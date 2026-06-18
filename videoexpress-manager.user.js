@@ -6,6 +6,8 @@
 // @match        https://app.videoexpress.ai/*
 // @grant        none
 // @run-at       document-idle
+// @updateURL    https://raw.githubusercontent.com/ayyfahim/videoexpress.aiAutomator/main/videoexpress-manager.user.js
+// @downloadURL  https://raw.githubusercontent.com/ayyfahim/videoexpress.aiAutomator/main/videoexpress-manager.user.js
 // ==/UserScript==
 
 (function () {
