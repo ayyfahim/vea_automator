@@ -1,0 +1,1431 @@
+// ==UserScript==
+// @name         VideoExpress Library Manager
+// @namespace    https://app.videoexpress.ai/
+// @version      0.2.0
+// @description  Manage folders, upload images, and batch convert images to videos inside VideoExpress AI.
+// @match        https://app.videoexpress.ai/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  if (!location.hostname.endsWith("videoexpress.ai")) return;
+  if (window.__videoExpressManagerLoaded) return;
+  window.__videoExpressManagerLoaded = true;
+
+  const config = {
+    libraryId: 4,
+    pageSize: 100,
+    videoLength: 10,
+    aspect: "16:9",
+    delayBetweenRequestsMs: 1500,
+    autoRetryOnParallelLimit: true,
+    parallelLimitRetryDelayMs: 60000,
+    maxParallelLimitRetries: Infinity,
+    pollIntervalMs: 15000,
+    skipStartedWithoutUuid: true,
+    promptCleaner: {
+      stripExtension: true,
+      replaceUnderscores: true,
+      replaceDashes: true,
+      removeNumbers: true,
+      collapseWhitespace: true,
+    },
+  };
+
+  const HISTORY_KEY = "videoexpress.manager.history.v1";
+  const UI_STATE_KEY = "videoexpress.manager.ui-state.v1";
+
+  const state = {
+    folders: [],
+    selectedFolderId: null,
+    items: [],
+    folderMediaCount: 0,
+    history: loadHistory(),
+    running: false,
+    stopRequested: false,
+    uploadInProgress: false,
+    selectedFiles: [],
+    activeTab: "folders",
+    queue: [],
+    activeStatuses: new Map(),
+  };
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  const formatDateTime = (value) => {
+    if (!value) return "";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    return date.toLocaleString();
+  };
+
+  const formatBytes = (bytes) => {
+    const value = Number(bytes || 0);
+    if (value < 1024) return `${value} B`;
+    if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+    return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  };
+
+  function cleanPrompt(name) {
+    let value = String(name || "");
+    if (config.promptCleaner.stripExtension) {
+      value = value.replace(/\.[a-z0-9]+$/i, "");
+    }
+    value = value.replace(/^\d{4}[-_]\d{2}[-_]\d{2}[-_\s]*/i, "");
+    value = value.replace(/\(\s*\d+\s*\)/g, " ");
+    value = value.replace(/([a-z])([A-Z])/g, "$1 $2");
+    if (config.promptCleaner.replaceUnderscores) {
+      value = value.replace(/_/g, " ");
+    }
+    if (config.promptCleaner.replaceDashes) {
+      value = value.replace(/-/g, " ");
+    }
+    if (config.promptCleaner.removeNumbers) {
+      value = value.replace(/\d+/g, " ");
+    }
+    value = value.replace(/[()[\]{}]/g, " ");
+    if (config.promptCleaner.collapseWhitespace) {
+      value = value.replace(/\s+/g, " ");
+    }
+    return value.trim();
+  }
+
+  function loadHistory() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(HISTORY_KEY) || "{}");
+      return {
+        version: 1,
+        updatedAt: parsed.updatedAt || null,
+        records:
+          parsed.records && typeof parsed.records === "object"
+            ? parsed.records
+            : {},
+      };
+    } catch (error) {
+      console.warn("VideoExpress manager history parse failed.", error);
+      return { version: 1, updatedAt: null, records: {} };
+    }
+  }
+
+  function saveHistory() {
+    state.history.updatedAt = new Date().toISOString();
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(state.history, null, 2));
+  }
+
+  function loadUiState() {
+    try {
+      return JSON.parse(localStorage.getItem(UI_STATE_KEY) || "{}");
+    } catch {
+      return {};
+    }
+  }
+
+  function saveUiState(patch) {
+    const next = { ...loadUiState(), ...patch };
+    localStorage.setItem(UI_STATE_KEY, JSON.stringify(next, null, 2));
+  }
+
+  async function assertOk(response, label) {
+    if (response.ok) return response;
+    const text = await response.text().catch(() => "");
+    throw new Error(
+      `${label} failed: ${response.status} ${response.statusText}\n${text}`,
+    );
+  }
+
+  async function getJson(url, label) {
+    const response = await fetch(url, {
+      method: "GET",
+      credentials: "include",
+      headers: { "X-Requested-With": "XMLHttpRequest" },
+    });
+    return (await assertOk(response, label)).json();
+  }
+
+  async function postForm(url, params, label) {
+    const response = await fetch(url, {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "X-Requested-With": "XMLHttpRequest",
+      },
+      body: params,
+    });
+    return (await assertOk(response, label)).text();
+  }
+
+  async function postFormJson(url, params, label) {
+    const responseText = await postForm(url, params, label);
+    try {
+      return JSON.parse(responseText);
+    } catch {
+      return responseText;
+    }
+  }
+
+  async function postMultipart(url, formData, label) {
+    const response = await fetch(url, {
+      method: "POST",
+      credentials: "include",
+      headers: { "X-Requested-With": "XMLHttpRequest" },
+      body: formData,
+    });
+    return (await assertOk(response, label)).text();
+  }
+
+  async function deleteRequest(url, label) {
+    const response = await fetch(url, {
+      method: "DELETE",
+      credentials: "include",
+      headers: { "X-Requested-With": "XMLHttpRequest" },
+    });
+    return (await assertOk(response, label)).text();
+  }
+
+  const api = {
+    async getFolders() {
+      const payload = await getJson(
+        `/library/get_categories/${config.libraryId}`,
+        "Load folders",
+      );
+      return Array.isArray(payload.data) ? payload.data : [];
+    },
+
+    async createFolder(categoryName) {
+      const params = new URLSearchParams({ categoryName });
+      return postForm(
+        `/library/add_category/${config.libraryId}`,
+        params.toString(),
+        "Create folder",
+      );
+    },
+
+    async deleteFolder(folderId) {
+      return deleteRequest(`/library/delete_category/${folderId}`, "Delete folder");
+    },
+
+    async getMedia(folderId, page = 1, start = 0, filter = "image") {
+      const params = new URLSearchParams({
+        categoryId: String(folderId),
+        page: String(page),
+        start: String(start),
+        limit: String(config.pageSize),
+        query: "",
+        orderBy: "name",
+        orderDir: "asc",
+        filter,
+      });
+      return getJson(
+        `/api/library/get_media/${config.libraryId}?${params.toString()}`,
+        `Load media for folder ${folderId}`,
+      );
+    },
+
+    async getAllImages(folderId) {
+      const items = [];
+      let page = 1;
+      let start = 0;
+      let total = Infinity;
+
+      while (start < total) {
+        const payload = await api.getMedia(folderId, page, start, "image");
+        const results = Array.isArray(payload.results) ? payload.results : [];
+        total = Number(payload.total || results.length || 0);
+        items.push(...results);
+        if (!results.length || results.length < config.pageSize) break;
+        page += 1;
+        start += config.pageSize;
+      }
+
+      return { total: items.length, results: items };
+    },
+
+    async uploadFile(folderId, file) {
+      const title = file.name.replace(/\.[a-z0-9]+$/i, "");
+      const formData = new FormData();
+      formData.append("title", title);
+      formData.append("categoryId", String(folderId));
+      formData.append("file", file, file.name);
+      return postMultipart(`/library/upload/${config.libraryId}`, formData, `Upload ${file.name}`);
+    },
+
+    async generateImageVideo(media, prompt, options = {}) {
+      const params = new URLSearchParams({
+        type: "human",
+        imagePrompt: "",
+        prompt,
+        uuid: media.uuid || "",
+        mediaId: String(media.id),
+        audioMediaId: "0",
+        isShared: media.isShared ? "1" : "0",
+        aspect: String(options.aspect || config.aspect),
+        videoLength: String(options.videoLength || config.videoLength),
+        enhanceHumanFace: "0",
+        isTalkingVideoFromText: "0",
+        isNarrationVideo: "0",
+        enhanceVideoPrompt: "1",
+        videoOnly: "0",
+        speed: "",
+        generatorName: "create_from_prompt",
+        faceImageMediaId: "0",
+        faceSwap: "0",
+        mode: "",
+      });
+      return postFormJson("/ai/api/image2video", params.toString(), "Generate video");
+    },
+
+    async getStatus(uuid) {
+      const cacheBust = Date.now();
+      return getJson(`/ai/api/status/${uuid}?_=${cacheBust}`, `Load status ${uuid}`);
+    },
+  };
+
+  function getSelectedFolder() {
+    return state.folders.find((item) => String(item.id) === String(state.selectedFolderId)) || null;
+  }
+
+  function makeRecordKey(folderId, mediaId) {
+    return `library:${config.libraryId}:folder:${folderId}:media:${mediaId}`;
+  }
+
+  function getRecord(folderId, mediaId) {
+    return state.history.records[makeRecordKey(folderId, mediaId)] || null;
+  }
+
+  function setRecord(folderId, mediaId, value) {
+    state.history.records[makeRecordKey(folderId, mediaId)] = value;
+    saveHistory();
+  }
+
+  function normalizeStatus(value) {
+    return String(value || "").toLowerCase();
+  }
+
+  function isParallelLimitMessage(message) {
+    return /multiple videos in progress|up to 5 ai videos|parallel/i.test(String(message || ""));
+  }
+
+  function buildQueue(folder, items) {
+    return items.map((media) => {
+      const prompt = cleanPrompt(media.name);
+      const record = getRecord(folder.id, media.id);
+      const historyStatus = record ? record.status : "";
+      const pendingMediaStatus = media.uuid
+        ? media.isPending
+          ? "running"
+          : "submitted"
+        : "";
+      const derivedStatus = pendingMediaStatus && !historyStatus ? pendingMediaStatus : historyStatus || "";
+      const normalizedStatus = normalizeStatus(derivedStatus);
+      return {
+        media,
+        prompt,
+        record,
+        status: derivedStatus,
+        skip:
+          !prompt ||
+          normalizedStatus === "submitted" ||
+          normalizedStatus === "running" ||
+          normalizedStatus === "completed" ||
+          (config.skipStartedWithoutUuid && normalizedStatus === "started"),
+      };
+    });
+  }
+
+  const root = document.createElement("div");
+  root.id = "ve-manager-root";
+  root.innerHTML = `
+    <style>
+      #ve-manager-root {
+        position: fixed;
+        top: 76px;
+        right: 18px;
+        z-index: 2147483647;
+        font-family: Roboto, "Segoe UI", system-ui, sans-serif;
+        color: #2f3d4c;
+      }
+      #ve-manager-panel {
+        width: min(560px, calc(100vw - 28px));
+        max-height: calc(100vh - 96px);
+        overflow: hidden;
+        background: #f7f9fc;
+        border: 1px solid rgba(17, 24, 39, 0.1);
+        border-radius: 6px;
+        box-shadow: 0 16px 55px rgba(38, 50, 65, 0.26);
+      }
+      #ve-manager-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 13px 14px 12px;
+        background: #ffffff;
+        border-bottom: 1px solid #dfe5ed;
+      }
+      #ve-manager-title {
+        font-size: 16px;
+        font-weight: 700;
+        letter-spacing: 0;
+        color: #263241;
+      }
+      #ve-manager-body {
+        padding: 0 14px 14px;
+        overflow: auto;
+        max-height: calc(100vh - 155px);
+      }
+      #ve-manager-body::-webkit-scrollbar {
+        width: 10px;
+      }
+      #ve-manager-body::-webkit-scrollbar-thumb {
+        background: #c9d3df;
+        border-radius: 999px;
+      }
+      .ve-tabs {
+        position: sticky;
+        top: 0;
+        z-index: 2;
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 0;
+        margin: 0 -14px 14px;
+        padding: 0 14px;
+        background: #ffffff;
+        border-bottom: 1px solid #dfe5ed;
+      }
+      .ve-tab {
+        height: 42px;
+        border: 0;
+        border-bottom: 3px solid transparent;
+        background: transparent;
+        color: #667789;
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 700;
+      }
+      .ve-tab i {
+        margin-right: 6px;
+      }
+      .ve-tab.active {
+        color: #1683c7;
+        border-bottom-color: #22a7f0;
+      }
+      .ve-tab-panel {
+        display: none;
+      }
+      .ve-tab-panel.active {
+        display: block;
+      }
+      .ve-section {
+        margin-bottom: 12px;
+        padding: 12px;
+        border: 1px solid #dfe5ed;
+        border-radius: 6px;
+        background: #ffffff;
+      }
+      .ve-section-title {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 10px;
+        color: #263241;
+        font-size: 13px;
+        font-weight: 700;
+      }
+      .ve-row {
+        display: flex;
+        gap: 10px;
+        margin-bottom: 10px;
+      }
+      .ve-row:last-child {
+        margin-bottom: 0;
+      }
+      .ve-row > * {
+        flex: 1;
+      }
+      .ve-input,
+      .ve-select,
+      .ve-button,
+      .ve-textarea {
+        width: 100%;
+        border-radius: 4px;
+        border: 1px solid #cfd9e4;
+        background: #ffffff;
+        color: #2f3d4c;
+        padding: 9px 10px;
+        font-size: 13px;
+        outline: none;
+      }
+      .ve-input:focus,
+      .ve-select:focus,
+      .ve-textarea:focus {
+        border-color: #22a7f0;
+        box-shadow: 0 0 0 3px rgba(34, 167, 240, 0.12);
+      }
+      .ve-textarea {
+        min-height: 74px;
+        resize: vertical;
+      }
+      .ve-input::placeholder,
+      .ve-textarea::placeholder {
+        color: #8ca0b4;
+      }
+      .ve-button {
+        cursor: pointer;
+        font-weight: 600;
+        white-space: nowrap;
+        transition: transform 0.12s ease, box-shadow 0.12s ease;
+      }
+      .ve-button:hover:not(:disabled) {
+        transform: translateY(-1px);
+        box-shadow: 0 5px 14px rgba(47, 61, 76, 0.14);
+      }
+      .ve-button:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+      }
+      .ve-button.primary {
+        background: #22a7f0;
+        border-color: #1683c7;
+        color: #ffffff;
+      }
+      .ve-button.success {
+        background: #20b486;
+        border-color: #168f68;
+        color: #ffffff;
+      }
+      .ve-button.warn {
+        background: #f0ad4e;
+        border-color: #d79535;
+        color: #ffffff;
+      }
+      .ve-button.danger {
+        background: #d9534f;
+        border-color: #bd3e3a;
+        color: #ffffff;
+      }
+      .ve-button.ghost {
+        background: #ffffff;
+        color: #4d5f73;
+      }
+      .ve-icon-button {
+        flex: 0 0 42px;
+        width: 42px;
+        min-width: 42px;
+        padding: 9px 0;
+      }
+      .ve-muted {
+        color: #7a8da3;
+        font-size: 12px;
+      }
+      .ve-stats {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 8px;
+      }
+      .ve-stat {
+        padding: 10px 11px;
+        border-radius: 6px;
+        background: #f2f6fa;
+        border: 1px solid #dfe5ed;
+      }
+      .ve-stat strong {
+        display: block;
+        font-size: 20px;
+        color: #263241;
+      }
+      .ve-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 12px;
+      }
+      .ve-table th,
+      .ve-table td {
+        border-bottom: 1px solid #e7edf4;
+        padding: 8px 6px;
+        vertical-align: top;
+        text-align: left;
+      }
+      .ve-table th {
+        color: #75879b;
+        font-weight: 600;
+      }
+      .ve-thumb {
+        width: 46px;
+        height: 34px;
+        flex: 0 0 46px;
+        border-radius: 4px;
+        background: #edf2f7 center / cover no-repeat;
+        border: 1px solid #d7e0ea;
+      }
+      .ve-media-cell {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        min-width: 0;
+      }
+      .ve-title-line {
+        word-break: break-word;
+        color: #2f3d4c;
+      }
+      .ve-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 3px 7px;
+        border-radius: 4px;
+        font-size: 11px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0;
+      }
+      .ve-badge.idle { background: #eef3f7; color: #64748b; }
+      .ve-badge.started { background: #e8f5fe; color: #1683c7; }
+      .ve-badge.submitted { background: #e8f5fe; color: #1683c7; }
+      .ve-badge.running { background: #e8f5fe; color: #1683c7; }
+      .ve-badge.completed { background: #e8f7f1; color: #168f68; }
+      .ve-badge.failed { background: #fdeeee; color: #bd3e3a; }
+      .ve-badge.parallel_limit { background: #fff4df; color: #9b6a18; }
+      .ve-badge.skipped { background: #eef3f7; color: #64748b; }
+      .ve-log {
+        margin-top: 8px;
+        max-height: 178px;
+        overflow: auto;
+        font-size: 12px;
+        white-space: pre-wrap;
+        color: #405367;
+        background: #f2f6fa;
+        border: 1px solid #dfe5ed;
+        border-radius: 6px;
+        padding: 9px;
+      }
+      .ve-folder-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+      }
+      .ve-folder-card {
+        min-height: 82px;
+        border: 1px solid #dfe5ed;
+        border-radius: 6px;
+        background: #fbfdff;
+        color: #405367;
+        cursor: pointer;
+        padding: 10px 9px;
+        text-align: left;
+      }
+      .ve-folder-card:hover {
+        border-color: #22a7f0;
+      }
+      .ve-folder-card.active {
+        border-color: #22a7f0;
+        box-shadow: inset 0 0 0 1px #22a7f0;
+        background: #f0f9ff;
+      }
+      .ve-folder-card i {
+        color: #22a7f0;
+        font-size: 22px;
+      }
+      .ve-folder-card strong {
+        display: block;
+        margin-top: 5px;
+        line-height: 1.2;
+        word-break: break-word;
+      }
+      .ve-file-picker {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+      }
+      .ve-file-input {
+        display: none;
+      }
+      .ve-hidden {
+        display: none !important;
+      }
+      #ve-manager-toggle {
+        margin-top: 10px;
+        margin-left: auto;
+        display: block;
+        width: 52px;
+        height: 52px;
+        border-radius: 6px;
+        border: none;
+        cursor: pointer;
+        color: white;
+        font-size: 20px;
+        font-weight: 700;
+        background: #22a7f0;
+        box-shadow: 0 10px 28px rgba(38, 50, 65, 0.24);
+      }
+      @media (max-width: 620px) {
+        #ve-manager-root {
+          top: 8px;
+          right: 8px;
+          left: 8px;
+        }
+        #ve-manager-panel {
+          width: auto;
+          max-height: calc(100vh - 16px);
+        }
+        .ve-folder-grid,
+        .ve-stats,
+        .ve-file-picker {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+        .ve-row {
+          flex-wrap: wrap;
+        }
+      }
+    </style>
+    <div id="ve-manager-panel">
+      <div id="ve-manager-header">
+        <div>
+          <div id="ve-manager-title">VideoExpress Manager</div>
+          <div class="ve-muted">Batch media workflow for My Media</div>
+        </div>
+        <button class="ve-button ghost ve-icon-button" id="ve-close-btn" title="Hide panel"><i class="bi bi-x-lg"></i></button>
+      </div>
+      <div id="ve-manager-body">
+        <div class="ve-tabs" role="tablist">
+          <button class="ve-tab active" data-tab="folders" type="button"><i class="bi bi-folder2-open"></i>Folders</button>
+          <button class="ve-tab" data-tab="upload" type="button"><i class="bi bi-upload"></i>Upload</button>
+          <button class="ve-tab" data-tab="queue" type="button"><i class="bi bi-play-circle"></i>Queue</button>
+          <button class="ve-tab" data-tab="activity" type="button"><i class="bi bi-activity"></i>Activity</button>
+        </div>
+        <div class="ve-tab-panel active" data-panel="folders">
+        <div class="ve-section">
+          <div class="ve-section-title">
+            <span><i class="bi bi-collection-play"></i> Media folders</span>
+            <button class="ve-button ghost ve-icon-button" id="ve-refresh-btn" title="Refresh folders"><i class="bi bi-arrow-clockwise"></i></button>
+          </div>
+          <div class="ve-row">
+            <select class="ve-select" id="ve-folder-select"></select>
+          </div>
+          <div class="ve-folder-grid" id="ve-folder-grid"></div>
+        </div>
+        <div class="ve-section">
+          <div class="ve-section-title"><span><i class="bi bi-folder-plus"></i> Create folder</span></div>
+          <div class="ve-row">
+            <input class="ve-input" id="ve-new-folder-input" placeholder="New folder name" />
+            <button class="ve-button success" id="ve-create-folder-btn"><i class="bi bi-plus-lg"></i> Create</button>
+          </div>
+          <div class="ve-row">
+            <button class="ve-button danger" id="ve-delete-folder-btn"><i class="bi bi-trash3"></i> Delete selected folder</button>
+          </div>
+        </div>
+        </div>
+        <div class="ve-tab-panel" data-panel="upload">
+        <div class="ve-section">
+          <div class="ve-section-title"><span><i class="bi bi-cloud-arrow-up"></i> Upload images</span></div>
+          <div class="ve-row">
+            <select class="ve-select" id="ve-upload-folder-select"></select>
+          </div>
+          <div class="ve-file-picker">
+            <button class="ve-button ghost" id="ve-pick-files-btn" type="button"><i class="bi bi-images"></i> Choose images</button>
+            <button class="ve-button ghost" id="ve-pick-folder-btn" type="button"><i class="bi bi-folder2-open"></i> Choose folder</button>
+          </div>
+          <input class="ve-file-input" id="ve-file-input" type="file" accept="image/*" multiple />
+          <input class="ve-file-input" id="ve-folder-input" type="file" accept="image/*" multiple webkitdirectory directory />
+          <div class="ve-row">
+            <button class="ve-button success" id="ve-upload-btn"><i class="bi bi-upload"></i> Upload selected images</button>
+            <button class="ve-button ghost" id="ve-clear-files-btn" type="button"><i class="bi bi-x-lg"></i> Clear</button>
+          </div>
+          <div class="ve-muted" id="ve-upload-summary">No files selected.</div>
+        </div>
+        </div>
+        <div class="ve-tab-panel" data-panel="queue">
+        <div class="ve-section">
+          <div class="ve-section-title"><span><i class="bi bi-camera-video"></i> Image to video</span></div>
+          <div class="ve-row">
+            <input class="ve-input" id="ve-video-length" type="number" min="1" max="60" value="${config.videoLength}" />
+            <select class="ve-select" id="ve-aspect">
+              <option value="16:9">16:9</option>
+              <option value="9:16">9:16</option>
+              <option value="1:1">1:1</option>
+            </select>
+          </div>
+          <div class="ve-row">
+            <input class="ve-input" id="ve-delay-input" type="number" min="0" step="100" value="${config.delayBetweenRequestsMs}" />
+            <input class="ve-input" id="ve-retry-delay-input" type="number" min="1000" step="1000" value="${config.parallelLimitRetryDelayMs}" />
+          </div>
+          <div class="ve-row">
+            <button class="ve-button primary" id="ve-load-media-btn"><i class="bi bi-list-check"></i> Load images</button>
+            <button class="ve-button success" id="ve-run-btn"><i class="bi bi-play-fill"></i> Run queue</button>
+            <button class="ve-button warn" id="ve-stop-btn"><i class="bi bi-stop-fill"></i> Stop</button>
+          </div>
+        </div>
+        <div class="ve-section">
+          <div class="ve-stats">
+            <div class="ve-stat"><span class="ve-muted">Images</span><strong id="ve-stat-images">0</strong></div>
+            <div class="ve-stat"><span class="ve-muted">Queued</span><strong id="ve-stat-queued">0</strong></div>
+            <div class="ve-stat"><span class="ve-muted">Running</span><strong id="ve-stat-running">0</strong></div>
+            <div class="ve-stat"><span class="ve-muted">Done</span><strong id="ve-stat-done">0</strong></div>
+          </div>
+        </div>
+        <div class="ve-section">
+          <div class="ve-section-title">
+            <span><i class="bi bi-table"></i> Queue preview</span>
+            <button class="ve-button ghost ve-icon-button" id="ve-reset-history-btn" type="button" title="Clear saved queue history"><i class="bi bi-eraser"></i></button>
+          </div>
+          <div class="ve-row">
+            <div class="ve-muted" id="ve-folder-summary">Select a folder to begin.</div>
+          </div>
+          <table class="ve-table">
+            <thead>
+              <tr>
+                <th style="width: 26%">Image</th>
+                <th style="width: 42%">Prompt</th>
+                <th style="width: 16%">Status</th>
+                <th style="width: 16%">Updated</th>
+              </tr>
+            </thead>
+            <tbody id="ve-queue-body"></tbody>
+          </table>
+        </div>
+        </div>
+        <div class="ve-tab-panel" data-panel="activity">
+          <div class="ve-section">
+            <div class="ve-section-title"><span><i class="bi bi-terminal"></i> Activity log</span></div>
+            <div class="ve-log" id="ve-log"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <button id="ve-manager-toggle" class="ve-hidden" title="VideoExpress Manager"><i class="bi bi-collection-play"></i></button>
+  `;
+
+  document.body.appendChild(root);
+
+  const els = {
+    panel: root.querySelector("#ve-manager-panel"),
+    toggle: root.querySelector("#ve-manager-toggle"),
+    closeBtn: root.querySelector("#ve-close-btn"),
+    tabs: Array.from(root.querySelectorAll(".ve-tab")),
+    tabPanels: Array.from(root.querySelectorAll(".ve-tab-panel")),
+    folderSelect: root.querySelector("#ve-folder-select"),
+    uploadFolderSelect: root.querySelector("#ve-upload-folder-select"),
+    folderGrid: root.querySelector("#ve-folder-grid"),
+    refreshBtn: root.querySelector("#ve-refresh-btn"),
+    newFolderInput: root.querySelector("#ve-new-folder-input"),
+    createFolderBtn: root.querySelector("#ve-create-folder-btn"),
+    deleteFolderBtn: root.querySelector("#ve-delete-folder-btn"),
+    fileInput: root.querySelector("#ve-file-input"),
+    folderInput: root.querySelector("#ve-folder-input"),
+    pickFilesBtn: root.querySelector("#ve-pick-files-btn"),
+    pickFolderBtn: root.querySelector("#ve-pick-folder-btn"),
+    clearFilesBtn: root.querySelector("#ve-clear-files-btn"),
+    uploadBtn: root.querySelector("#ve-upload-btn"),
+    uploadSummary: root.querySelector("#ve-upload-summary"),
+    videoLength: root.querySelector("#ve-video-length"),
+    aspect: root.querySelector("#ve-aspect"),
+    delayInput: root.querySelector("#ve-delay-input"),
+    retryDelayInput: root.querySelector("#ve-retry-delay-input"),
+    loadMediaBtn: root.querySelector("#ve-load-media-btn"),
+    runBtn: root.querySelector("#ve-run-btn"),
+    stopBtn: root.querySelector("#ve-stop-btn"),
+    resetHistoryBtn: root.querySelector("#ve-reset-history-btn"),
+    statImages: root.querySelector("#ve-stat-images"),
+    statQueued: root.querySelector("#ve-stat-queued"),
+    statRunning: root.querySelector("#ve-stat-running"),
+    statDone: root.querySelector("#ve-stat-done"),
+    folderSummary: root.querySelector("#ve-folder-summary"),
+    queueBody: root.querySelector("#ve-queue-body"),
+    log: root.querySelector("#ve-log"),
+  };
+
+  function logLine(message) {
+    const line = `[${new Date().toLocaleTimeString()}] ${message}`;
+    els.log.textContent = `${line}\n${els.log.textContent}`.trim();
+  }
+
+  function setPanelVisible(visible) {
+    els.panel.classList.toggle("ve-hidden", !visible);
+    els.toggle.classList.toggle("ve-hidden", visible);
+    saveUiState({ collapsed: !visible });
+  }
+
+  function setActiveTab(tab) {
+    state.activeTab = tab;
+    els.tabs.forEach((element) => {
+      element.classList.toggle("active", element.dataset.tab === tab);
+    });
+    els.tabPanels.forEach((element) => {
+      element.classList.toggle("active", element.dataset.panel === tab);
+    });
+    saveUiState({ activeTab: tab });
+  }
+
+  function getBadgeClass(status) {
+    const value = normalizeStatus(status);
+    if (!value) return "idle";
+    return value.replace(/[^a-z0-9_-]/g, "_");
+  }
+
+  function renderFolders() {
+    const options = state.folders
+      .map((folder) => {
+        const selected = String(folder.id) === String(state.selectedFolderId) ? "selected" : "";
+        return `<option value="${folder.id}" ${selected}>${escapeHtml(folder.title || folder.name)} (${folder.id})</option>`;
+      })
+      .join("");
+    els.folderSelect.innerHTML = options || `<option value="">No folders found</option>`;
+    els.uploadFolderSelect.innerHTML = options || `<option value="">No folders found</option>`;
+    els.uploadFolderSelect.value = state.selectedFolderId || "";
+    els.folderGrid.innerHTML = state.folders.length
+      ? state.folders
+          .map((folder) => {
+            const active = String(folder.id) === String(state.selectedFolderId) ? "active" : "";
+            return `
+              <button class="ve-folder-card ${active}" data-folder-id="${folder.id}" type="button" title="${escapeHtml(folder.title || folder.name)}">
+                <i class="bi bi-folder2"></i>
+                <strong>${escapeHtml(folder.title || folder.name)}</strong>
+                <span class="ve-muted">${folder.id}</span>
+              </button>
+            `;
+          })
+          .join("")
+      : `<div class="ve-muted">No folders found.</div>`;
+  }
+
+  function renderSelectedFiles() {
+    const files = state.selectedFiles;
+    if (!files.length) {
+      els.uploadSummary.textContent = "No files selected.";
+      return;
+    }
+
+    const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
+    const sample = files
+      .slice(0, 3)
+      .map((file) => file.webkitRelativePath || file.name)
+      .join(", ");
+    const more = files.length > 3 ? `, +${files.length - 3} more` : "";
+    els.uploadSummary.textContent = `${files.length} image${files.length === 1 ? "" : "s"} selected | ${formatBytes(totalBytes)} | ${sample}${more}`;
+  }
+
+  function isImageFile(file) {
+    return /^image\//i.test(file.type || "") || /\.(png|jpe?g|webp|gif|bmp)$/i.test(file.name || "");
+  }
+
+  function setSelectedFiles(fileList) {
+    state.selectedFiles = Array.from(fileList || [])
+      .filter(isImageFile)
+      .sort((a, b) => {
+        const nameA = a.webkitRelativePath || a.name;
+        const nameB = b.webkitRelativePath || b.name;
+        return nameA.localeCompare(nameB, undefined, { numeric: true, sensitivity: "base" });
+      });
+    renderSelectedFiles();
+    updateButtonStates();
+  }
+
+  function renderQueue() {
+    const runningCount = state.queue.filter((item) => {
+      const status = normalizeStatus(item.status);
+      return status === "submitted" || status === "running" || status === "started";
+    }).length;
+    const doneCount = state.queue.filter((item) => normalizeStatus(item.status) === "completed").length;
+    const queuedCount = state.queue.filter((item) => {
+      const status = normalizeStatus(item.status);
+      return !item.skip || status === "failed" || status === "parallel_limit";
+    }).length;
+
+    els.statImages.textContent = String(state.items.length);
+    els.statQueued.textContent = String(queuedCount);
+    els.statRunning.textContent = String(runningCount);
+    els.statDone.textContent = String(doneCount);
+
+    const folder = getSelectedFolder();
+    els.folderSummary.textContent = folder
+      ? `${folder.title || folder.name} | ${state.items.length} images loaded | history updated ${formatDateTime(state.history.updatedAt) || "never"}`
+      : "Select a folder to begin.";
+
+    els.queueBody.innerHTML = state.queue.length
+      ? state.queue
+          .slice(0, 150)
+          .map((item) => {
+            const record = item.record || getRecord(state.selectedFolderId, item.media.id);
+            const latestStatus = item.status || (record && record.status) || "";
+            const updatedAt = record && (record.updatedAt || record.completedAt || record.startedAt);
+            const imageUrl = item.media.thumbUrl || item.media.mediaPath || "";
+            const displayStatus = latestStatus || (item.skip ? "skipped" : "idle");
+            return `
+              <tr>
+                <td>
+                  <div class="ve-media-cell">
+                    <div class="ve-thumb" style="background-image:url('${escapeAttr(imageUrl)}')"></div>
+                    <div>
+                      <div class="ve-title-line">${escapeHtml(item.media.name || item.media.fileName || String(item.media.id))}</div>
+                      <div class="ve-muted">${item.media.id}</div>
+                    </div>
+                  </div>
+                </td>
+                <td>${escapeHtml(item.prompt || "(empty prompt)")}</td>
+                <td><span class="ve-badge ${getBadgeClass(displayStatus)}">${escapeHtml(displayStatus)}</span></td>
+                <td>${escapeHtml(formatDateTime(updatedAt) || "-")}</td>
+              </tr>
+            `;
+          })
+          .join("")
+      : `<tr><td colspan="4" class="ve-muted">No items loaded yet.</td></tr>`;
+  }
+
+  function escapeHtml(value) {
+    return String(value || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  function escapeAttr(value) {
+    return escapeHtml(value).replace(/\(/g, "%28").replace(/\)/g, "%29");
+  }
+
+  async function refreshFolders() {
+    logLine("Refreshing folder list...");
+    state.folders = await api.getFolders();
+
+    const currentExists = state.folders.some(
+      (folder) => String(folder.id) === String(state.selectedFolderId),
+    );
+    if (!currentExists) {
+      const saved = loadUiState().selectedFolderId;
+      const savedExists = state.folders.some((folder) => String(folder.id) === String(saved));
+      state.selectedFolderId = savedExists
+        ? saved
+        : (state.folders[0] && state.folders[0].id) || null;
+    }
+
+    renderFolders();
+    saveUiState({ selectedFolderId: state.selectedFolderId });
+    logLine(`Loaded ${state.folders.length} folders.`);
+  }
+
+  function selectFolder(folderId) {
+    state.selectedFolderId = folderId || null;
+    saveUiState({ selectedFolderId: state.selectedFolderId });
+    state.items = [];
+    state.queue = [];
+    renderFolders();
+    renderQueue();
+  }
+
+  async function loadFolderImages() {
+    const folder = getSelectedFolder();
+    if (!folder) throw new Error("Please select a folder first.");
+    logLine(`Loading images for folder "${folder.title || folder.name}"...`);
+    const payload = await api.getAllImages(folder.id);
+    state.items = payload.results;
+    state.folderMediaCount = payload.total;
+    state.queue = buildQueue(folder, state.items);
+    renderQueue();
+    logLine(`Loaded ${state.items.length} images from folder ${folder.id}.`);
+  }
+
+  async function createFolder() {
+    const name = els.newFolderInput.value.trim();
+    if (!name) throw new Error("Folder name is required.");
+    await api.createFolder(name);
+    els.newFolderInput.value = "";
+    await refreshFolders();
+    const created = state.folders.find((folder) => folder.name === name || folder.title === name);
+    if (created) {
+      state.selectedFolderId = created.id;
+      renderFolders();
+      saveUiState({ selectedFolderId: created.id });
+    }
+    logLine(`Folder "${name}" created.`);
+  }
+
+  async function deleteSelectedFolder() {
+    const folder = getSelectedFolder();
+    if (!folder) throw new Error("No folder selected.");
+    const ok = window.confirm(`Delete folder "${folder.title || folder.name}" (${folder.id})?`);
+    if (!ok) return;
+    await api.deleteFolder(folder.id);
+    state.items = [];
+    state.queue = [];
+    await refreshFolders();
+    renderQueue();
+    logLine(`Folder ${folder.id} deleted.`);
+  }
+
+  async function uploadSelectedFiles() {
+    const folder = getSelectedFolder();
+    const files = state.selectedFiles;
+    if (!folder) throw new Error("Select a folder before uploading.");
+    if (!files.length) throw new Error("Choose one or more image files first.");
+
+    state.uploadInProgress = true;
+    updateButtonStates();
+    let successCount = 0;
+    let failCount = 0;
+    els.uploadSummary.textContent = `Uploading ${files.length} files...`;
+
+    for (const file of files) {
+      try {
+        await api.uploadFile(folder.id, file);
+        successCount += 1;
+        els.uploadSummary.textContent = `Uploaded ${successCount}/${files.length}`;
+      } catch (error) {
+        failCount += 1;
+        logLine(`Upload failed for ${file.name}: ${error.message}`);
+      }
+    }
+
+    state.uploadInProgress = false;
+    updateButtonStates();
+    els.fileInput.value = "";
+    els.folderInput.value = "";
+    state.selectedFiles = [];
+    els.uploadSummary.textContent = `Upload complete. Success: ${successCount}, Failed: ${failCount}`;
+    await loadFolderImages();
+  }
+
+  function updateConfigFromInputs() {
+    config.videoLength = Number(els.videoLength.value || 10);
+    config.aspect = els.aspect.value || "16:9";
+    config.delayBetweenRequestsMs = Number(els.delayInput.value || 0);
+    config.parallelLimitRetryDelayMs = Number(els.retryDelayInput.value || 60000);
+  }
+
+  async function runQueue() {
+    if (state.running) return;
+    const folder = getSelectedFolder();
+    if (!folder) throw new Error("No folder selected.");
+    if (!state.queue.length) await loadFolderImages();
+
+    updateConfigFromInputs();
+    state.running = true;
+    state.stopRequested = false;
+    updateButtonStates();
+
+    try {
+      for (const item of state.queue) {
+        if (state.stopRequested) break;
+        if (!item.prompt) {
+          item.status = "skipped";
+          continue;
+        }
+
+        const existing = getRecord(folder.id, item.media.id);
+        const existingStatus = existing ? normalizeStatus(existing.status) : "";
+        if (
+          existing &&
+          (["submitted", "running", "completed"].includes(existingStatus) ||
+            (config.skipStartedWithoutUuid && existingStatus === "started"))
+        ) {
+          item.status = existing.status;
+          continue;
+        }
+
+        let retries = existing && existing.parallelLimitRetries ? existing.parallelLimitRetries : 0;
+        let done = false;
+
+        while (!done) {
+          if (state.stopRequested) break;
+
+          const startedAt = new Date().toISOString();
+          const baseRecord = {
+            libraryId: config.libraryId,
+            folderId: folder.id,
+            folderName: folder.name,
+            folderTitle: folder.title,
+            imageId: item.media.id,
+            imageName: item.media.name,
+            imageFileName: item.media.fileName,
+            mediaPath: item.media.mediaPath,
+            prompt: item.prompt,
+            aspect: config.aspect,
+            videoLength: config.videoLength,
+            startedAt,
+            updatedAt: startedAt,
+            status: "started",
+          };
+          setRecord(folder.id, item.media.id, baseRecord);
+          item.record = baseRecord;
+          item.status = "started";
+          renderQueue();
+          logLine(`Submitting ${item.media.name}`);
+
+          try {
+            const result = await api.generateImageVideo(item.media, item.prompt);
+            const completedAt = new Date().toISOString();
+
+            if (result && isParallelLimitMessage(result.error || result.message)) {
+              retries += 1;
+              const nextRecord = {
+                ...baseRecord,
+                status: "parallel_limit",
+                response: result,
+                parallelLimitRetries: retries,
+                updatedAt: completedAt,
+                completedAt,
+              };
+              setRecord(folder.id, item.media.id, nextRecord);
+              item.record = nextRecord;
+              item.status = "parallel_limit";
+              renderQueue();
+
+              if (
+                config.autoRetryOnParallelLimit &&
+                retries <= config.maxParallelLimitRetries
+              ) {
+                logLine(
+                  `Parallel limit hit. Waiting ${Math.round(config.parallelLimitRetryDelayMs / 1000)}s before retry.`,
+                );
+                await sleep(config.parallelLimitRetryDelayMs);
+                continue;
+              }
+
+              done = true;
+              break;
+            }
+
+            const nextRecord = {
+              ...baseRecord,
+              status: result && result.success ? "submitted" : "failed",
+              uuid: result && result.uuid ? result.uuid : null,
+              estimatedTimeSeconds:
+                result && typeof result.estimatedTimeSeconds !== "undefined"
+                  ? result.estimatedTimeSeconds
+                  : null,
+              response: result,
+              completedAt,
+              updatedAt: completedAt,
+            };
+            setRecord(folder.id, item.media.id, nextRecord);
+            item.record = nextRecord;
+            item.status = nextRecord.status;
+            if (nextRecord.uuid) {
+              state.activeStatuses.set(nextRecord.uuid, { folderId: folder.id, mediaId: item.media.id });
+            }
+            renderQueue();
+            done = true;
+          } catch (error) {
+            const failedAt = new Date().toISOString();
+            const message = String(error && (error.message || error.stack || error));
+            const status = isParallelLimitMessage(message) ? "parallel_limit" : "failed";
+            if (status === "parallel_limit") retries += 1;
+
+            const nextRecord = {
+              ...baseRecord,
+              status,
+              error: message,
+              parallelLimitRetries: retries,
+              failedAt,
+              updatedAt: failedAt,
+            };
+            setRecord(folder.id, item.media.id, nextRecord);
+            item.record = nextRecord;
+            item.status = status;
+            renderQueue();
+            logLine(`Submit failed for ${item.media.name}: ${message}`);
+
+            if (
+              status === "parallel_limit" &&
+              config.autoRetryOnParallelLimit &&
+              retries <= config.maxParallelLimitRetries
+            ) {
+              await sleep(config.parallelLimitRetryDelayMs);
+              continue;
+            }
+
+            done = true;
+          }
+        }
+
+        if (config.delayBetweenRequestsMs > 0 && !state.stopRequested) {
+          await sleep(config.delayBetweenRequestsMs);
+        }
+      }
+    } finally {
+      state.running = false;
+      updateButtonStates();
+      renderQueue();
+      logLine(state.stopRequested ? "Queue stopped." : "Queue run finished.");
+    }
+  }
+
+  async function pollStatuses() {
+    const pendingRecords = Object.values(state.history.records).filter((record) => {
+      const status = normalizeStatus(record.status);
+      return record.uuid && ["submitted", "running", "parallel_limit"].includes(status);
+    });
+
+    for (const record of pendingRecords) {
+      try {
+        const statusPayload = await api.getStatus(record.uuid);
+        const status = normalizeStatus(statusPayload.status);
+        let mapped = "running";
+
+        if (
+          status === "succeeded" ||
+          status === "success" ||
+          status === "completed" ||
+          status === "complete" ||
+          status === "finished" ||
+          status === "done"
+        ) {
+          mapped = "completed";
+        } else if (status === "failed" || status === "error") {
+          mapped = "failed";
+        } else if (status === "queued" || status === "pending" || status === "running") {
+          mapped = "running";
+        }
+
+        const nextRecord = {
+          ...record,
+          status: mapped,
+          statusPayload,
+          updatedAt: new Date().toISOString(),
+        };
+        setRecord(record.folderId, record.imageId, nextRecord);
+      } catch (error) {
+        logLine(`Status poll failed for ${record.uuid}: ${error.message}`);
+      }
+    }
+
+    const folder = getSelectedFolder();
+    if (folder && state.items.length) {
+      state.queue = buildQueue(folder, state.items);
+      renderQueue();
+    }
+  }
+
+  function updateButtonStates() {
+    els.runBtn.disabled = state.running || state.uploadInProgress;
+    els.stopBtn.disabled = !state.running;
+    els.uploadBtn.disabled = state.uploadInProgress || state.running || !state.selectedFiles.length;
+    els.loadMediaBtn.disabled = state.running || state.uploadInProgress;
+    els.createFolderBtn.disabled = state.running || state.uploadInProgress;
+    els.deleteFolderBtn.disabled = state.running || state.uploadInProgress;
+    els.refreshBtn.disabled = state.running || state.uploadInProgress;
+    els.clearFilesBtn.disabled = state.uploadInProgress || state.running || !state.selectedFiles.length;
+  }
+
+  async function handleAction(action) {
+    try {
+      updateConfigFromInputs();
+      await action();
+    } catch (error) {
+      console.error(error);
+      logLine(error.message || String(error));
+      alert(error.message || String(error));
+    }
+  }
+
+  function attachEvents() {
+    els.closeBtn.addEventListener("click", () => setPanelVisible(false));
+    els.toggle.addEventListener("click", () => setPanelVisible(true));
+    els.tabs.forEach((tab) => {
+      tab.addEventListener("click", () => setActiveTab(tab.dataset.tab));
+    });
+
+    els.folderSelect.addEventListener("change", async () => {
+      selectFolder(els.folderSelect.value);
+    });
+
+    els.uploadFolderSelect.addEventListener("change", async () => {
+      selectFolder(els.uploadFolderSelect.value);
+    });
+
+    els.folderGrid.addEventListener("click", (event) => {
+      const card = event.target.closest("[data-folder-id]");
+      if (!card) return;
+      selectFolder(card.dataset.folderId);
+    });
+
+    els.refreshBtn.addEventListener("click", () => handleAction(refreshFolders));
+    els.createFolderBtn.addEventListener("click", () => handleAction(createFolder));
+    els.deleteFolderBtn.addEventListener("click", () => handleAction(deleteSelectedFolder));
+    els.pickFilesBtn.addEventListener("click", () => els.fileInput.click());
+    els.pickFolderBtn.addEventListener("click", () => els.folderInput.click());
+    els.fileInput.addEventListener("change", () => setSelectedFiles(els.fileInput.files));
+    els.folderInput.addEventListener("change", () => setSelectedFiles(els.folderInput.files));
+    els.clearFilesBtn.addEventListener("click", () => {
+      state.selectedFiles = [];
+      els.fileInput.value = "";
+      els.folderInput.value = "";
+      renderSelectedFiles();
+      updateButtonStates();
+    });
+    els.uploadBtn.addEventListener("click", () => handleAction(uploadSelectedFiles));
+    els.loadMediaBtn.addEventListener("click", () => handleAction(loadFolderImages));
+    els.runBtn.addEventListener("click", () => handleAction(runQueue));
+    els.resetHistoryBtn.addEventListener("click", () => {
+      const folder = getSelectedFolder();
+      const scopeLabel = folder ? ` for "${folder.title || folder.name}"` : "";
+      const ok = window.confirm(`Clear saved queue history${scopeLabel}?`);
+      if (!ok) return;
+      if (folder) {
+        const prefix = `library:${config.libraryId}:folder:${folder.id}:`;
+        Object.keys(state.history.records).forEach((key) => {
+          if (key.startsWith(prefix)) delete state.history.records[key];
+        });
+      } else {
+        state.history.records = {};
+      }
+      saveHistory();
+      if (folder && state.items.length) state.queue = buildQueue(folder, state.items);
+      renderQueue();
+      logLine("Saved queue history cleared.");
+    });
+    els.stopBtn.addEventListener("click", () => {
+      state.stopRequested = true;
+      logLine("Stop requested. Current request will finish first.");
+    });
+  }
+
+  async function bootstrap() {
+    const savedUi = loadUiState();
+    if (savedUi.aspect) config.aspect = savedUi.aspect;
+    if (savedUi.videoLength) config.videoLength = savedUi.videoLength;
+    if (savedUi.delayBetweenRequestsMs) config.delayBetweenRequestsMs = savedUi.delayBetweenRequestsMs;
+    if (savedUi.parallelLimitRetryDelayMs) {
+      config.parallelLimitRetryDelayMs = savedUi.parallelLimitRetryDelayMs;
+    }
+
+    els.aspect.value = config.aspect;
+    els.videoLength.value = String(config.videoLength);
+    els.delayInput.value = String(config.delayBetweenRequestsMs);
+    els.retryDelayInput.value = String(config.parallelLimitRetryDelayMs);
+    state.selectedFolderId = savedUi.selectedFolderId || null;
+
+    ["aspect", "videoLength", "delayInput", "retryDelayInput"].forEach((key) => {
+      const element = els[key];
+      element.addEventListener("change", () => {
+        updateConfigFromInputs();
+        saveUiState({
+          aspect: config.aspect,
+          videoLength: config.videoLength,
+          delayBetweenRequestsMs: config.delayBetweenRequestsMs,
+          parallelLimitRetryDelayMs: config.parallelLimitRetryDelayMs,
+        });
+      });
+    });
+
+    attachEvents();
+    setPanelVisible(!savedUi.collapsed);
+    setActiveTab(savedUi.activeTab || "folders");
+    renderSelectedFiles();
+    updateButtonStates();
+    await refreshFolders();
+    renderQueue();
+    await pollStatuses();
+    setInterval(() => {
+      pollStatuses().catch((error) => console.warn("Status poll failed", error));
+    }, config.pollIntervalMs);
+    logLine("Manager ready.");
+  }
+
+  bootstrap().catch((error) => {
+    console.error("VideoExpress manager bootstrap failed.", error);
+    alert(`VideoExpress manager failed to start.\n\n${error.message || error}`);
+  });
+})();
