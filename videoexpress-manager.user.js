@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         VideoExpress Library Manager
 // @namespace    https://app.videoexpress.ai/
-// @version      0.3.1
+// @version      0.4.0
 // @description  Manage folders, upload images, and batch convert images to videos inside VideoExpress AI.
 // @match        https://app.videoexpress.ai/*
 // @grant        none
 // @run-at       document-idle
-// @updateURL    https://raw.githubusercontent.com/ayyfahim/videoexpress.aiAutomator/main/videoexpress-manager.user.js
-// @downloadURL  https://raw.githubusercontent.com/ayyfahim/videoexpress.aiAutomator/main/videoexpress-manager.user.js
+// @updateURL    https://raw.githubusercontent.com/ayyfahim/vea_automator/master/videoexpress-manager.user.js
+// @downloadURL  https://raw.githubusercontent.com/ayyfahim/vea_automator/master/videoexpress-manager.user.js
 // ==/UserScript==
 
 (function () {
@@ -55,6 +55,16 @@
     selectedFiles: [],
     videos: [],
     selectedVideoIds: new Set(),
+    dragging: false,
+    dragOffsetX: 0,
+    dragOffsetY: 0,
+    videoFilters: {
+      query: "",
+      dateFrom: "",
+      dateTo: "",
+      minSizeMb: "",
+      maxSizeMb: "",
+    },
     activeTab: "folders",
     queue: [],
     activeStatuses: new Map(),
@@ -421,6 +431,11 @@
         padding: 13px 14px 12px;
         background: #ffffff;
         border-bottom: 1px solid #dfe5ed;
+        cursor: move;
+        user-select: none;
+      }
+      #ve-manager-header button {
+        cursor: pointer;
       }
       #ve-manager-title {
         font-size: 16px;
@@ -880,13 +895,25 @@
               <button class="ve-button primary" id="ve-load-videos-btn" type="button"><i class="bi bi-collection-play"></i> Load videos</button>
             </div>
             <div class="ve-row">
+              <input class="ve-input" id="ve-video-filter-query" type="search" placeholder="Filter by name or media ID" />
+            </div>
+            <div class="ve-row">
+              <input class="ve-input" id="ve-video-filter-date-from" type="date" title="Created from" />
+              <input class="ve-input" id="ve-video-filter-date-to" type="date" title="Created to" />
+            </div>
+            <div class="ve-row">
+              <input class="ve-input" id="ve-video-filter-min-size" type="number" min="0" step="1" placeholder="Min MB" />
+              <input class="ve-input" id="ve-video-filter-max-size" type="number" min="0" step="1" placeholder="Max MB" />
+              <button class="ve-button ghost" id="ve-clear-video-filters-btn" type="button"><i class="bi bi-x-lg"></i> Clear filters</button>
+            </div>
+            <div class="ve-row">
               <input class="ve-input" id="ve-download-min-delay" type="number" min="1000" step="1000" value="${config.downloadMinDelayMs}" />
               <input class="ve-input" id="ve-download-max-delay" type="number" min="1000" step="1000" value="${config.downloadMaxDelayMs}" />
             </div>
             <div class="ve-download-controls">
               <button class="ve-button ghost" id="ve-select-all-videos-btn" type="button"><i class="bi bi-check2-square"></i> Select all</button>
               <button class="ve-button success" id="ve-download-selected-btn" type="button"><i class="bi bi-download"></i> Selected</button>
-              <button class="ve-button primary" id="ve-download-all-btn" type="button"><i class="bi bi-download"></i> All loaded</button>
+              <button class="ve-button primary" id="ve-download-all-btn" type="button"><i class="bi bi-download"></i> Visible</button>
             </div>
             <div class="ve-row" style="margin-top:10px">
               <button class="ve-button warn" id="ve-stop-downloads-btn" type="button"><i class="bi bi-stop-fill"></i> Stop downloads</button>
@@ -952,6 +979,12 @@
     stopBtn: root.querySelector("#ve-stop-btn"),
     resetHistoryBtn: root.querySelector("#ve-reset-history-btn"),
     loadVideosBtn: root.querySelector("#ve-load-videos-btn"),
+    videoFilterQuery: root.querySelector("#ve-video-filter-query"),
+    videoFilterDateFrom: root.querySelector("#ve-video-filter-date-from"),
+    videoFilterDateTo: root.querySelector("#ve-video-filter-date-to"),
+    videoFilterMinSize: root.querySelector("#ve-video-filter-min-size"),
+    videoFilterMaxSize: root.querySelector("#ve-video-filter-max-size"),
+    clearVideoFiltersBtn: root.querySelector("#ve-clear-video-filters-btn"),
     downloadMinDelay: root.querySelector("#ve-download-min-delay"),
     downloadMaxDelay: root.querySelector("#ve-download-max-delay"),
     selectAllVideosBtn: root.querySelector("#ve-select-all-videos-btn"),
@@ -980,6 +1013,30 @@
     els.panel.classList.toggle("ve-hidden", !visible);
     els.toggle.classList.toggle("ve-hidden", visible);
     saveUiState({ collapsed: !visible });
+  }
+
+  function clampPanelPosition(left, top) {
+    const rect = root.getBoundingClientRect();
+    const margin = 8;
+    const maxLeft = Math.max(margin, window.innerWidth - rect.width - margin);
+    const maxTop = Math.max(margin, window.innerHeight - rect.height - margin);
+    return {
+      left: Math.min(Math.max(margin, left), maxLeft),
+      top: Math.min(Math.max(margin, top), maxTop),
+    };
+  }
+
+  function setPanelPosition(left, top, persist = true) {
+    const next = clampPanelPosition(left, top);
+    root.style.left = `${next.left}px`;
+    root.style.top = `${next.top}px`;
+    root.style.right = "auto";
+    if (persist) saveUiState({ panelPosition: next });
+  }
+
+  function restorePanelPosition(position) {
+    if (!position || typeof position.left !== "number" || typeof position.top !== "number") return;
+    setPanelPosition(position.left, position.top, false);
   }
 
   function setActiveTab(tab) {
@@ -1037,16 +1094,21 @@
   }
 
   function renderVideos() {
+    const visibleVideos = getFilteredVideos();
     const selectedCount = state.selectedVideoIds.size;
     const total = state.videos.length;
+    const visibleSelectedCount = visibleVideos.filter((video) =>
+      state.selectedVideoIds.has(String(video.id)),
+    ).length;
     els.downloadSummary.textContent = total
-      ? `${total} video${total === 1 ? "" : "s"} loaded | ${selectedCount} selected`
+      ? `${visibleVideos.length}/${total} visible | ${visibleSelectedCount} visible selected | ${selectedCount} total selected`
       : "No videos loaded yet.";
-    els.videoMasterCheckbox.checked = total > 0 && selectedCount === total;
+    els.videoMasterCheckbox.checked =
+      visibleVideos.length > 0 && visibleSelectedCount === visibleVideos.length;
     els.videoMasterCheckbox.indeterminate =
-      selectedCount > 0 && selectedCount < total;
-    els.videoBody.innerHTML = total
-      ? state.videos
+      visibleSelectedCount > 0 && visibleSelectedCount < visibleVideos.length;
+    els.videoBody.innerHTML = visibleVideos.length
+      ? visibleVideos
           .map((video) => {
             const checked = state.selectedVideoIds.has(String(video.id))
               ? "checked"
@@ -1072,6 +1134,53 @@
           })
           .join("")
       : `<tr><td colspan="5" class="ve-muted">Load videos from a folder first.</td></tr>`;
+  }
+
+  function getFilteredVideos() {
+    const query = state.videoFilters.query.trim().toLowerCase();
+    const fromTime = state.videoFilters.dateFrom
+      ? new Date(`${state.videoFilters.dateFrom}T00:00:00`).getTime()
+      : null;
+    const toTime = state.videoFilters.dateTo
+      ? new Date(`${state.videoFilters.dateTo}T23:59:59`).getTime()
+      : null;
+    const minBytes = state.videoFilters.minSizeMb
+      ? Number(state.videoFilters.minSizeMb) * 1024 * 1024
+      : null;
+    const maxBytes = state.videoFilters.maxSizeMb
+      ? Number(state.videoFilters.maxSizeMb) * 1024 * 1024
+      : null;
+
+    return state.videos.filter((video) => {
+      const haystack = `${video.name || ""} ${video.fileName || ""} ${video.id || ""}`.toLowerCase();
+      const createdAt = video.datetime ? new Date(video.datetime).getTime() : null;
+      const size = Number(video.size || 0);
+      if (query && !haystack.includes(query)) return false;
+      if (fromTime && (!createdAt || createdAt < fromTime)) return false;
+      if (toTime && (!createdAt || createdAt > toTime)) return false;
+      if (minBytes !== null && size < minBytes) return false;
+      if (maxBytes !== null && size > maxBytes) return false;
+      return true;
+    });
+  }
+
+  function syncVideoFiltersFromInputs() {
+    state.videoFilters = {
+      query: els.videoFilterQuery.value || "",
+      dateFrom: els.videoFilterDateFrom.value || "",
+      dateTo: els.videoFilterDateTo.value || "",
+      minSizeMb: els.videoFilterMinSize.value || "",
+      maxSizeMb: els.videoFilterMaxSize.value || "",
+    };
+    saveUiState({ videoFilters: state.videoFilters });
+  }
+
+  function applyVideoFiltersToInputs() {
+    els.videoFilterQuery.value = state.videoFilters.query || "";
+    els.videoFilterDateFrom.value = state.videoFilters.dateFrom || "";
+    els.videoFilterDateTo.value = state.videoFilters.dateTo || "";
+    els.videoFilterMinSize.value = state.videoFilters.minSizeMb || "";
+    els.videoFilterMaxSize.value = state.videoFilters.maxSizeMb || "";
   }
 
   function renderSelectedFiles() {
@@ -1627,6 +1736,7 @@
   }
 
   function updateButtonStates() {
+    const visibleVideoCount = getFilteredVideos().length;
     els.runBtn.disabled = state.running || state.uploadInProgress;
     els.stopBtn.disabled = !state.running;
     els.uploadBtn.disabled =
@@ -1658,12 +1768,12 @@
       state.running ||
       state.uploadInProgress ||
       state.downloadInProgress ||
-      !state.videos.length;
+      !visibleVideoCount;
     els.selectAllVideosBtn.disabled =
       state.running ||
       state.uploadInProgress ||
       state.downloadInProgress ||
-      !state.videos.length;
+      !visibleVideoCount;
     els.stopDownloadsBtn.disabled = !state.downloadInProgress;
   }
 
@@ -1681,6 +1791,39 @@
   function attachEvents() {
     els.closeBtn.addEventListener("click", () => setPanelVisible(false));
     els.toggle.addEventListener("click", () => setPanelVisible(true));
+    root
+      .querySelector("#ve-manager-header")
+      .addEventListener("pointerdown", (event) => {
+        if (event.target.closest("button")) return;
+        const rect = root.getBoundingClientRect();
+        state.dragging = true;
+        state.dragOffsetX = event.clientX - rect.left;
+        state.dragOffsetY = event.clientY - rect.top;
+        event.currentTarget.setPointerCapture(event.pointerId);
+      });
+    root
+      .querySelector("#ve-manager-header")
+      .addEventListener("pointermove", (event) => {
+        if (!state.dragging) return;
+        setPanelPosition(
+          event.clientX - state.dragOffsetX,
+          event.clientY - state.dragOffsetY,
+          false,
+        );
+      });
+    root
+      .querySelector("#ve-manager-header")
+      .addEventListener("pointerup", (event) => {
+        if (!state.dragging) return;
+        state.dragging = false;
+        const rect = root.getBoundingClientRect();
+        setPanelPosition(rect.left, rect.top, true);
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      });
+    window.addEventListener("resize", () => {
+      const rect = root.getBoundingClientRect();
+      if (rect.width && rect.height) setPanelPosition(rect.left, rect.top, true);
+    });
     els.tabs.forEach((tab) => {
       tab.addEventListener("click", () => setActiveTab(tab.dataset.tab));
     });
@@ -1737,10 +1880,44 @@
     els.loadVideosBtn.addEventListener("click", () =>
       handleAction(loadFolderVideos),
     );
+    [
+      els.videoFilterQuery,
+      els.videoFilterDateFrom,
+      els.videoFilterDateTo,
+      els.videoFilterMinSize,
+      els.videoFilterMaxSize,
+    ].forEach((element) => {
+      element.addEventListener("input", () => {
+        syncVideoFiltersFromInputs();
+        renderVideos();
+        updateButtonStates();
+      });
+      element.addEventListener("change", () => {
+        syncVideoFiltersFromInputs();
+        renderVideos();
+        updateButtonStates();
+      });
+    });
+    els.clearVideoFiltersBtn.addEventListener("click", () => {
+      state.videoFilters = {
+        query: "",
+        dateFrom: "",
+        dateTo: "",
+        minSizeMb: "",
+        maxSizeMb: "",
+      };
+      applyVideoFiltersToInputs();
+      saveUiState({ videoFilters: state.videoFilters });
+      renderVideos();
+      updateButtonStates();
+    });
     els.videoMasterCheckbox.addEventListener("change", () => {
-      state.selectedVideoIds = els.videoMasterCheckbox.checked
-        ? new Set(state.videos.map((video) => String(video.id)))
-        : new Set();
+      const visibleVideos = getFilteredVideos();
+      if (els.videoMasterCheckbox.checked) {
+        visibleVideos.forEach((video) => state.selectedVideoIds.add(String(video.id)));
+      } else {
+        visibleVideos.forEach((video) => state.selectedVideoIds.delete(String(video.id)));
+      }
       renderVideos();
       updateButtonStates();
     });
@@ -1756,9 +1933,7 @@
       updateButtonStates();
     });
     els.selectAllVideosBtn.addEventListener("click", () => {
-      state.selectedVideoIds = new Set(
-        state.videos.map((video) => String(video.id)),
-      );
+      getFilteredVideos().forEach((video) => state.selectedVideoIds.add(String(video.id)));
       renderVideos();
       updateButtonStates();
     });
@@ -1769,7 +1944,9 @@
       handleAction(() => downloadVideos(selected, "Selected downloads"));
     });
     els.downloadAllBtn.addEventListener("click", () => {
-      handleAction(() => downloadVideos(state.videos, "All loaded downloads"));
+      handleAction(() =>
+        downloadVideos(getFilteredVideos(), "Visible downloads"),
+      );
     });
     els.stopDownloadsBtn.addEventListener("click", () => {
       state.stopRequested = true;
@@ -1815,6 +1992,12 @@
       config.downloadMinDelayMs = savedUi.downloadMinDelayMs;
     if (savedUi.downloadMaxDelayMs)
       config.downloadMaxDelayMs = savedUi.downloadMaxDelayMs;
+    if (savedUi.videoFilters && typeof savedUi.videoFilters === "object") {
+      state.videoFilters = {
+        ...state.videoFilters,
+        ...savedUi.videoFilters,
+      };
+    }
 
     els.aspect.value = config.aspect;
     els.videoLength.value = String(config.videoLength);
@@ -1823,6 +2006,7 @@
     els.downloadMinDelay.value = String(config.downloadMinDelayMs);
     els.downloadMaxDelay.value = String(config.downloadMaxDelayMs);
     state.selectedFolderId = savedUi.selectedFolderId || null;
+    applyVideoFiltersToInputs();
 
     [
       "aspect",
@@ -1848,6 +2032,7 @@
 
     attachEvents();
     setPanelVisible(!savedUi.collapsed);
+    restorePanelPosition(savedUi.panelPosition);
     setActiveTab(savedUi.activeTab || "folders");
     renderSelectedFiles();
     renderVideos();
