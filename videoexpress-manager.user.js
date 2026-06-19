@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoExpress Library Manager
 // @namespace    https://app.videoexpress.ai/
-// @version      0.3.0
+// @version      0.3.1
 // @description  Manage folders, upload images, and batch convert images to videos inside VideoExpress AI.
 // @match        https://app.videoexpress.ai/*
 // @grant        none
@@ -220,7 +220,10 @@
     },
 
     async deleteFolder(folderId) {
-      return deleteRequest(`/library/delete_category/${folderId}`, "Delete folder");
+      return deleteRequest(
+        `/library/delete_category/${folderId}`,
+        "Delete folder",
+      );
     },
 
     async getMedia(folderId, page = 1, start = 0, filter = "image") {
@@ -284,7 +287,11 @@
       formData.append("title", title);
       formData.append("categoryId", String(folderId));
       formData.append("file", file, file.name);
-      return postMultipart(`/library/upload/${config.libraryId}`, formData, `Upload ${file.name}`);
+      return postMultipart(
+        `/library/upload/${config.libraryId}`,
+        formData,
+        `Upload ${file.name}`,
+      );
     },
 
     async generateImageVideo(media, prompt, options = {}) {
@@ -309,17 +316,28 @@
         faceSwap: "0",
         mode: "",
       });
-      return postFormJson("/ai/api/image2video", params.toString(), "Generate video");
+      return postFormJson(
+        "/ai/api/image2video",
+        params.toString(),
+        "Generate video",
+      );
     },
 
     async getStatus(uuid) {
       const cacheBust = Date.now();
-      return getJson(`/ai/api/status/${uuid}?_=${cacheBust}`, `Load status ${uuid}`);
+      return getJson(
+        `/ai/api/status/${uuid}?_=${cacheBust}`,
+        `Load status ${uuid}`,
+      );
     },
   };
 
   function getSelectedFolder() {
-    return state.folders.find((item) => String(item.id) === String(state.selectedFolderId)) || null;
+    return (
+      state.folders.find(
+        (item) => String(item.id) === String(state.selectedFolderId),
+      ) || null
+    );
   }
 
   function makeRecordKey(folderId, mediaId) {
@@ -340,7 +358,9 @@
   }
 
   function isParallelLimitMessage(message) {
-    return /multiple videos in progress|up to 5 ai videos|parallel/i.test(String(message || ""));
+    return /multiple videos in progress|up to 5 ai videos|parallel/i.test(
+      String(message || ""),
+    );
   }
 
   function buildQueue(folder, items) {
@@ -353,7 +373,10 @@
           ? "running"
           : "submitted"
         : "";
-      const derivedStatus = pendingMediaStatus && !historyStatus ? pendingMediaStatus : historyStatus || "";
+      const derivedStatus =
+        pendingMediaStatus && !historyStatus
+          ? pendingMediaStatus
+          : historyStatus || "";
       const normalizedStatus = normalizeStatus(derivedStatus);
       return {
         media,
@@ -979,19 +1002,28 @@
   function renderFolders() {
     const options = state.folders
       .map((folder) => {
-        const selected = String(folder.id) === String(state.selectedFolderId) ? "selected" : "";
+        const selected =
+          String(folder.id) === String(state.selectedFolderId)
+            ? "selected"
+            : "";
         return `<option value="${folder.id}" ${selected}>${escapeHtml(folder.title || folder.name)} (${folder.id})</option>`;
       })
       .join("");
-    els.folderSelect.innerHTML = options || `<option value="">No folders found</option>`;
-    els.uploadFolderSelect.innerHTML = options || `<option value="">No folders found</option>`;
-    els.downloadFolderSelect.innerHTML = options || `<option value="">No folders found</option>`;
+    els.folderSelect.innerHTML =
+      options || `<option value="">No folders found</option>`;
+    els.uploadFolderSelect.innerHTML =
+      options || `<option value="">No folders found</option>`;
+    els.downloadFolderSelect.innerHTML =
+      options || `<option value="">No folders found</option>`;
     els.uploadFolderSelect.value = state.selectedFolderId || "";
     els.downloadFolderSelect.value = state.selectedFolderId || "";
     els.folderGrid.innerHTML = state.folders.length
       ? state.folders
           .map((folder) => {
-            const active = String(folder.id) === String(state.selectedFolderId) ? "active" : "";
+            const active =
+              String(folder.id) === String(state.selectedFolderId)
+                ? "active"
+                : "";
             return `
               <button class="ve-folder-card ${active}" data-folder-id="${folder.id}" type="button" title="${escapeHtml(folder.title || folder.name)}">
                 <i class="bi bi-folder2"></i>
@@ -1011,11 +1043,14 @@
       ? `${total} video${total === 1 ? "" : "s"} loaded | ${selectedCount} selected`
       : "No videos loaded yet.";
     els.videoMasterCheckbox.checked = total > 0 && selectedCount === total;
-    els.videoMasterCheckbox.indeterminate = selectedCount > 0 && selectedCount < total;
+    els.videoMasterCheckbox.indeterminate =
+      selectedCount > 0 && selectedCount < total;
     els.videoBody.innerHTML = total
       ? state.videos
           .map((video) => {
-            const checked = state.selectedVideoIds.has(String(video.id)) ? "checked" : "";
+            const checked = state.selectedVideoIds.has(String(video.id))
+              ? "checked"
+              : "";
             const imageUrl = video.thumbUrl || "";
             return `
               <tr>
@@ -1056,7 +1091,10 @@
   }
 
   function isImageFile(file) {
-    return /^image\//i.test(file.type || "") || /\.(png|jpe?g|webp|gif|bmp)$/i.test(file.name || "");
+    return (
+      /^image\//i.test(file.type || "") ||
+      /\.(png|jpe?g|webp|gif|bmp)$/i.test(file.name || "")
+    );
   }
 
   function setSelectedFiles(fileList) {
@@ -1065,7 +1103,10 @@
       .sort((a, b) => {
         const nameA = a.webkitRelativePath || a.name;
         const nameB = b.webkitRelativePath || b.name;
-        return nameA.localeCompare(nameB, undefined, { numeric: true, sensitivity: "base" });
+        return nameA.localeCompare(nameB, undefined, {
+          numeric: true,
+          sensitivity: "base",
+        });
       });
     renderSelectedFiles();
     updateButtonStates();
@@ -1074,9 +1115,13 @@
   function renderQueue() {
     const runningCount = state.queue.filter((item) => {
       const status = normalizeStatus(item.status);
-      return status === "submitted" || status === "running" || status === "started";
+      return (
+        status === "submitted" || status === "running" || status === "started"
+      );
     }).length;
-    const doneCount = state.queue.filter((item) => normalizeStatus(item.status) === "completed").length;
+    const doneCount = state.queue.filter(
+      (item) => normalizeStatus(item.status) === "completed",
+    ).length;
     const queuedCount = state.queue.filter((item) => {
       const status = normalizeStatus(item.status);
       return !item.skip || status === "failed" || status === "parallel_limit";
@@ -1096,11 +1141,15 @@
       ? state.queue
           .slice(0, 150)
           .map((item) => {
-            const record = item.record || getRecord(state.selectedFolderId, item.media.id);
+            const record =
+              item.record || getRecord(state.selectedFolderId, item.media.id);
             const latestStatus = item.status || (record && record.status) || "";
-            const updatedAt = record && (record.updatedAt || record.completedAt || record.startedAt);
+            const updatedAt =
+              record &&
+              (record.updatedAt || record.completedAt || record.startedAt);
             const imageUrl = item.media.thumbUrl || item.media.mediaPath || "";
-            const displayStatus = latestStatus || (item.skip ? "skipped" : "idle");
+            const displayStatus =
+              latestStatus || (item.skip ? "skipped" : "idle");
             return `
               <tr>
                 <td>
@@ -1158,7 +1207,9 @@
     );
     if (!currentExists) {
       const saved = loadUiState().selectedFolderId;
-      const savedExists = state.folders.some((folder) => String(folder.id) === String(saved));
+      const savedExists = state.folders.some(
+        (folder) => String(folder.id) === String(saved),
+      );
       state.selectedFolderId = savedExists
         ? saved
         : (state.folders[0] && state.folders[0].id) || null;
@@ -1198,7 +1249,9 @@
     if (!folder) throw new Error("Please select a folder first.");
     logLine(`Loading videos for folder "${folder.title || folder.name}"...`);
     const payload = await api.getAllVideos(folder.id);
-    state.videos = payload.results.filter((item) => item.type === "video" || item.extension === "mp4");
+    state.videos = payload.results.filter(
+      (item) => item.type === "video" || item.extension === "mp4",
+    );
     state.selectedVideoIds = new Set();
     renderVideos();
     updateButtonStates();
@@ -1211,7 +1264,9 @@
     await api.createFolder(name);
     els.newFolderInput.value = "";
     await refreshFolders();
-    const created = state.folders.find((folder) => folder.name === name || folder.title === name);
+    const created = state.folders.find(
+      (folder) => folder.name === name || folder.title === name,
+    );
     if (created) {
       state.selectedFolderId = created.id;
       renderFolders();
@@ -1223,7 +1278,9 @@
   async function deleteSelectedFolder() {
     const folder = getSelectedFolder();
     if (!folder) throw new Error("No folder selected.");
-    const ok = window.confirm(`Delete folder "${folder.title || folder.name}" (${folder.id})?`);
+    const ok = window.confirm(
+      `Delete folder "${folder.title || folder.name}" (${folder.id})?`,
+    );
     if (!ok) return;
     await api.deleteFolder(folder.id);
     state.items = [];
@@ -1269,9 +1326,13 @@
     config.videoLength = Number(els.videoLength.value || 10);
     config.aspect = els.aspect.value || "16:9";
     config.delayBetweenRequestsMs = Number(els.delayInput.value || 0);
-    config.parallelLimitRetryDelayMs = Number(els.retryDelayInput.value || 60000);
+    config.parallelLimitRetryDelayMs = Number(
+      els.retryDelayInput.value || 60000,
+    );
     config.downloadMinDelayMs = Number(els.downloadMinDelay.value || 6000);
-    config.downloadMaxDelayMs = Number(els.downloadMaxDelay.value || config.downloadMinDelayMs);
+    config.downloadMaxDelayMs = Number(
+      els.downloadMaxDelay.value || config.downloadMinDelayMs,
+    );
     if (config.downloadMaxDelayMs < config.downloadMinDelayMs) {
       config.downloadMaxDelayMs = config.downloadMinDelayMs;
       els.downloadMaxDelay.value = String(config.downloadMaxDelayMs);
@@ -1309,10 +1370,15 @@
         els.downloadSummary.textContent = `${label}: starting ${completed}/${total} | ${video.name || video.id}`;
         triggerBrowserDownload(video);
         els.downloadProgress.style.width = `${Math.round((completed / total) * 100)}%`;
-        logLine(`Download started ${completed}/${total}: ${video.name || video.id}`);
+        logLine(
+          `Download started ${completed}/${total}: ${video.name || video.id}`,
+        );
 
         if (completed < total && !state.stopRequested) {
-          const waitMs = randomDelay(config.downloadMinDelayMs, config.downloadMaxDelayMs);
+          const waitMs = randomDelay(
+            config.downloadMinDelayMs,
+            config.downloadMaxDelayMs,
+          );
           els.downloadSummary.textContent = `${label}: waiting ${Math.round(waitMs / 1000)}s before next download (${completed}/${total})`;
           await sleep(waitMs);
         }
@@ -1323,7 +1389,11 @@
       els.downloadSummary.textContent = state.stopRequested
         ? `${label}: stopped after ${completed}/${total}`
         : `${label}: queued ${completed}/${total} downloads`;
-      logLine(state.stopRequested ? "Download queue stopped." : "Download queue finished.");
+      logLine(
+        state.stopRequested
+          ? "Download queue stopped."
+          : "Download queue finished.",
+      );
     }
   }
 
@@ -1357,7 +1427,10 @@
           continue;
         }
 
-        let retries = existing && existing.parallelLimitRetries ? existing.parallelLimitRetries : 0;
+        let retries =
+          existing && existing.parallelLimitRetries
+            ? existing.parallelLimitRetries
+            : 0;
         let done = false;
 
         while (!done) {
@@ -1387,10 +1460,16 @@
           logLine(`Submitting ${item.media.name}`);
 
           try {
-            const result = await api.generateImageVideo(item.media, item.prompt);
+            const result = await api.generateImageVideo(
+              item.media,
+              item.prompt,
+            );
             const completedAt = new Date().toISOString();
 
-            if (result && isParallelLimitMessage(result.error || result.message)) {
+            if (
+              result &&
+              isParallelLimitMessage(result.error || result.message)
+            ) {
               retries += 1;
               const nextRecord = {
                 ...baseRecord,
@@ -1436,14 +1515,21 @@
             item.record = nextRecord;
             item.status = nextRecord.status;
             if (nextRecord.uuid) {
-              state.activeStatuses.set(nextRecord.uuid, { folderId: folder.id, mediaId: item.media.id });
+              state.activeStatuses.set(nextRecord.uuid, {
+                folderId: folder.id,
+                mediaId: item.media.id,
+              });
             }
             renderQueue();
             done = true;
           } catch (error) {
             const failedAt = new Date().toISOString();
-            const message = String(error && (error.message || error.stack || error));
-            const status = isParallelLimitMessage(message) ? "parallel_limit" : "failed";
+            const message = String(
+              error && (error.message || error.stack || error),
+            );
+            const status = isParallelLimitMessage(message)
+              ? "parallel_limit"
+              : "failed";
             if (status === "parallel_limit") retries += 1;
 
             const nextRecord = {
@@ -1486,10 +1572,15 @@
   }
 
   async function pollStatuses() {
-    const pendingRecords = Object.values(state.history.records).filter((record) => {
-      const status = normalizeStatus(record.status);
-      return record.uuid && ["submitted", "running", "parallel_limit"].includes(status);
-    });
+    const pendingRecords = Object.values(state.history.records).filter(
+      (record) => {
+        const status = normalizeStatus(record.status);
+        return (
+          record.uuid &&
+          ["submitted", "running", "parallel_limit"].includes(status)
+        );
+      },
+    );
 
     for (const record of pendingRecords) {
       try {
@@ -1508,7 +1599,11 @@
           mapped = "completed";
         } else if (status === "failed" || status === "error") {
           mapped = "failed";
-        } else if (status === "queued" || status === "pending" || status === "running") {
+        } else if (
+          status === "queued" ||
+          status === "pending" ||
+          status === "running"
+        ) {
           mapped = "running";
         }
 
@@ -1534,17 +1629,41 @@
   function updateButtonStates() {
     els.runBtn.disabled = state.running || state.uploadInProgress;
     els.stopBtn.disabled = !state.running;
-    els.uploadBtn.disabled = state.uploadInProgress || state.running || state.downloadInProgress || !state.selectedFiles.length;
-    els.loadMediaBtn.disabled = state.running || state.uploadInProgress || state.downloadInProgress;
-    els.createFolderBtn.disabled = state.running || state.uploadInProgress || state.downloadInProgress;
-    els.deleteFolderBtn.disabled = state.running || state.uploadInProgress || state.downloadInProgress;
-    els.refreshBtn.disabled = state.running || state.uploadInProgress || state.downloadInProgress;
-    els.clearFilesBtn.disabled = state.uploadInProgress || state.running || state.downloadInProgress || !state.selectedFiles.length;
-    els.loadVideosBtn.disabled = state.running || state.uploadInProgress || state.downloadInProgress;
+    els.uploadBtn.disabled =
+      state.uploadInProgress ||
+      state.running ||
+      state.downloadInProgress ||
+      !state.selectedFiles.length;
+    els.loadMediaBtn.disabled =
+      state.running || state.uploadInProgress || state.downloadInProgress;
+    els.createFolderBtn.disabled =
+      state.running || state.uploadInProgress || state.downloadInProgress;
+    els.deleteFolderBtn.disabled =
+      state.running || state.uploadInProgress || state.downloadInProgress;
+    els.refreshBtn.disabled =
+      state.running || state.uploadInProgress || state.downloadInProgress;
+    els.clearFilesBtn.disabled =
+      state.uploadInProgress ||
+      state.running ||
+      state.downloadInProgress ||
+      !state.selectedFiles.length;
+    els.loadVideosBtn.disabled =
+      state.running || state.uploadInProgress || state.downloadInProgress;
     els.downloadSelectedBtn.disabled =
-      state.running || state.uploadInProgress || state.downloadInProgress || !state.selectedVideoIds.size;
-    els.downloadAllBtn.disabled = state.running || state.uploadInProgress || state.downloadInProgress || !state.videos.length;
-    els.selectAllVideosBtn.disabled = state.running || state.uploadInProgress || state.downloadInProgress || !state.videos.length;
+      state.running ||
+      state.uploadInProgress ||
+      state.downloadInProgress ||
+      !state.selectedVideoIds.size;
+    els.downloadAllBtn.disabled =
+      state.running ||
+      state.uploadInProgress ||
+      state.downloadInProgress ||
+      !state.videos.length;
+    els.selectAllVideosBtn.disabled =
+      state.running ||
+      state.uploadInProgress ||
+      state.downloadInProgress ||
+      !state.videos.length;
     els.stopDownloadsBtn.disabled = !state.downloadInProgress;
   }
 
@@ -1584,13 +1703,23 @@
       selectFolder(card.dataset.folderId);
     });
 
-    els.refreshBtn.addEventListener("click", () => handleAction(refreshFolders));
-    els.createFolderBtn.addEventListener("click", () => handleAction(createFolder));
-    els.deleteFolderBtn.addEventListener("click", () => handleAction(deleteSelectedFolder));
+    els.refreshBtn.addEventListener("click", () =>
+      handleAction(refreshFolders),
+    );
+    els.createFolderBtn.addEventListener("click", () =>
+      handleAction(createFolder),
+    );
+    els.deleteFolderBtn.addEventListener("click", () =>
+      handleAction(deleteSelectedFolder),
+    );
     els.pickFilesBtn.addEventListener("click", () => els.fileInput.click());
     els.pickFolderBtn.addEventListener("click", () => els.folderInput.click());
-    els.fileInput.addEventListener("change", () => setSelectedFiles(els.fileInput.files));
-    els.folderInput.addEventListener("change", () => setSelectedFiles(els.folderInput.files));
+    els.fileInput.addEventListener("change", () =>
+      setSelectedFiles(els.fileInput.files),
+    );
+    els.folderInput.addEventListener("change", () =>
+      setSelectedFiles(els.folderInput.files),
+    );
     els.clearFilesBtn.addEventListener("click", () => {
       state.selectedFiles = [];
       els.fileInput.value = "";
@@ -1598,10 +1727,16 @@
       renderSelectedFiles();
       updateButtonStates();
     });
-    els.uploadBtn.addEventListener("click", () => handleAction(uploadSelectedFiles));
-    els.loadMediaBtn.addEventListener("click", () => handleAction(loadFolderImages));
+    els.uploadBtn.addEventListener("click", () =>
+      handleAction(uploadSelectedFiles),
+    );
+    els.loadMediaBtn.addEventListener("click", () =>
+      handleAction(loadFolderImages),
+    );
     els.runBtn.addEventListener("click", () => handleAction(runQueue));
-    els.loadVideosBtn.addEventListener("click", () => handleAction(loadFolderVideos));
+    els.loadVideosBtn.addEventListener("click", () =>
+      handleAction(loadFolderVideos),
+    );
     els.videoMasterCheckbox.addEventListener("change", () => {
       state.selectedVideoIds = els.videoMasterCheckbox.checked
         ? new Set(state.videos.map((video) => String(video.id)))
@@ -1621,12 +1756,16 @@
       updateButtonStates();
     });
     els.selectAllVideosBtn.addEventListener("click", () => {
-      state.selectedVideoIds = new Set(state.videos.map((video) => String(video.id)));
+      state.selectedVideoIds = new Set(
+        state.videos.map((video) => String(video.id)),
+      );
       renderVideos();
       updateButtonStates();
     });
     els.downloadSelectedBtn.addEventListener("click", () => {
-      const selected = state.videos.filter((video) => state.selectedVideoIds.has(String(video.id)));
+      const selected = state.videos.filter((video) =>
+        state.selectedVideoIds.has(String(video.id)),
+      );
       handleAction(() => downloadVideos(selected, "Selected downloads"));
     });
     els.downloadAllBtn.addEventListener("click", () => {
@@ -1634,7 +1773,9 @@
     });
     els.stopDownloadsBtn.addEventListener("click", () => {
       state.stopRequested = true;
-      logLine("Download stop requested. Current browser download will finish starting first.");
+      logLine(
+        "Download stop requested. Current browser download will finish starting first.",
+      );
     });
     els.resetHistoryBtn.addEventListener("click", () => {
       const folder = getSelectedFolder();
@@ -1650,7 +1791,8 @@
         state.history.records = {};
       }
       saveHistory();
-      if (folder && state.items.length) state.queue = buildQueue(folder, state.items);
+      if (folder && state.items.length)
+        state.queue = buildQueue(folder, state.items);
       renderQueue();
       logLine("Saved queue history cleared.");
     });
@@ -1664,12 +1806,15 @@
     const savedUi = loadUiState();
     if (savedUi.aspect) config.aspect = savedUi.aspect;
     if (savedUi.videoLength) config.videoLength = savedUi.videoLength;
-    if (savedUi.delayBetweenRequestsMs) config.delayBetweenRequestsMs = savedUi.delayBetweenRequestsMs;
+    if (savedUi.delayBetweenRequestsMs)
+      config.delayBetweenRequestsMs = savedUi.delayBetweenRequestsMs;
     if (savedUi.parallelLimitRetryDelayMs) {
       config.parallelLimitRetryDelayMs = savedUi.parallelLimitRetryDelayMs;
     }
-    if (savedUi.downloadMinDelayMs) config.downloadMinDelayMs = savedUi.downloadMinDelayMs;
-    if (savedUi.downloadMaxDelayMs) config.downloadMaxDelayMs = savedUi.downloadMaxDelayMs;
+    if (savedUi.downloadMinDelayMs)
+      config.downloadMinDelayMs = savedUi.downloadMinDelayMs;
+    if (savedUi.downloadMaxDelayMs)
+      config.downloadMaxDelayMs = savedUi.downloadMaxDelayMs;
 
     els.aspect.value = config.aspect;
     els.videoLength.value = String(config.videoLength);
@@ -1679,7 +1824,14 @@
     els.downloadMaxDelay.value = String(config.downloadMaxDelayMs);
     state.selectedFolderId = savedUi.selectedFolderId || null;
 
-    ["aspect", "videoLength", "delayInput", "retryDelayInput", "downloadMinDelay", "downloadMaxDelay"].forEach((key) => {
+    [
+      "aspect",
+      "videoLength",
+      "delayInput",
+      "retryDelayInput",
+      "downloadMinDelay",
+      "downloadMaxDelay",
+    ].forEach((key) => {
       const element = els[key];
       element.addEventListener("change", () => {
         updateConfigFromInputs();
@@ -1704,7 +1856,9 @@
     renderQueue();
     await pollStatuses();
     setInterval(() => {
-      pollStatuses().catch((error) => console.warn("Status poll failed", error));
+      pollStatuses().catch((error) =>
+        console.warn("Status poll failed", error),
+      );
     }, config.pollIntervalMs);
     logLine("Manager ready.");
   }
