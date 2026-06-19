@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoExpress Library Manager
 // @namespace    https://app.videoexpress.ai/
-// @version      0.2.0
+// @version      0.3.0
 // @description  Manage folders, upload images, and batch convert images to videos inside VideoExpress AI.
 // @match        https://app.videoexpress.ai/*
 // @grant        none
@@ -28,6 +28,8 @@
     maxParallelLimitRetries: Infinity,
     pollIntervalMs: 15000,
     skipStartedWithoutUuid: true,
+    downloadMinDelayMs: 6000,
+    downloadMaxDelayMs: 14000,
     promptCleaner: {
       stripExtension: true,
       replaceUnderscores: true,
@@ -49,7 +51,10 @@
     running: false,
     stopRequested: false,
     uploadInProgress: false,
+    downloadInProgress: false,
     selectedFiles: [],
+    videos: [],
+    selectedVideoIds: new Set(),
     activeTab: "folders",
     queue: [],
     activeStatuses: new Map(),
@@ -69,6 +74,14 @@
     if (value < 1024) return `${value} B`;
     if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
     return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  };
+
+  const formatDuration = (milliseconds) => {
+    const seconds = Math.round(Number(milliseconds || 0) / 1000);
+    if (!seconds) return "-";
+    const minutes = Math.floor(seconds / 60);
+    const rest = seconds % 60;
+    return `${minutes}:${String(rest).padStart(2, "0")}`;
   };
 
   function cleanPrompt(name) {
@@ -246,6 +259,25 @@
       return { total: items.length, results: items };
     },
 
+    async getAllVideos(folderId) {
+      const items = [];
+      let page = 1;
+      let start = 0;
+      let total = Infinity;
+
+      while (start < total) {
+        const payload = await api.getMedia(folderId, page, start, "");
+        const results = Array.isArray(payload.results) ? payload.results : [];
+        total = Number(payload.total || results.length || 0);
+        items.push(...results);
+        if (!results.length || results.length < config.pageSize) break;
+        page += 1;
+        start += config.pageSize;
+      }
+
+      return { total: items.length, results: items };
+    },
+
     async uploadFile(folderId, file) {
       const title = file.name.replace(/\.[a-z0-9]+$/i, "");
       const formData = new FormData();
@@ -390,7 +422,7 @@
         top: 0;
         z-index: 2;
         display: grid;
-        grid-template-columns: repeat(4, 1fr);
+        grid-template-columns: repeat(5, 1fr);
         gap: 0;
         margin: 0 -14px 14px;
         padding: 0 14px;
@@ -641,6 +673,33 @@
         grid-template-columns: 1fr 1fr;
         gap: 10px;
       }
+      .ve-download-controls {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 10px;
+      }
+      .ve-check-cell {
+        width: 34px;
+        text-align: center !important;
+      }
+      .ve-checkbox {
+        width: 16px;
+        height: 16px;
+        cursor: pointer;
+      }
+      .ve-progress {
+        height: 8px;
+        overflow: hidden;
+        border-radius: 999px;
+        background: #e5edf5;
+        border: 1px solid #d7e0ea;
+      }
+      .ve-progress-bar {
+        width: 0%;
+        height: 100%;
+        background: #22a7f0;
+        transition: width 0.2s ease;
+      }
       .ve-file-input {
         display: none;
       }
@@ -674,7 +733,8 @@
         }
         .ve-folder-grid,
         .ve-stats,
-        .ve-file-picker {
+        .ve-file-picker,
+        .ve-download-controls {
           grid-template-columns: repeat(2, minmax(0, 1fr));
         }
         .ve-row {
@@ -695,6 +755,7 @@
           <button class="ve-tab active" data-tab="folders" type="button"><i class="bi bi-folder2-open"></i>Folders</button>
           <button class="ve-tab" data-tab="upload" type="button"><i class="bi bi-upload"></i>Upload</button>
           <button class="ve-tab" data-tab="queue" type="button"><i class="bi bi-play-circle"></i>Queue</button>
+          <button class="ve-tab" data-tab="downloads" type="button"><i class="bi bi-download"></i>Downloads</button>
           <button class="ve-tab" data-tab="activity" type="button"><i class="bi bi-activity"></i>Activity</button>
         </div>
         <div class="ve-tab-panel active" data-panel="folders">
@@ -788,6 +849,43 @@
           </table>
         </div>
         </div>
+        <div class="ve-tab-panel" data-panel="downloads">
+          <div class="ve-section">
+            <div class="ve-section-title"><span><i class="bi bi-download"></i> Download videos</span></div>
+            <div class="ve-row">
+              <select class="ve-select" id="ve-download-folder-select"></select>
+              <button class="ve-button primary" id="ve-load-videos-btn" type="button"><i class="bi bi-collection-play"></i> Load videos</button>
+            </div>
+            <div class="ve-row">
+              <input class="ve-input" id="ve-download-min-delay" type="number" min="1000" step="1000" value="${config.downloadMinDelayMs}" />
+              <input class="ve-input" id="ve-download-max-delay" type="number" min="1000" step="1000" value="${config.downloadMaxDelayMs}" />
+            </div>
+            <div class="ve-download-controls">
+              <button class="ve-button ghost" id="ve-select-all-videos-btn" type="button"><i class="bi bi-check2-square"></i> Select all</button>
+              <button class="ve-button success" id="ve-download-selected-btn" type="button"><i class="bi bi-download"></i> Selected</button>
+              <button class="ve-button primary" id="ve-download-all-btn" type="button"><i class="bi bi-download"></i> All loaded</button>
+            </div>
+            <div class="ve-row" style="margin-top:10px">
+              <button class="ve-button warn" id="ve-stop-downloads-btn" type="button"><i class="bi bi-stop-fill"></i> Stop downloads</button>
+            </div>
+            <div class="ve-progress" title="Download queue progress"><div class="ve-progress-bar" id="ve-download-progress"></div></div>
+            <div class="ve-muted" id="ve-download-summary" style="margin-top:8px">Load a video folder to begin.</div>
+          </div>
+          <div class="ve-section">
+            <table class="ve-table">
+              <thead>
+                <tr>
+                  <th class="ve-check-cell"><input class="ve-checkbox" id="ve-video-master-checkbox" type="checkbox" /></th>
+                  <th style="width: 46%">Video</th>
+                  <th style="width: 18%">Size</th>
+                  <th style="width: 18%">Duration</th>
+                  <th style="width: 18%">Created</th>
+                </tr>
+              </thead>
+              <tbody id="ve-video-body"></tbody>
+            </table>
+          </div>
+        </div>
         <div class="ve-tab-panel" data-panel="activity">
           <div class="ve-section">
             <div class="ve-section-title"><span><i class="bi bi-terminal"></i> Activity log</span></div>
@@ -809,6 +907,7 @@
     tabPanels: Array.from(root.querySelectorAll(".ve-tab-panel")),
     folderSelect: root.querySelector("#ve-folder-select"),
     uploadFolderSelect: root.querySelector("#ve-upload-folder-select"),
+    downloadFolderSelect: root.querySelector("#ve-download-folder-select"),
     folderGrid: root.querySelector("#ve-folder-grid"),
     refreshBtn: root.querySelector("#ve-refresh-btn"),
     newFolderInput: root.querySelector("#ve-new-folder-input"),
@@ -829,6 +928,17 @@
     runBtn: root.querySelector("#ve-run-btn"),
     stopBtn: root.querySelector("#ve-stop-btn"),
     resetHistoryBtn: root.querySelector("#ve-reset-history-btn"),
+    loadVideosBtn: root.querySelector("#ve-load-videos-btn"),
+    downloadMinDelay: root.querySelector("#ve-download-min-delay"),
+    downloadMaxDelay: root.querySelector("#ve-download-max-delay"),
+    selectAllVideosBtn: root.querySelector("#ve-select-all-videos-btn"),
+    downloadSelectedBtn: root.querySelector("#ve-download-selected-btn"),
+    downloadAllBtn: root.querySelector("#ve-download-all-btn"),
+    stopDownloadsBtn: root.querySelector("#ve-stop-downloads-btn"),
+    videoMasterCheckbox: root.querySelector("#ve-video-master-checkbox"),
+    videoBody: root.querySelector("#ve-video-body"),
+    downloadSummary: root.querySelector("#ve-download-summary"),
+    downloadProgress: root.querySelector("#ve-download-progress"),
     statImages: root.querySelector("#ve-stat-images"),
     statQueued: root.querySelector("#ve-stat-queued"),
     statRunning: root.querySelector("#ve-stat-running"),
@@ -875,7 +985,9 @@
       .join("");
     els.folderSelect.innerHTML = options || `<option value="">No folders found</option>`;
     els.uploadFolderSelect.innerHTML = options || `<option value="">No folders found</option>`;
+    els.downloadFolderSelect.innerHTML = options || `<option value="">No folders found</option>`;
     els.uploadFolderSelect.value = state.selectedFolderId || "";
+    els.downloadFolderSelect.value = state.selectedFolderId || "";
     els.folderGrid.innerHTML = state.folders.length
       ? state.folders
           .map((folder) => {
@@ -890,6 +1002,41 @@
           })
           .join("")
       : `<div class="ve-muted">No folders found.</div>`;
+  }
+
+  function renderVideos() {
+    const selectedCount = state.selectedVideoIds.size;
+    const total = state.videos.length;
+    els.downloadSummary.textContent = total
+      ? `${total} video${total === 1 ? "" : "s"} loaded | ${selectedCount} selected`
+      : "No videos loaded yet.";
+    els.videoMasterCheckbox.checked = total > 0 && selectedCount === total;
+    els.videoMasterCheckbox.indeterminate = selectedCount > 0 && selectedCount < total;
+    els.videoBody.innerHTML = total
+      ? state.videos
+          .map((video) => {
+            const checked = state.selectedVideoIds.has(String(video.id)) ? "checked" : "";
+            const imageUrl = video.thumbUrl || "";
+            return `
+              <tr>
+                <td class="ve-check-cell"><input class="ve-checkbox ve-video-checkbox" type="checkbox" data-video-id="${video.id}" ${checked} /></td>
+                <td>
+                  <div class="ve-media-cell">
+                    <div class="ve-thumb" style="background-image:url('${escapeAttr(imageUrl)}')"></div>
+                    <div>
+                      <div class="ve-title-line">${escapeHtml(video.name || video.fileName || String(video.id))}</div>
+                      <div class="ve-muted">${video.id}</div>
+                    </div>
+                  </div>
+                </td>
+                <td>${escapeHtml(formatBytes(video.size))}</td>
+                <td>${escapeHtml(formatDuration(video.duration))}</td>
+                <td>${escapeHtml(formatDateTime(video.datetime) || "-")}</td>
+              </tr>
+            `;
+          })
+          .join("")
+      : `<tr><td colspan="5" class="ve-muted">Load videos from a folder first.</td></tr>`;
   }
 
   function renderSelectedFiles() {
@@ -988,6 +1135,20 @@
     return escapeHtml(value).replace(/\(/g, "%28").replace(/\)/g, "%29");
   }
 
+  function sanitizeFileName(value) {
+    const name = String(value || "video")
+      .replace(/[<>:"/\\|?*\x00-\x1f]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    return (name || "video").slice(0, 180);
+  }
+
+  function randomDelay(minMs, maxMs) {
+    const min = Math.max(1000, Number(minMs || 1000));
+    const max = Math.max(min, Number(maxMs || min));
+    return Math.round(min + Math.random() * (max - min));
+  }
+
   async function refreshFolders() {
     logLine("Refreshing folder list...");
     state.folders = await api.getFolders();
@@ -1013,8 +1174,11 @@
     saveUiState({ selectedFolderId: state.selectedFolderId });
     state.items = [];
     state.queue = [];
+    state.videos = [];
+    state.selectedVideoIds = new Set();
     renderFolders();
     renderQueue();
+    renderVideos();
   }
 
   async function loadFolderImages() {
@@ -1027,6 +1191,18 @@
     state.queue = buildQueue(folder, state.items);
     renderQueue();
     logLine(`Loaded ${state.items.length} images from folder ${folder.id}.`);
+  }
+
+  async function loadFolderVideos() {
+    const folder = getSelectedFolder();
+    if (!folder) throw new Error("Please select a folder first.");
+    logLine(`Loading videos for folder "${folder.title || folder.name}"...`);
+    const payload = await api.getAllVideos(folder.id);
+    state.videos = payload.results.filter((item) => item.type === "video" || item.extension === "mp4");
+    state.selectedVideoIds = new Set();
+    renderVideos();
+    updateButtonStates();
+    logLine(`Loaded ${state.videos.length} videos from folder ${folder.id}.`);
   }
 
   async function createFolder() {
@@ -1094,6 +1270,61 @@
     config.aspect = els.aspect.value || "16:9";
     config.delayBetweenRequestsMs = Number(els.delayInput.value || 0);
     config.parallelLimitRetryDelayMs = Number(els.retryDelayInput.value || 60000);
+    config.downloadMinDelayMs = Number(els.downloadMinDelay.value || 6000);
+    config.downloadMaxDelayMs = Number(els.downloadMaxDelay.value || config.downloadMinDelayMs);
+    if (config.downloadMaxDelayMs < config.downloadMinDelayMs) {
+      config.downloadMaxDelayMs = config.downloadMinDelayMs;
+      els.downloadMaxDelay.value = String(config.downloadMaxDelayMs);
+    }
+  }
+
+  function triggerBrowserDownload(video) {
+    const link = document.createElement("a");
+    link.href = `/library/download/${video.id}`;
+    link.download = `${sanitizeFileName(video.name || video.fileName || video.id)}.mp4`;
+    link.rel = "noopener";
+    link.style.display = "none";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  }
+
+  async function downloadVideos(videos, label) {
+    if (state.downloadInProgress) return;
+    if (!videos.length) throw new Error("No videos selected for download.");
+
+    updateConfigFromInputs();
+    state.downloadInProgress = true;
+    state.stopRequested = false;
+    updateButtonStates();
+
+    let completed = 0;
+    const total = videos.length;
+    els.downloadProgress.style.width = "0%";
+
+    try {
+      for (const video of videos) {
+        if (state.stopRequested) break;
+        completed += 1;
+        els.downloadSummary.textContent = `${label}: starting ${completed}/${total} | ${video.name || video.id}`;
+        triggerBrowserDownload(video);
+        els.downloadProgress.style.width = `${Math.round((completed / total) * 100)}%`;
+        logLine(`Download started ${completed}/${total}: ${video.name || video.id}`);
+
+        if (completed < total && !state.stopRequested) {
+          const waitMs = randomDelay(config.downloadMinDelayMs, config.downloadMaxDelayMs);
+          els.downloadSummary.textContent = `${label}: waiting ${Math.round(waitMs / 1000)}s before next download (${completed}/${total})`;
+          await sleep(waitMs);
+        }
+      }
+    } finally {
+      state.downloadInProgress = false;
+      updateButtonStates();
+      els.downloadSummary.textContent = state.stopRequested
+        ? `${label}: stopped after ${completed}/${total}`
+        : `${label}: queued ${completed}/${total} downloads`;
+      logLine(state.stopRequested ? "Download queue stopped." : "Download queue finished.");
+    }
   }
 
   async function runQueue() {
@@ -1303,12 +1534,18 @@
   function updateButtonStates() {
     els.runBtn.disabled = state.running || state.uploadInProgress;
     els.stopBtn.disabled = !state.running;
-    els.uploadBtn.disabled = state.uploadInProgress || state.running || !state.selectedFiles.length;
-    els.loadMediaBtn.disabled = state.running || state.uploadInProgress;
-    els.createFolderBtn.disabled = state.running || state.uploadInProgress;
-    els.deleteFolderBtn.disabled = state.running || state.uploadInProgress;
-    els.refreshBtn.disabled = state.running || state.uploadInProgress;
-    els.clearFilesBtn.disabled = state.uploadInProgress || state.running || !state.selectedFiles.length;
+    els.uploadBtn.disabled = state.uploadInProgress || state.running || state.downloadInProgress || !state.selectedFiles.length;
+    els.loadMediaBtn.disabled = state.running || state.uploadInProgress || state.downloadInProgress;
+    els.createFolderBtn.disabled = state.running || state.uploadInProgress || state.downloadInProgress;
+    els.deleteFolderBtn.disabled = state.running || state.uploadInProgress || state.downloadInProgress;
+    els.refreshBtn.disabled = state.running || state.uploadInProgress || state.downloadInProgress;
+    els.clearFilesBtn.disabled = state.uploadInProgress || state.running || state.downloadInProgress || !state.selectedFiles.length;
+    els.loadVideosBtn.disabled = state.running || state.uploadInProgress || state.downloadInProgress;
+    els.downloadSelectedBtn.disabled =
+      state.running || state.uploadInProgress || state.downloadInProgress || !state.selectedVideoIds.size;
+    els.downloadAllBtn.disabled = state.running || state.uploadInProgress || state.downloadInProgress || !state.videos.length;
+    els.selectAllVideosBtn.disabled = state.running || state.uploadInProgress || state.downloadInProgress || !state.videos.length;
+    els.stopDownloadsBtn.disabled = !state.downloadInProgress;
   }
 
   async function handleAction(action) {
@@ -1337,6 +1574,10 @@
       selectFolder(els.uploadFolderSelect.value);
     });
 
+    els.downloadFolderSelect.addEventListener("change", async () => {
+      selectFolder(els.downloadFolderSelect.value);
+    });
+
     els.folderGrid.addEventListener("click", (event) => {
       const card = event.target.closest("[data-folder-id]");
       if (!card) return;
@@ -1360,6 +1601,41 @@
     els.uploadBtn.addEventListener("click", () => handleAction(uploadSelectedFiles));
     els.loadMediaBtn.addEventListener("click", () => handleAction(loadFolderImages));
     els.runBtn.addEventListener("click", () => handleAction(runQueue));
+    els.loadVideosBtn.addEventListener("click", () => handleAction(loadFolderVideos));
+    els.videoMasterCheckbox.addEventListener("change", () => {
+      state.selectedVideoIds = els.videoMasterCheckbox.checked
+        ? new Set(state.videos.map((video) => String(video.id)))
+        : new Set();
+      renderVideos();
+      updateButtonStates();
+    });
+    els.videoBody.addEventListener("change", (event) => {
+      const checkbox = event.target.closest(".ve-video-checkbox");
+      if (!checkbox) return;
+      if (checkbox.checked) {
+        state.selectedVideoIds.add(String(checkbox.dataset.videoId));
+      } else {
+        state.selectedVideoIds.delete(String(checkbox.dataset.videoId));
+      }
+      renderVideos();
+      updateButtonStates();
+    });
+    els.selectAllVideosBtn.addEventListener("click", () => {
+      state.selectedVideoIds = new Set(state.videos.map((video) => String(video.id)));
+      renderVideos();
+      updateButtonStates();
+    });
+    els.downloadSelectedBtn.addEventListener("click", () => {
+      const selected = state.videos.filter((video) => state.selectedVideoIds.has(String(video.id)));
+      handleAction(() => downloadVideos(selected, "Selected downloads"));
+    });
+    els.downloadAllBtn.addEventListener("click", () => {
+      handleAction(() => downloadVideos(state.videos, "All loaded downloads"));
+    });
+    els.stopDownloadsBtn.addEventListener("click", () => {
+      state.stopRequested = true;
+      logLine("Download stop requested. Current browser download will finish starting first.");
+    });
     els.resetHistoryBtn.addEventListener("click", () => {
       const folder = getSelectedFolder();
       const scopeLabel = folder ? ` for "${folder.title || folder.name}"` : "";
@@ -1392,14 +1668,18 @@
     if (savedUi.parallelLimitRetryDelayMs) {
       config.parallelLimitRetryDelayMs = savedUi.parallelLimitRetryDelayMs;
     }
+    if (savedUi.downloadMinDelayMs) config.downloadMinDelayMs = savedUi.downloadMinDelayMs;
+    if (savedUi.downloadMaxDelayMs) config.downloadMaxDelayMs = savedUi.downloadMaxDelayMs;
 
     els.aspect.value = config.aspect;
     els.videoLength.value = String(config.videoLength);
     els.delayInput.value = String(config.delayBetweenRequestsMs);
     els.retryDelayInput.value = String(config.parallelLimitRetryDelayMs);
+    els.downloadMinDelay.value = String(config.downloadMinDelayMs);
+    els.downloadMaxDelay.value = String(config.downloadMaxDelayMs);
     state.selectedFolderId = savedUi.selectedFolderId || null;
 
-    ["aspect", "videoLength", "delayInput", "retryDelayInput"].forEach((key) => {
+    ["aspect", "videoLength", "delayInput", "retryDelayInput", "downloadMinDelay", "downloadMaxDelay"].forEach((key) => {
       const element = els[key];
       element.addEventListener("change", () => {
         updateConfigFromInputs();
@@ -1408,6 +1688,8 @@
           videoLength: config.videoLength,
           delayBetweenRequestsMs: config.delayBetweenRequestsMs,
           parallelLimitRetryDelayMs: config.parallelLimitRetryDelayMs,
+          downloadMinDelayMs: config.downloadMinDelayMs,
+          downloadMaxDelayMs: config.downloadMaxDelayMs,
         });
       });
     });
@@ -1416,6 +1698,7 @@
     setPanelVisible(!savedUi.collapsed);
     setActiveTab(savedUi.activeTab || "folders");
     renderSelectedFiles();
+    renderVideos();
     updateButtonStates();
     await refreshFolders();
     renderQueue();
