@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoExpress Library Manager
 // @namespace    https://app.videoexpress.ai/
-// @version      0.4.0
+// @version      0.5.0
 // @description  Manage folders, upload images, and batch convert images to videos inside VideoExpress AI.
 // @match        https://app.videoexpress.ai/*
 // @grant        none
@@ -37,6 +37,8 @@
       removeNumbers: true,
       collapseWhitespace: true,
     },
+    masterPrompt: "",
+    masterPromptEnabled: false,
   };
 
   const HISTORY_KEY = "videoexpress.manager.history.v1";
@@ -68,6 +70,12 @@
     activeTab: "folders",
     queue: [],
     activeStatuses: new Map(),
+    auth: {
+      csrfToken: "",
+      csrfHeaderName: "X-CSRF-TOKEN",
+      bearerToken: "",
+      lastRefreshedAt: 0,
+    },
   };
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -118,6 +126,16 @@
     return value.trim();
   }
 
+  function composePrompt(imagePrompt) {
+    const image = String(imagePrompt || "").trim();
+    const master = String(config.masterPrompt || "").trim();
+    if (!config.masterPromptEnabled || !master) return image;
+    if (master.includes("{{image}}")) {
+      return master.replace(/{{image}}/g, image).trim();
+    }
+    return [master, image].filter(Boolean).join(", ");
+  }
+
   function loadHistory() {
     try {
       const parsed = JSON.parse(localStorage.getItem(HISTORY_KEY) || "{}");
@@ -161,26 +179,153 @@
     );
   }
 
+  function readCookie(name) {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = document.cookie.match(new RegExp(`(?:^|;\\s*)${escaped}=([^;]*)`));
+    if (!match) return "";
+    try {
+      return decodeURIComponent(match[1]);
+    } catch {
+      return match[1];
+    }
+  }
+
+  function captureAuthHeader(name, value) {
+    if (!name || !value) return;
+    const headerName = String(name);
+    const headerValue = String(value).trim();
+    if (/^authorization$/i.test(headerName) && /^bearer\s+/i.test(headerValue)) {
+      state.auth.bearerToken = headerValue.replace(/^bearer\s+/i, "");
+    } else if (/(csrf|xsrf)/i.test(headerName)) {
+      state.auth.csrfHeaderName = headerName;
+      state.auth.csrfToken = headerValue;
+    }
+  }
+
+  function refreshAuthFromPage() {
+    const csrfElement = document.querySelector(
+      'meta[name="csrf-token"], meta[name="csrf_token"], meta[name="xsrf-token"], input[name="_token"], input[name="csrf_token"]',
+    );
+    const csrfValue = csrfElement && (csrfElement.content || csrfElement.value);
+    const csrfCookie =
+      readCookie("XSRF-TOKEN") || readCookie("CSRF-TOKEN") || readCookie("csrf_token");
+    if (csrfValue) {
+      state.auth.csrfHeaderName = "X-CSRF-TOKEN";
+      state.auth.csrfToken = csrfValue;
+    } else if (csrfCookie) {
+      state.auth.csrfHeaderName = "X-XSRF-TOKEN";
+      state.auth.csrfToken = csrfCookie;
+    }
+
+    for (const storage of [window.localStorage, window.sessionStorage]) {
+      try {
+        for (let index = 0; index < storage.length; index += 1) {
+          const key = storage.key(index) || "";
+          if (!/(access.?token|auth|bearer|jwt)/i.test(key)) continue;
+          const value = storage.getItem(key) || "";
+          const tokenMatch = value.match(/(?:access[_-]?token|token|jwt)"?\s*[:=]\s*"?([\w.-]+)/i);
+          const token = tokenMatch ? tokenMatch[1] : value.replace(/^Bearer\s+/i, "");
+          if (token && /^[\w.-]+$/.test(token)) state.auth.bearerToken = token;
+        }
+      } catch {
+        // Storage can be unavailable in restricted browser contexts.
+      }
+    }
+    state.auth.lastRefreshedAt = Date.now();
+  }
+
+  function getDynamicAuthHeaders() {
+    refreshAuthFromPage();
+    const headers = {};
+    if (state.auth.csrfToken) {
+      headers[state.auth.csrfHeaderName || "X-CSRF-TOKEN"] = state.auth.csrfToken;
+    }
+    if (state.auth.bearerToken) headers.Authorization = `Bearer ${state.auth.bearerToken}`;
+    return headers;
+  }
+
+  function isSameOriginRequest(input) {
+    try {
+      const url = input instanceof Request ? input.url : input;
+      return new URL(url, location.href).origin === location.origin;
+    } catch {
+      return false;
+    }
+  }
+
+  function captureAuthHeaders(headers) {
+    if (!headers) return;
+    try {
+      new Headers(headers).forEach((value, name) => captureAuthHeader(name, value));
+    } catch {
+      // Ignore malformed request headers from other page code.
+    }
+  }
+
+  function installAuthCapture() {
+    if (window.__videoExpressManagerAuthCaptureInstalled) return;
+    window.__videoExpressManagerAuthCaptureInstalled = true;
+
+    const originalFetch = window.fetch;
+    window.fetch = function videoExpressAuthAwareFetch(input, init) {
+      if (isSameOriginRequest(input)) {
+        if (input instanceof Request) captureAuthHeaders(input.headers);
+        captureAuthHeaders(init && init.headers);
+      }
+      return originalFetch.apply(this, arguments);
+    };
+
+    const xhrSameOrigin = Symbol("videoExpressSameOrigin");
+    const originalOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function videoExpressAuthAwareOpen(method, url) {
+      this[xhrSameOrigin] = isSameOriginRequest(url);
+      return originalOpen.apply(this, arguments);
+    };
+
+    const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+    XMLHttpRequest.prototype.setRequestHeader = function videoExpressAuthAwareHeader(name, value) {
+      if (this[xhrSameOrigin]) captureAuthHeader(name, value);
+      return originalSetRequestHeader.apply(this, arguments);
+    };
+  }
+
+  async function sessionFetch(url, options = {}, label = "Request") {
+    const makeRequest = () =>
+      fetch(url, {
+        ...options,
+        credentials: "include",
+        headers: {
+          ...getDynamicAuthHeaders(),
+          ...(options.headers || {}),
+        },
+      });
+
+    let response = await makeRequest();
+    if ([401, 403, 419].includes(response.status)) {
+      refreshAuthFromPage();
+      response = await makeRequest();
+    }
+    return assertOk(response, label);
+  }
+
   async function getJson(url, label) {
-    const response = await fetch(url, {
+    const response = await sessionFetch(url, {
       method: "GET",
-      credentials: "include",
       headers: { "X-Requested-With": "XMLHttpRequest" },
-    });
-    return (await assertOk(response, label)).json();
+    }, label);
+    return response.json();
   }
 
   async function postForm(url, params, label) {
-    const response = await fetch(url, {
+    const response = await sessionFetch(url, {
       method: "POST",
-      credentials: "include",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         "X-Requested-With": "XMLHttpRequest",
       },
       body: params,
-    });
-    return (await assertOk(response, label)).text();
+    }, label);
+    return response.text();
   }
 
   async function postFormJson(url, params, label) {
@@ -193,22 +338,20 @@
   }
 
   async function postMultipart(url, formData, label) {
-    const response = await fetch(url, {
+    const response = await sessionFetch(url, {
       method: "POST",
-      credentials: "include",
       headers: { "X-Requested-With": "XMLHttpRequest" },
       body: formData,
-    });
-    return (await assertOk(response, label)).text();
+    }, label);
+    return response.text();
   }
 
   async function deleteRequest(url, label) {
-    const response = await fetch(url, {
+    const response = await sessionFetch(url, {
       method: "DELETE",
-      credentials: "include",
       headers: { "X-Requested-With": "XMLHttpRequest" },
-    });
-    return (await assertOk(response, label)).text();
+    }, label);
+    return response.text();
   }
 
   const api = {
@@ -375,7 +518,7 @@
 
   function buildQueue(folder, items) {
     return items.map((media) => {
-      const prompt = cleanPrompt(media.name);
+      const prompt = composePrompt(cleanPrompt(media.name));
       const record = getRecord(folder.id, media.id);
       const historyStatus = record ? record.status : "";
       const pendingMediaStatus = media.uuid
@@ -806,6 +949,10 @@
             <select class="ve-select" id="ve-folder-select"></select>
           </div>
           <div class="ve-folder-grid" id="ve-folder-grid"></div>
+          <div class="ve-row" style="margin-top:10px">
+            <button class="ve-button ghost" id="ve-show-create-folder-btn" type="button"><i class="bi bi-folder-plus"></i> Create folder</button>
+            <button class="ve-button primary" id="ve-show-upload-btn" type="button"><i class="bi bi-upload"></i> Upload images</button>
+          </div>
         </div>
         <div class="ve-section">
           <div class="ve-section-title"><span><i class="bi bi-folder-plus"></i> Create folder</span></div>
@@ -852,6 +999,16 @@
             <input class="ve-input" id="ve-delay-input" type="number" min="0" step="100" value="${config.delayBetweenRequestsMs}" />
             <input class="ve-input" id="ve-retry-delay-input" type="number" min="1000" step="1000" value="${config.parallelLimitRetryDelayMs}" />
           </div>
+          <div class="ve-row" style="align-items:center">
+            <label class="ve-muted" style="display:flex;align-items:center;gap:8px;cursor:pointer">
+              <input class="ve-checkbox" id="ve-master-prompt-enabled" type="checkbox" />
+              Use a master prompt for every image
+            </label>
+          </div>
+          <div class="ve-row">
+            <textarea class="ve-textarea" id="ve-master-prompt" placeholder="e.g. cinematic product shot, soft studio light. Add {{image}} to choose exactly where the filename prompt appears."></textarea>
+          </div>
+          <div class="ve-muted" style="margin-top:-4px;margin-bottom:10px">When enabled, this is added before every image's filename prompt.</div>
           <div class="ve-row">
             <button class="ve-button primary" id="ve-load-media-btn"><i class="bi bi-list-check"></i> Load images</button>
             <button class="ve-button success" id="ve-run-btn"><i class="bi bi-play-fill"></i> Run queue</button>
@@ -960,6 +1117,8 @@
     downloadFolderSelect: root.querySelector("#ve-download-folder-select"),
     folderGrid: root.querySelector("#ve-folder-grid"),
     refreshBtn: root.querySelector("#ve-refresh-btn"),
+    showCreateFolderBtn: root.querySelector("#ve-show-create-folder-btn"),
+    showUploadBtn: root.querySelector("#ve-show-upload-btn"),
     newFolderInput: root.querySelector("#ve-new-folder-input"),
     createFolderBtn: root.querySelector("#ve-create-folder-btn"),
     deleteFolderBtn: root.querySelector("#ve-delete-folder-btn"),
@@ -974,6 +1133,8 @@
     aspect: root.querySelector("#ve-aspect"),
     delayInput: root.querySelector("#ve-delay-input"),
     retryDelayInput: root.querySelector("#ve-retry-delay-input"),
+    masterPromptEnabled: root.querySelector("#ve-master-prompt-enabled"),
+    masterPrompt: root.querySelector("#ve-master-prompt"),
     loadMediaBtn: root.querySelector("#ve-load-media-btn"),
     runBtn: root.querySelector("#ve-run-btn"),
     stopBtn: root.querySelector("#ve-stop-btn"),
@@ -1442,6 +1603,8 @@
     config.downloadMaxDelayMs = Number(
       els.downloadMaxDelay.value || config.downloadMinDelayMs,
     );
+    config.masterPromptEnabled = Boolean(els.masterPromptEnabled.checked);
+    config.masterPrompt = els.masterPrompt.value.trim();
     if (config.downloadMaxDelayMs < config.downloadMinDelayMs) {
       config.downloadMaxDelayMs = config.downloadMinDelayMs;
       els.downloadMaxDelay.value = String(config.downloadMaxDelayMs);
@@ -1775,6 +1938,8 @@
       state.downloadInProgress ||
       !visibleVideoCount;
     els.stopDownloadsBtn.disabled = !state.downloadInProgress;
+    els.masterPromptEnabled.disabled = state.running;
+    els.masterPrompt.disabled = state.running || !els.masterPromptEnabled.checked;
   }
 
   async function handleAction(action) {
@@ -1849,6 +2014,11 @@
     els.refreshBtn.addEventListener("click", () =>
       handleAction(refreshFolders),
     );
+    els.showCreateFolderBtn.addEventListener("click", () => {
+      els.newFolderInput.focus();
+      els.newFolderInput.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+    els.showUploadBtn.addEventListener("click", () => setActiveTab("upload"));
     els.createFolderBtn.addEventListener("click", () =>
       handleAction(createFolder),
     );
@@ -1977,9 +2147,31 @@
       state.stopRequested = true;
       logLine("Stop requested. Current request will finish first.");
     });
+    [els.masterPromptEnabled, els.masterPrompt].forEach((element) => {
+      element.addEventListener("input", () => {
+        updateConfigFromInputs();
+        saveUiState({
+          masterPromptEnabled: config.masterPromptEnabled,
+          masterPrompt: config.masterPrompt,
+        });
+        if (state.items.length && !state.running) {
+          const folder = getSelectedFolder();
+          if (folder) state.queue = buildQueue(folder, state.items);
+          renderQueue();
+        }
+        updateButtonStates();
+      });
+      element.addEventListener("change", () => element.dispatchEvent(new Event("input")));
+    });
   }
 
   async function bootstrap() {
+    installAuthCapture();
+    refreshAuthFromPage();
+    window.addEventListener("focus", refreshAuthFromPage);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) refreshAuthFromPage();
+    });
     const savedUi = loadUiState();
     if (savedUi.aspect) config.aspect = savedUi.aspect;
     if (savedUi.videoLength) config.videoLength = savedUi.videoLength;
@@ -1992,6 +2184,12 @@
       config.downloadMinDelayMs = savedUi.downloadMinDelayMs;
     if (savedUi.downloadMaxDelayMs)
       config.downloadMaxDelayMs = savedUi.downloadMaxDelayMs;
+    if (typeof savedUi.masterPromptEnabled === "boolean") {
+      config.masterPromptEnabled = savedUi.masterPromptEnabled;
+    }
+    if (typeof savedUi.masterPrompt === "string") {
+      config.masterPrompt = savedUi.masterPrompt;
+    }
     if (savedUi.videoFilters && typeof savedUi.videoFilters === "object") {
       state.videoFilters = {
         ...state.videoFilters,
@@ -2005,6 +2203,8 @@
     els.retryDelayInput.value = String(config.parallelLimitRetryDelayMs);
     els.downloadMinDelay.value = String(config.downloadMinDelayMs);
     els.downloadMaxDelay.value = String(config.downloadMaxDelayMs);
+    els.masterPromptEnabled.checked = config.masterPromptEnabled;
+    els.masterPrompt.value = config.masterPrompt;
     state.selectedFolderId = savedUi.selectedFolderId || null;
     applyVideoFiltersToInputs();
 
@@ -2026,6 +2226,8 @@
           parallelLimitRetryDelayMs: config.parallelLimitRetryDelayMs,
           downloadMinDelayMs: config.downloadMinDelayMs,
           downloadMaxDelayMs: config.downloadMaxDelayMs,
+          masterPromptEnabled: config.masterPromptEnabled,
+          masterPrompt: config.masterPrompt,
         });
       });
     });
