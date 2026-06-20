@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoExpress Library Manager
 // @namespace    https://app.videoexpress.ai/
-// @version      0.5.0
+// @version      0.5.1
 // @description  Manage folders, upload images, and batch convert images to videos inside VideoExpress AI.
 // @match        https://app.videoexpress.ai/*
 // @grant        none
@@ -184,7 +184,9 @@
 
   function readCookie(name) {
     const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const match = document.cookie.match(new RegExp(`(?:^|;\\s*)${escaped}=([^;]*)`));
+    const match = document.cookie.match(
+      new RegExp(`(?:^|;\\s*)${escaped}=([^;]*)`),
+    );
     if (!match) return "";
     try {
       return decodeURIComponent(match[1]);
@@ -197,7 +199,10 @@
     if (!name || !value) return;
     const headerName = String(name);
     const headerValue = String(value).trim();
-    if (/^authorization$/i.test(headerName) && /^bearer\s+/i.test(headerValue)) {
+    if (
+      /^authorization$/i.test(headerName) &&
+      /^bearer\s+/i.test(headerValue)
+    ) {
       state.auth.bearerToken = headerValue.replace(/^bearer\s+/i, "");
     } else if (/(csrf|xsrf)/i.test(headerName)) {
       state.auth.csrfHeaderName = headerName;
@@ -211,7 +216,9 @@
     );
     const csrfValue = csrfElement && (csrfElement.content || csrfElement.value);
     const csrfCookie =
-      readCookie("XSRF-TOKEN") || readCookie("CSRF-TOKEN") || readCookie("csrf_token");
+      readCookie("XSRF-TOKEN") ||
+      readCookie("CSRF-TOKEN") ||
+      readCookie("csrf_token");
     if (csrfValue) {
       state.auth.csrfHeaderName = "X-CSRF-TOKEN";
       state.auth.csrfToken = csrfValue;
@@ -226,8 +233,12 @@
           const key = storage.key(index) || "";
           if (!/(access.?token|auth|bearer|jwt)/i.test(key)) continue;
           const value = storage.getItem(key) || "";
-          const tokenMatch = value.match(/(?:access[_-]?token|token|jwt)"?\s*[:=]\s*"?([\w.-]+)/i);
-          const token = tokenMatch ? tokenMatch[1] : value.replace(/^Bearer\s+/i, "");
+          const tokenMatch = value.match(
+            /(?:access[_-]?token|token|jwt)"?\s*[:=]\s*"?([\w.-]+)/i,
+          );
+          const token = tokenMatch
+            ? tokenMatch[1]
+            : value.replace(/^Bearer\s+/i, "");
           if (token && /^[\w.-]+$/.test(token)) state.auth.bearerToken = token;
         }
       } catch {
@@ -241,9 +252,11 @@
     refreshAuthFromPage();
     const headers = {};
     if (state.auth.csrfToken) {
-      headers[state.auth.csrfHeaderName || "X-CSRF-TOKEN"] = state.auth.csrfToken;
+      headers[state.auth.csrfHeaderName || "X-CSRF-TOKEN"] =
+        state.auth.csrfToken;
     }
-    if (state.auth.bearerToken) headers.Authorization = `Bearer ${state.auth.bearerToken}`;
+    if (state.auth.bearerToken)
+      headers.Authorization = `Bearer ${state.auth.bearerToken}`;
     return headers;
   }
 
@@ -259,7 +272,9 @@
   function captureAuthHeaders(headers) {
     if (!headers) return;
     try {
-      new Headers(headers).forEach((value, name) => captureAuthHeader(name, value));
+      new Headers(headers).forEach((value, name) =>
+        captureAuthHeader(name, value),
+      );
     } catch {
       // Ignore malformed request headers from other page code.
     }
@@ -280,16 +295,20 @@
 
     const xhrSameOrigin = Symbol("videoExpressSameOrigin");
     const originalOpen = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function videoExpressAuthAwareOpen(method, url) {
+    XMLHttpRequest.prototype.open = function videoExpressAuthAwareOpen(
+      method,
+      url,
+    ) {
       this[xhrSameOrigin] = isSameOriginRequest(url);
       return originalOpen.apply(this, arguments);
     };
 
     const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
-    XMLHttpRequest.prototype.setRequestHeader = function videoExpressAuthAwareHeader(name, value) {
-      if (this[xhrSameOrigin]) captureAuthHeader(name, value);
-      return originalSetRequestHeader.apply(this, arguments);
-    };
+    XMLHttpRequest.prototype.setRequestHeader =
+      function videoExpressAuthAwareHeader(name, value) {
+        if (this[xhrSameOrigin]) captureAuthHeader(name, value);
+        return originalSetRequestHeader.apply(this, arguments);
+      };
   }
 
   async function sessionFetch(url, options = {}, label = "Request") {
@@ -312,22 +331,30 @@
   }
 
   async function getJson(url, label) {
-    const response = await sessionFetch(url, {
-      method: "GET",
-      headers: { "X-Requested-With": "XMLHttpRequest" },
-    }, label);
+    const response = await sessionFetch(
+      url,
+      {
+        method: "GET",
+        headers: { "X-Requested-With": "XMLHttpRequest" },
+      },
+      label,
+    );
     return response.json();
   }
 
   async function postForm(url, params, label) {
-    const response = await sessionFetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "X-Requested-With": "XMLHttpRequest",
+    const response = await sessionFetch(
+      url,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+          "X-Requested-With": "XMLHttpRequest",
+        },
+        body: params,
       },
-      body: params,
-    }, label);
+      label,
+    );
     return response.text();
   }
 
@@ -341,19 +368,27 @@
   }
 
   async function postMultipart(url, formData, label) {
-    const response = await sessionFetch(url, {
-      method: "POST",
-      headers: { "X-Requested-With": "XMLHttpRequest" },
-      body: formData,
-    }, label);
+    const response = await sessionFetch(
+      url,
+      {
+        method: "POST",
+        headers: { "X-Requested-With": "XMLHttpRequest" },
+        body: formData,
+      },
+      label,
+    );
     return response.text();
   }
 
   async function deleteRequest(url, label) {
-    const response = await sessionFetch(url, {
-      method: "DELETE",
-      headers: { "X-Requested-With": "XMLHttpRequest" },
-    }, label);
+    const response = await sessionFetch(
+      url,
+      {
+        method: "DELETE",
+        headers: { "X-Requested-With": "XMLHttpRequest" },
+      },
+      label,
+    );
     return response.text();
   }
 
@@ -1207,7 +1242,12 @@
   }
 
   function restorePanelPosition(position) {
-    if (!position || typeof position.left !== "number" || typeof position.top !== "number") return;
+    if (
+      !position ||
+      typeof position.left !== "number" ||
+      typeof position.top !== "number"
+    )
+      return;
     setPanelPosition(position.left, position.top, false);
   }
 
@@ -1324,8 +1364,11 @@
       : null;
 
     return state.videos.filter((video) => {
-      const haystack = `${video.name || ""} ${video.fileName || ""} ${video.id || ""}`.toLowerCase();
-      const createdAt = video.datetime ? new Date(video.datetime).getTime() : null;
+      const haystack =
+        `${video.name || ""} ${video.fileName || ""} ${video.id || ""}`.toLowerCase();
+      const createdAt = video.datetime
+        ? new Date(video.datetime).getTime()
+        : null;
       const size = Number(video.size || 0);
       if (query && !haystack.includes(query)) return false;
       if (fromTime && (!createdAt || createdAt < fromTime)) return false;
@@ -2006,7 +2049,8 @@
       });
     window.addEventListener("resize", () => {
       const rect = root.getBoundingClientRect();
-      if (rect.width && rect.height) setPanelPosition(rect.left, rect.top, true);
+      if (rect.width && rect.height)
+        setPanelPosition(rect.left, rect.top, true);
     });
     els.tabs.forEach((tab) => {
       tab.addEventListener("click", () => setActiveTab(tab.dataset.tab));
@@ -2035,7 +2079,10 @@
     );
     els.showCreateFolderBtn.addEventListener("click", () => {
       els.newFolderInput.focus();
-      els.newFolderInput.scrollIntoView({ behavior: "smooth", block: "center" });
+      els.newFolderInput.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+      });
     });
     els.showUploadBtn.addEventListener("click", () => setActiveTab("upload"));
     els.createFolderBtn.addEventListener("click", () =>
@@ -2103,9 +2150,13 @@
     els.videoMasterCheckbox.addEventListener("change", () => {
       const visibleVideos = getFilteredVideos();
       if (els.videoMasterCheckbox.checked) {
-        visibleVideos.forEach((video) => state.selectedVideoIds.add(String(video.id)));
+        visibleVideos.forEach((video) =>
+          state.selectedVideoIds.add(String(video.id)),
+        );
       } else {
-        visibleVideos.forEach((video) => state.selectedVideoIds.delete(String(video.id)));
+        visibleVideos.forEach((video) =>
+          state.selectedVideoIds.delete(String(video.id)),
+        );
       }
       renderVideos();
       updateButtonStates();
@@ -2122,7 +2173,9 @@
       updateButtonStates();
     });
     els.selectAllVideosBtn.addEventListener("click", () => {
-      getFilteredVideos().forEach((video) => state.selectedVideoIds.add(String(video.id)));
+      getFilteredVideos().forEach((video) =>
+        state.selectedVideoIds.add(String(video.id)),
+      );
       renderVideos();
       updateButtonStates();
     });
@@ -2186,7 +2239,9 @@
         }
         updateButtonStates();
       });
-      element.addEventListener("change", () => element.dispatchEvent(new Event("input")));
+      element.addEventListener("change", () =>
+        element.dispatchEvent(new Event("input")),
+      );
     });
   }
 
