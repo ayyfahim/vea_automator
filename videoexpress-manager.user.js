@@ -39,6 +39,7 @@
     },
     masterPrompt: "",
     masterPromptEnabled: false,
+    appendFilenamePrompt: false,
   };
 
   const HISTORY_KEY = "videoexpress.manager.history.v1";
@@ -129,7 +130,9 @@
   function composePrompt(imagePrompt) {
     const image = String(imagePrompt || "").trim();
     const master = String(config.masterPrompt || "").trim();
-    if (!config.masterPromptEnabled || !master) return image;
+    if (!config.masterPromptEnabled) return image;
+    if (!master) return "";
+    if (!config.appendFilenamePrompt) return master;
     if (master.includes("{{image}}")) {
       return master.replace(/{{image}}/g, image).trim();
     }
@@ -1005,10 +1008,16 @@
               Use a master prompt for every image
             </label>
           </div>
-          <div class="ve-row">
-            <textarea class="ve-textarea" id="ve-master-prompt" placeholder="e.g. cinematic product shot, soft studio light. Add {{image}} to choose exactly where the filename prompt appears."></textarea>
+          <div class="ve-row ve-hidden" id="ve-filename-prompt-row" style="align-items:center">
+            <label class="ve-muted" style="display:flex;align-items:center;gap:8px;cursor:pointer">
+              <input class="ve-checkbox" id="ve-append-filename-prompt" type="checkbox" />
+              Also include the image filename in the prompt
+            </label>
           </div>
-          <div class="ve-muted" style="margin-top:-4px;margin-bottom:10px">When enabled, this is added before every image's filename prompt.</div>
+          <div class="ve-row">
+            <textarea class="ve-textarea" id="ve-master-prompt" placeholder="e.g. cinematic product shot, soft studio light. {{image}} is optional when the filename option is enabled."></textarea>
+          </div>
+          <div class="ve-muted" style="margin-top:-4px;margin-bottom:10px">Master mode uses only this text unless you turn on the filename option.</div>
           <div class="ve-row">
             <button class="ve-button primary" id="ve-load-media-btn"><i class="bi bi-list-check"></i> Load images</button>
             <button class="ve-button success" id="ve-run-btn"><i class="bi bi-play-fill"></i> Run queue</button>
@@ -1134,6 +1143,8 @@
     delayInput: root.querySelector("#ve-delay-input"),
     retryDelayInput: root.querySelector("#ve-retry-delay-input"),
     masterPromptEnabled: root.querySelector("#ve-master-prompt-enabled"),
+    appendFilenamePrompt: root.querySelector("#ve-append-filename-prompt"),
+    filenamePromptRow: root.querySelector("#ve-filename-prompt-row"),
     masterPrompt: root.querySelector("#ve-master-prompt"),
     loadMediaBtn: root.querySelector("#ve-load-media-btn"),
     runBtn: root.querySelector("#ve-run-btn"),
@@ -1604,11 +1615,19 @@
       els.downloadMaxDelay.value || config.downloadMinDelayMs,
     );
     config.masterPromptEnabled = Boolean(els.masterPromptEnabled.checked);
+    config.appendFilenamePrompt = Boolean(els.appendFilenamePrompt.checked);
     config.masterPrompt = els.masterPrompt.value.trim();
     if (config.downloadMaxDelayMs < config.downloadMinDelayMs) {
       config.downloadMaxDelayMs = config.downloadMinDelayMs;
       els.downloadMaxDelay.value = String(config.downloadMaxDelayMs);
     }
+  }
+
+  function updateMasterPromptControls() {
+    const masterEnabled = els.masterPromptEnabled.checked;
+    els.filenamePromptRow.classList.toggle("ve-hidden", !masterEnabled);
+    els.masterPrompt.disabled = state.running || !masterEnabled;
+    els.appendFilenamePrompt.disabled = state.running || !masterEnabled;
   }
 
   function triggerBrowserDownload(video) {
@@ -1939,7 +1958,7 @@
       !visibleVideoCount;
     els.stopDownloadsBtn.disabled = !state.downloadInProgress;
     els.masterPromptEnabled.disabled = state.running;
-    els.masterPrompt.disabled = state.running || !els.masterPromptEnabled.checked;
+    updateMasterPromptControls();
   }
 
   async function handleAction(action) {
@@ -2147,11 +2166,17 @@
       state.stopRequested = true;
       logLine("Stop requested. Current request will finish first.");
     });
-    [els.masterPromptEnabled, els.masterPrompt].forEach((element) => {
+    [
+      els.masterPromptEnabled,
+      els.appendFilenamePrompt,
+      els.masterPrompt,
+    ].forEach((element) => {
       element.addEventListener("input", () => {
         updateConfigFromInputs();
+        updateMasterPromptControls();
         saveUiState({
           masterPromptEnabled: config.masterPromptEnabled,
+          appendFilenamePrompt: config.appendFilenamePrompt,
           masterPrompt: config.masterPrompt,
         });
         if (state.items.length && !state.running) {
@@ -2187,6 +2212,9 @@
     if (typeof savedUi.masterPromptEnabled === "boolean") {
       config.masterPromptEnabled = savedUi.masterPromptEnabled;
     }
+    if (typeof savedUi.appendFilenamePrompt === "boolean") {
+      config.appendFilenamePrompt = savedUi.appendFilenamePrompt;
+    }
     if (typeof savedUi.masterPrompt === "string") {
       config.masterPrompt = savedUi.masterPrompt;
     }
@@ -2204,7 +2232,9 @@
     els.downloadMinDelay.value = String(config.downloadMinDelayMs);
     els.downloadMaxDelay.value = String(config.downloadMaxDelayMs);
     els.masterPromptEnabled.checked = config.masterPromptEnabled;
+    els.appendFilenamePrompt.checked = config.appendFilenamePrompt;
     els.masterPrompt.value = config.masterPrompt;
+    updateMasterPromptControls();
     state.selectedFolderId = savedUi.selectedFolderId || null;
     applyVideoFiltersToInputs();
 
@@ -2227,6 +2257,7 @@
           downloadMinDelayMs: config.downloadMinDelayMs,
           downloadMaxDelayMs: config.downloadMaxDelayMs,
           masterPromptEnabled: config.masterPromptEnabled,
+          appendFilenamePrompt: config.appendFilenamePrompt,
           masterPrompt: config.masterPrompt,
         });
       });
