@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoExpress Library Manager
 // @namespace    https://app.videoexpress.ai/
-// @version      0.5.1
+// @version      0.5.2
 // @description  Manage folders, upload images, and batch convert images to videos inside VideoExpress AI.
 // @match        https://app.videoexpress.ai/*
 // @grant        none
@@ -40,6 +40,8 @@
     masterPrompt: "",
     masterPromptEnabled: false,
     appendFilenamePrompt: false,
+    promptListEnabled: false,
+    promptList: "",
   };
 
   const HISTORY_KEY = "videoexpress.manager.history.v1";
@@ -137,6 +139,19 @@
       return master.replace(/{{image}}/g, image).trim();
     }
     return [master, image].filter(Boolean).join(", ");
+  }
+
+  function parsePromptList(value) {
+    return String(value || "")
+      .split(/\r?\n/)
+      .map((line) =>
+        line
+          .trim()
+          .replace(/^\s*[-*]\s+/, "")
+          .replace(/^\s*\d+\s*[.)\]-]\s+/, "")
+          .trim(),
+      )
+      .filter(Boolean);
   }
 
   function loadHistory() {
@@ -555,8 +570,14 @@
   }
 
   function buildQueue(folder, items) {
-    return items.map((media) => {
-      const prompt = composePrompt(cleanPrompt(media.name));
+    const promptList = config.promptListEnabled
+      ? parsePromptList(config.promptList)
+      : [];
+    return items.map((media, index) => {
+      const individualPrompt = config.promptListEnabled
+        ? promptList[index] || ""
+        : cleanPrompt(media.name);
+      const prompt = composePrompt(individualPrompt);
       const record = getRecord(folder.id, media.id);
       const historyStatus = record ? record.status : "";
       const pendingMediaStatus = media.uuid
@@ -1046,13 +1067,23 @@
           <div class="ve-row ve-hidden" id="ve-filename-prompt-row" style="align-items:center">
             <label class="ve-muted" style="display:flex;align-items:center;gap:8px;cursor:pointer">
               <input class="ve-checkbox" id="ve-append-filename-prompt" type="checkbox" />
-              Also include the image filename in the prompt
+              Also include each image's individual prompt
             </label>
           </div>
           <div class="ve-row">
-            <textarea class="ve-textarea" id="ve-master-prompt" placeholder="e.g. cinematic product shot, soft studio light. {{image}} is optional when the filename option is enabled."></textarea>
+            <textarea class="ve-textarea" id="ve-master-prompt" placeholder="e.g. cinematic product shot, soft studio light. {{image}} is optional when the individual prompt option is enabled."></textarea>
           </div>
-          <div class="ve-muted" style="margin-top:-4px;margin-bottom:10px">Master mode uses only this text unless you turn on the filename option.</div>
+          <div class="ve-muted" style="margin-top:-4px;margin-bottom:10px">Master mode uses only this text unless you turn on the individual prompt option.</div>
+          <div class="ve-row" style="align-items:center">
+            <label class="ve-muted" style="display:flex;align-items:center;gap:8px;cursor:pointer">
+              <input class="ve-checkbox" id="ve-prompt-list-enabled" type="checkbox" />
+              Use prompt list matched to sorted images
+            </label>
+          </div>
+          <div class="ve-row ve-hidden" id="ve-prompt-list-row">
+            <textarea class="ve-textarea" id="ve-prompt-list" placeholder="Paste one prompt per line. Line 1 = first sorted image, line 2 = second sorted image, etc."></textarea>
+          </div>
+          <div class="ve-muted ve-hidden" id="ve-prompt-list-summary" style="margin-top:-4px;margin-bottom:10px">Prompt list is off.</div>
           <div class="ve-row">
             <button class="ve-button primary" id="ve-load-media-btn"><i class="bi bi-list-check"></i> Load images</button>
             <button class="ve-button success" id="ve-run-btn"><i class="bi bi-play-fill"></i> Run queue</button>
@@ -1181,6 +1212,10 @@
     appendFilenamePrompt: root.querySelector("#ve-append-filename-prompt"),
     filenamePromptRow: root.querySelector("#ve-filename-prompt-row"),
     masterPrompt: root.querySelector("#ve-master-prompt"),
+    promptListEnabled: root.querySelector("#ve-prompt-list-enabled"),
+    promptListRow: root.querySelector("#ve-prompt-list-row"),
+    promptList: root.querySelector("#ve-prompt-list"),
+    promptListSummary: root.querySelector("#ve-prompt-list-summary"),
     loadMediaBtn: root.querySelector("#ve-load-media-btn"),
     runBtn: root.querySelector("#ve-run-btn"),
     stopBtn: root.querySelector("#ve-stop-btn"),
@@ -1421,6 +1456,15 @@
     );
   }
 
+  function compareMediaName(a, b) {
+    const nameA = a.name || a.fileName || String(a.id || "");
+    const nameB = b.name || b.fileName || String(b.id || "");
+    return nameA.localeCompare(nameB, undefined, {
+      numeric: true,
+      sensitivity: "base",
+    });
+  }
+
   function setSelectedFiles(fileList) {
     state.selectedFiles = Array.from(fileList || [])
       .filter(isImageFile)
@@ -1561,7 +1605,7 @@
     if (!folder) throw new Error("Please select a folder first.");
     logLine(`Loading images for folder "${folder.title || folder.name}"...`);
     const payload = await api.getAllImages(folder.id);
-    state.items = payload.results;
+    state.items = payload.results.slice().sort(compareMediaName);
     state.folderMediaCount = payload.total;
     state.queue = buildQueue(folder, state.items);
     renderQueue();
@@ -1660,6 +1704,8 @@
     config.masterPromptEnabled = Boolean(els.masterPromptEnabled.checked);
     config.appendFilenamePrompt = Boolean(els.appendFilenamePrompt.checked);
     config.masterPrompt = els.masterPrompt.value.trim();
+    config.promptListEnabled = Boolean(els.promptListEnabled.checked);
+    config.promptList = els.promptList.value;
     if (config.downloadMaxDelayMs < config.downloadMinDelayMs) {
       config.downloadMaxDelayMs = config.downloadMinDelayMs;
       els.downloadMaxDelay.value = String(config.downloadMaxDelayMs);
@@ -1668,9 +1714,23 @@
 
   function updateMasterPromptControls() {
     const masterEnabled = els.masterPromptEnabled.checked;
+    const promptListEnabled = els.promptListEnabled.checked;
+    const promptCount = parsePromptList(els.promptList.value).length;
+    const imageCount = state.items.length;
+    const promptCountText = `${promptCount} prompt line${promptCount === 1 ? "" : "s"} detected`;
+    const promptMismatchText =
+      imageCount && promptCount !== imageCount
+        ? ` Warning: ${imageCount} image${imageCount === 1 ? "" : "s"} loaded.`
+        : "";
     els.filenamePromptRow.classList.toggle("ve-hidden", !masterEnabled);
+    els.promptListRow.classList.toggle("ve-hidden", !promptListEnabled);
+    els.promptListSummary.classList.toggle("ve-hidden", !promptListEnabled);
+    els.promptListSummary.textContent = promptListEnabled
+      ? `${promptCountText}. Line 1 matches the first sorted image.${promptMismatchText}`
+      : "Prompt list is off.";
     els.masterPrompt.disabled = state.running || !masterEnabled;
     els.appendFilenamePrompt.disabled = state.running || !masterEnabled;
+    els.promptList.disabled = state.running || !promptListEnabled;
   }
 
   function triggerBrowserDownload(video) {
@@ -2001,6 +2061,7 @@
       !visibleVideoCount;
     els.stopDownloadsBtn.disabled = !state.downloadInProgress;
     els.masterPromptEnabled.disabled = state.running;
+    els.promptListEnabled.disabled = state.running;
     updateMasterPromptControls();
   }
 
@@ -2223,6 +2284,8 @@
       els.masterPromptEnabled,
       els.appendFilenamePrompt,
       els.masterPrompt,
+      els.promptListEnabled,
+      els.promptList,
     ].forEach((element) => {
       element.addEventListener("input", () => {
         updateConfigFromInputs();
@@ -2231,6 +2294,8 @@
           masterPromptEnabled: config.masterPromptEnabled,
           appendFilenamePrompt: config.appendFilenamePrompt,
           masterPrompt: config.masterPrompt,
+          promptListEnabled: config.promptListEnabled,
+          promptList: config.promptList,
         });
         if (state.items.length && !state.running) {
           const folder = getSelectedFolder();
@@ -2273,6 +2338,12 @@
     if (typeof savedUi.masterPrompt === "string") {
       config.masterPrompt = savedUi.masterPrompt;
     }
+    if (typeof savedUi.promptListEnabled === "boolean") {
+      config.promptListEnabled = savedUi.promptListEnabled;
+    }
+    if (typeof savedUi.promptList === "string") {
+      config.promptList = savedUi.promptList;
+    }
     if (savedUi.videoFilters && typeof savedUi.videoFilters === "object") {
       state.videoFilters = {
         ...state.videoFilters,
@@ -2289,6 +2360,8 @@
     els.masterPromptEnabled.checked = config.masterPromptEnabled;
     els.appendFilenamePrompt.checked = config.appendFilenamePrompt;
     els.masterPrompt.value = config.masterPrompt;
+    els.promptListEnabled.checked = config.promptListEnabled;
+    els.promptList.value = config.promptList;
     updateMasterPromptControls();
     state.selectedFolderId = savedUi.selectedFolderId || null;
     applyVideoFiltersToInputs();
@@ -2314,6 +2387,8 @@
           masterPromptEnabled: config.masterPromptEnabled,
           appendFilenamePrompt: config.appendFilenamePrompt,
           masterPrompt: config.masterPrompt,
+          promptListEnabled: config.promptListEnabled,
+          promptList: config.promptList,
         });
       });
     });
