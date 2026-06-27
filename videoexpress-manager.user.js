@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         VideoExpress Library Manager
 // @namespace    https://app.videoexpress.ai/
-// @version      0.5.2
+// @version      0.5.3
 // @description  Manage folders, upload images, and batch convert images to videos inside VideoExpress AI.
 // @match        https://app.videoexpress.ai/*
 // @grant        none
 // @run-at       document-idle
-// @updateURL    https://raw.githubusercontent.com/ayyfahim/vea_automator/master/videoexpress-manager.user.js
-// @downloadURL  https://raw.githubusercontent.com/ayyfahim/vea_automator/master/videoexpress-manager.user.js
+// @updateURL    https://raw.githubusercontent.com/ayyfahim/vea_automator/main/videoexpress-manager.user.js
+// @downloadURL  https://raw.githubusercontent.com/ayyfahim/vea_automator/main/videoexpress-manager.user.js
 // ==/UserScript==
 
 (function () {
