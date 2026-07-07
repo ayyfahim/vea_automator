@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoExpress Library Manager
 // @namespace    https://app.videoexpress.ai/
-// @version      0.5.3
+// @version      0.6.0
 // @description  Manage folders, upload images, and batch convert images to videos inside VideoExpress AI.
 // @match        https://app.videoexpress.ai/*
 // @grant        none
@@ -796,7 +796,7 @@
       }
       .ve-stats {
         display: grid;
-        grid-template-columns: repeat(4, 1fr);
+        grid-template-columns: repeat(5, 1fr);
         gap: 8px;
       }
       .ve-stat {
@@ -809,6 +809,16 @@
         display: block;
         font-size: 20px;
         color: #263241;
+      }
+      .ve-stat.failures {
+        background: #fef2f2;
+        border-color: #fecaca;
+      }
+      .ve-stat.failures strong {
+        color: #dc2626;
+      }
+      .ve-stat.failures span {
+        color: #b91c1c;
       }
       .ve-table {
         width: 100%;
@@ -1096,6 +1106,7 @@
             <div class="ve-stat"><span class="ve-muted">Queued</span><strong id="ve-stat-queued">0</strong></div>
             <div class="ve-stat"><span class="ve-muted">Running</span><strong id="ve-stat-running">0</strong></div>
             <div class="ve-stat"><span class="ve-muted">Done</span><strong id="ve-stat-done">0</strong></div>
+            <div class="ve-stat failures"><span>Failed</span><strong id="ve-stat-failed">0</strong></div>
           </div>
         </div>
         <div class="ve-section">
@@ -1241,6 +1252,7 @@
     statQueued: root.querySelector("#ve-stat-queued"),
     statRunning: root.querySelector("#ve-stat-running"),
     statDone: root.querySelector("#ve-stat-done"),
+    statFailed: root.querySelector("#ve-stat-failed"),
     folderSummary: root.querySelector("#ve-folder-summary"),
     queueBody: root.querySelector("#ve-queue-body"),
     log: root.querySelector("#ve-log"),
@@ -1490,6 +1502,9 @@
     const doneCount = state.queue.filter(
       (item) => normalizeStatus(item.status) === "completed",
     ).length;
+    const failedCount = state.queue.filter(
+      (item) => normalizeStatus(item.status) === "failed",
+    ).length;
     const queuedCount = state.queue.filter((item) => {
       const status = normalizeStatus(item.status);
       return !item.skip || status === "failed" || status === "parallel_limit";
@@ -1499,6 +1514,7 @@
     els.statQueued.textContent = String(queuedCount);
     els.statRunning.textContent = String(runningCount);
     els.statDone.textContent = String(doneCount);
+    els.statFailed.textContent = String(failedCount);
 
     const folder = getSelectedFolder();
     els.folderSummary.textContent = folder
@@ -1558,6 +1574,37 @@
       .replace(/\s+/g, " ")
       .trim();
     return (name || "video").slice(0, 180);
+  }
+
+  function resolveVideoDownloadName(video) {
+    if (video.uuid) {
+      const records = state.history.records;
+      for (const key of Object.keys(records)) {
+        const record = records[key];
+        if (record.uuid === video.uuid && record.imageName) {
+          return sanitizeFileName(record.imageName) + ".mp4";
+        }
+      }
+    }
+    return sanitizeFileName(video.name || video.fileName || video.id) + ".mp4";
+  }
+
+  async function fetchAndDownload(video, fileName) {
+    const response = await fetch(`/library/download/${video.id}`);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} ${response.statusText}`);
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = fileName;
+    link.rel = "noopener";
+    link.style.display = "none";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
   }
 
   function randomDelay(minMs, maxMs) {
@@ -1668,16 +1715,20 @@
     updateButtonStates();
     let successCount = 0;
     let failCount = 0;
+    const failedNames = [];
     els.uploadSummary.textContent = `Uploading ${files.length} files...`;
 
     for (const file of files) {
       try {
         await api.uploadFile(folder.id, file);
         successCount += 1;
-        els.uploadSummary.textContent = `Uploaded ${successCount}/${files.length}`;
+        const failedText = failedNames.length ? ` | Last fail: ${failedNames[failedNames.length - 1]}` : "";
+        els.uploadSummary.textContent = `Uploaded ${successCount}/${files.length}${failedText}`;
       } catch (error) {
         failCount += 1;
+        failedNames.push(file.name);
         logLine(`Upload failed for ${file.name}: ${error.message}`);
+        els.uploadSummary.textContent = `Uploaded ${successCount}/${files.length} | Last fail: ${file.name}`;
       }
     }
 
@@ -1686,7 +1737,8 @@
     els.fileInput.value = "";
     els.folderInput.value = "";
     state.selectedFiles = [];
-    els.uploadSummary.textContent = `Upload complete. Success: ${successCount}, Failed: ${failCount}`;
+    const failedText = failedNames.length ? ` | Failed: ${failedNames.join(", ")}` : "";
+    els.uploadSummary.textContent = `Upload complete. Success: ${successCount}, Failed: ${failCount}${failedText}`;
     await loadFolderImages();
   }
 
@@ -1733,17 +1785,6 @@
     els.promptList.disabled = state.running || !promptListEnabled;
   }
 
-  function triggerBrowserDownload(video) {
-    const link = document.createElement("a");
-    link.href = `/library/download/${video.id}`;
-    link.download = `${sanitizeFileName(video.name || video.fileName || video.id)}.mp4`;
-    link.rel = "noopener";
-    link.style.display = "none";
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-  }
-
   async function downloadVideos(videos, label) {
     if (state.downloadInProgress) return;
     if (!videos.length) throw new Error("No videos selected for download.");
@@ -1754,39 +1795,53 @@
     updateButtonStates();
 
     let completed = 0;
+    let failCount = 0;
+    const failedNames = [];
     const total = videos.length;
     els.downloadProgress.style.width = "0%";
 
     try {
       for (const video of videos) {
         if (state.stopRequested) break;
+        const downloadName = resolveVideoDownloadName(video);
         completed += 1;
-        els.downloadSummary.textContent = `${label}: starting ${completed}/${total} | ${video.name || video.id}`;
-        triggerBrowserDownload(video);
+        els.downloadSummary.textContent = `${label}: downloading ${completed}/${total} | ${downloadName}`;
+
+        try {
+          await fetchAndDownload(video, downloadName);
+          logLine(`Download completed ${completed}/${total}: ${downloadName}`);
+        } catch (error) {
+          failCount += 1;
+          failedNames.push(downloadName);
+          logLine(`Download failed for ${downloadName}: ${error.message}`);
+        }
+
         els.downloadProgress.style.width = `${Math.round((completed / total) * 100)}%`;
-        logLine(
-          `Download started ${completed}/${total}: ${video.name || video.id}`,
-        );
 
         if (completed < total && !state.stopRequested) {
           const waitMs = randomDelay(
             config.downloadMinDelayMs,
             config.downloadMaxDelayMs,
           );
-          els.downloadSummary.textContent = `${label}: waiting ${Math.round(waitMs / 1000)}s before next download (${completed}/${total})`;
+          const failedText = failedNames.length ? ` | Failed: ${failedNames.join(", ")}` : "";
+          els.downloadSummary.textContent = `${label}: waiting ${Math.round(waitMs / 1000)}s before next (${completed}/${total})${failedText}`;
           await sleep(waitMs);
         }
       }
     } finally {
       state.downloadInProgress = false;
       updateButtonStates();
-      els.downloadSummary.textContent = state.stopRequested
-        ? `${label}: stopped after ${completed}/${total}`
-        : `${label}: queued ${completed}/${total} downloads`;
+      const successCount = completed - failCount;
+      const failedText = failedNames.length ? ` | Failed: ${failedNames.join(", ")}` : "";
+      if (state.stopRequested) {
+        els.downloadSummary.textContent = `${label}: stopped after ${completed}/${total}${failedText}`;
+      } else {
+        els.downloadSummary.textContent = `${label}: ${successCount}/${total} downloaded, ${failCount} failed${failedText}`;
+      }
       logLine(
         state.stopRequested
           ? "Download queue stopped."
-          : "Download queue finished.",
+          : `Download queue finished. ${successCount} succeeded, ${failCount} failed.`,
       );
     }
   }
@@ -2196,10 +2251,11 @@
       });
     });
     els.clearVideoFiltersBtn.addEventListener("click", () => {
+      const todayStr = new Date().toISOString().slice(0, 10);
       state.videoFilters = {
         query: "",
-        dateFrom: "",
-        dateTo: "",
+        dateFrom: todayStr,
+        dateTo: todayStr,
         minSizeMb: "",
         maxSizeMb: "",
       };
@@ -2350,6 +2406,9 @@
         ...savedUi.videoFilters,
       };
     }
+    const todayStr = new Date().toISOString().slice(0, 10);
+    state.videoFilters.dateFrom = todayStr;
+    state.videoFilters.dateTo = todayStr;
 
     els.aspect.value = config.aspect;
     els.videoLength.value = String(config.videoLength);
