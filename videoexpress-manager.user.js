@@ -1939,10 +1939,24 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     (rec) => String(rec.folderId) === String(folder.id) && normalizeStatus(rec.status) === "completed" && (!onlyRemaining || !rec.downloadedAt) && !rec.videoId,
   );
   if (missingWithoutVideoId.length) {
-    logLine(`Warning: ${missingWithoutVideoId.length} completed without videoId (status payload not captured). Will skip. Wait for poll or check console [VE] videoId captured.`);
+    logLine(`Warning: ${missingWithoutVideoId.length} completed without videoId. Will attempt library correlation (may skip if ambiguous).`);
+    try {
+      const payload = await api.getAllVideos(folder.id);
+      const vids = payload.results.filter(v => v.type === "video" || v.extension === "mp4").sort((a,b)=> new Date(b.datetime)-new Date(a.datetime));
+      const recentWindowMs = 24*60*60*1000;
+      const now = Date.now();
+      const recentVids = vids.filter(v => (now - new Date(v.datetime).getTime()) < recentWindowMs);
+      if (recentVids.length >= missingWithoutVideoId.length && recentVids.length < 5) {
+        logLine(`Recent library videos ${recentVids.length} >= missing ${missingWithoutVideoId.length}, but correlation is ambiguous — skipping auto-assign. Please wait for poll to capture videoId or check console [VE][STATUS RAW].`);
+      } else if (recentVids.length) {
+        logLine(`Found ${recentVids.length} recent videos, not auto-assigning.`);
+      }
+    } catch (e) {
+      logLine(`Library correlation failed: ${e.message}`);
+    }
   }
 
-  if (!entries.length) throw new Error(onlyRemaining ? "No remaining downloads." : "No completed videos to download." + (missingWithoutVideoId.length ? ` (${missingWithoutVideoId.length} completed but videoId missing)` : ""));
+  if (!entries.length) throw new Error(onlyRemaining ? "No remaining downloads." : "No completed videos to download." + (missingWithoutVideoId.length ? ` (${missingWithoutVideoId.length} completed but videoId missing — wait for status poll or re-check payload)` : ""));
 
   state.downloadInProgress = true;
   state.stopRequested = false;
