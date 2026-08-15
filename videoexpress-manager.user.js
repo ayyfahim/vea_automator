@@ -1077,6 +1077,39 @@ function extractVideoIdFromStatus(payload) {
       .ve-badge.failed { background: #fdeeee; color: #bd3e3a; }
       .ve-badge.parallel_limit { background: #fff4df; color: #9b6a18; }
       .ve-badge.skipped { background: #eef3f7; color: #64748b; }
+      .ve-info {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 16px;
+        height: 16px;
+        margin-left: 6px;
+        border-radius: 999px;
+        border: 1px solid #cbd5e1;
+        background: #f8fafc;
+        color: #64748b;
+        font-size: 10px;
+        font-weight: 700;
+        cursor: help;
+        vertical-align: middle;
+      }
+      .ve-info:hover { background: #eef2f7; color: #334155; }
+      .ve-retry-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 3px 8px;
+        border-radius: 4px;
+        border: 1px solid #22a7f0;
+        background: #ffffff;
+        color: #1683c7;
+        font-size: 11px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      .ve-retry-btn:hover { background: #e8f5fe; }
+      .ve-retry-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+      .ve-queue-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
       .ve-log {
         margin-top: 8px;
         max-height: 178px;
@@ -1330,13 +1363,14 @@ function extractVideoIdFromStatus(payload) {
           <div class="ve-row">
             <div class="ve-muted" id="ve-folder-summary">Select a folder to begin.</div>
           </div>
-          <table class="ve-table">
+            <table class="ve-table">
             <thead>
               <tr>
-                <th style="width: 26%">Image</th>
-                <th style="width: 42%">Prompt</th>
-                <th style="width: 16%">Status</th>
-                <th style="width: 16%">Updated</th>
+                <th style="width: 24%">Image</th>
+                <th style="width: 36%">Prompt</th>
+                <th style="width: 14%">Status</th>
+                <th style="width: 14%">Updated</th>
+                <th style="width: 12%">Actions</th>
               </tr>
             </thead>
             <tbody id="ve-queue-body"></tbody>
@@ -1754,6 +1788,12 @@ function extractVideoIdFromStatus(payload) {
             const displayStatus =
               latestStatus || (item.skip ? "skipped" : "idle");
             const isDownloaded = record && record.downloadedAt;
+            const isFailed = normalizeStatus(latestStatus) === "failed";
+            const isParallel = normalizeStatus(latestStatus) === "parallel_limit";
+            const canRetry = isFailed || isParallel;
+            const reason = canRetry ? getFailureReason(record || { status: latestStatus, error: item.record && item.record.error, response: item.record && item.record.response, statusPayload: item.record && item.record.statusPayload }) : "";
+            const reasonAttr = escapeAttr(reason);
+            const reasonHtml = escapeHtml(reason);
             return `
               <tr>
                 <td>
@@ -1766,13 +1806,22 @@ function extractVideoIdFromStatus(payload) {
                   </div>
                 </td>
                 <td>${escapeHtml(item.prompt || "(empty prompt)")}</td>
-                <td><span class="ve-badge ${getBadgeClass(displayStatus)}">${escapeHtml(displayStatus)}</span>${isDownloaded ? ` <span class="ve-badge completed">downloaded</span>` : ""}</td>
+                <td>
+                  <span class="ve-badge ${getBadgeClass(displayStatus)}">${escapeHtml(displayStatus)}</span>
+                  ${canRetry && reason ? `<span class="ve-info" title="${reasonAttr}" data-failure-reason="${reasonAttr}" role="button" tabindex="0" aria-label="Failure reason">i</span>` : ""}
+                  ${isDownloaded ? ` <span class="ve-badge completed">downloaded</span>` : ""}
+                </td>
                 <td>${escapeHtml(formatDateTime(updatedAt) || "-")}</td>
+                <td>
+                  <div class="ve-queue-actions">
+                    ${canRetry ? `<button class="ve-retry-btn" data-retry-media-id="${escapeAttr(String(item.media.id))}" title="${canRetry ? `Retry ${reasonHtml}` : ""}"><i class="bi bi-arrow-clockwise"></i> Retry</button>` : `<span class="ve-muted">—</span>`}
+                  </div>
+                </td>
               </tr>
             `;
           })
           .join("")
-      : `<tr><td colspan="4" class="ve-muted">No items loaded yet.</td></tr>`;
+      : `<tr><td colspan="5" class="ve-muted">No items loaded yet.</td></tr>`;
     const missing = Object.values(state.history.records).filter(r => String(r.folderId)===String(state.selectedFolderId) && normalizeStatus(r.status)==="completed" && !r.videoId).length;
     const counts = getQueueDownloadCounts();
     els.queueDownloadSummary.textContent = counts.completed
