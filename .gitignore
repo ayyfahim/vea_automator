@@ -1,2 +1,4 @@
 site_design.html
 temp/
+*.log
+*.har
