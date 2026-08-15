@@ -2383,7 +2383,12 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       if (!vid) { failed++; processed++; logLine(`Skip ${rec.imageName}: no videoId resolvable`); return; }
       const myQIdx = ++nextQIdx;
       const fakeVideo = { id: vid, uuid: rec.uuid, name: rec.imageName, fileName: rec.imageFileName };
-      const fileName = resolveVideoDownloadName(fakeVideo);
+      const baseName = resolveVideoDownloadName(fakeVideo);
+      const queuePos = getQueuePositionForMedia(rec.imageId);
+      const fallbackPos = myQIdx; // 1-based within entries
+      const finalPos = queuePos != null ? queuePos : fallbackPos;
+      if (queuePos == null) logLine(`queuePos fallback for ${rec.imageName || rec.imageId}: using ${fallbackPos} (queue not loaded)`);
+      const fileName = `${finalPos}_${baseName}`;
       els.queueDownloadSummary.textContent = `${onlyRemaining ? "Remaining" : "Completed"}: downloading ${myQIdx}/${total} | ${fileName}`;
       try {
         await fetchAndDownloadWithRetry(fakeVideo, fileName);
