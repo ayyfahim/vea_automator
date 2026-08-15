@@ -1973,6 +1973,33 @@ async function downloadQueueCompleted({ onlyRemaining }) {
   updateConfigFromInputs();
   const folder = getSelectedFolder();
   if (!folder) throw new Error("No folder selected.");
+
+  const missingBefore = Object.values(state.history.records).filter(
+    (rec) => String(rec.folderId) === String(folder.id) && normalizeStatus(rec.status) === "completed" && (!onlyRemaining || !rec.downloadedAt) && !rec.videoId && rec.uuid
+  );
+
+  if (missingBefore.length) {
+    logLine(`Resolving ${missingBefore.length} completed video IDs from library...`);
+    try {
+      const aiMap = await fetchAiVideosMap();
+      for (const rec of missingBefore) {
+        const u = String(rec.uuid).toLowerCase().trim();
+        if (aiMap.has(u)) {
+          const matched = aiMap.get(u);
+          rec.videoId = String(matched.id);
+          setRecord(folder.id, rec.imageId, {
+            ...rec,
+            videoId: String(matched.id),
+            updatedAt: new Date().toISOString(),
+          });
+          logLine(`Resolved ${rec.imageName}: video ID ${matched.id}`);
+        }
+      }
+    } catch (e) {
+      logLine(`Library resolution error: ${e.message}`);
+    }
+  }
+
   const entries = Object.values(state.history.records)
     .filter((rec) => String(rec.folderId) === String(folder.id) && normalizeStatus(rec.status) === "completed" && (!onlyRemaining || !rec.downloadedAt))
     .filter((rec) => rec.videoId)
@@ -1981,23 +2008,6 @@ async function downloadQueueCompleted({ onlyRemaining }) {
   const missingWithoutVideoId = Object.values(state.history.records).filter(
     (rec) => String(rec.folderId) === String(folder.id) && normalizeStatus(rec.status) === "completed" && (!onlyRemaining || !rec.downloadedAt) && !rec.videoId,
   );
-  if (missingWithoutVideoId.length) {
-    logLine(`Warning: ${missingWithoutVideoId.length} completed without videoId. Will attempt library correlation (may skip if ambiguous).`);
-    try {
-      const payload = await api.getAllVideos(folder.id);
-      const vids = payload.results.filter(v => v.type === "video" || v.extension === "mp4").sort((a,b)=> new Date(b.datetime)-new Date(a.datetime));
-      const recentWindowMs = 24*60*60*1000;
-      const now = Date.now();
-      const recentVids = vids.filter(v => (now - new Date(v.datetime).getTime()) < recentWindowMs);
-      if (recentVids.length >= missingWithoutVideoId.length && recentVids.length < 5) {
-        logLine(`Recent library videos ${recentVids.length} >= missing ${missingWithoutVideoId.length}, but correlation is ambiguous — skipping auto-assign. Please wait for poll to capture videoId or check console [VE][STATUS RAW].`);
-      } else if (recentVids.length) {
-        logLine(`Found ${recentVids.length} recent videos, not auto-assigning.`);
-      }
-    } catch (e) {
-      logLine(`Library correlation failed: ${e.message}`);
-    }
-  }
 
   if (!entries.length) throw new Error(onlyRemaining ? "No remaining downloads." : "No completed videos to download." + (missingWithoutVideoId.length ? ` (${missingWithoutVideoId.length} completed but videoId missing — wait for status poll or re-check payload)` : ""));
 
@@ -2273,6 +2283,30 @@ async function downloadQueueCompleted({ onlyRemaining }) {
         setRecord(record.folderId, record.imageId, nextRecord);
       } catch (error) {
         logLine(`Status poll failed for ${record.uuid}: ${error.message}`);
+      }
+    }
+
+    const completedWithoutVid = Object.values(state.history.records).filter(
+      (r) => normalizeStatus(r.status) === "completed" && r.uuid && !r.videoId
+    );
+    if (completedWithoutVid.length) {
+      try {
+        const aiMap = await fetchAiVideosMap();
+        for (const record of completedWithoutVid) {
+          const u = String(record.uuid).toLowerCase().trim();
+          if (aiMap.has(u)) {
+            const vidItem = aiMap.get(u);
+            record.videoId = String(vidItem.id);
+            setRecord(record.folderId, record.imageId, {
+              ...record,
+              videoId: String(vidItem.id),
+              updatedAt: new Date().toISOString()
+            });
+            logLine(`Matched video ID ${vidItem.id} for ${record.imageName || record.uuid}`);
+          }
+        }
+      } catch (e) {
+        console.warn("[VE] AI videos map resolution failed in pollStatuses:", e);
       }
     }
 
