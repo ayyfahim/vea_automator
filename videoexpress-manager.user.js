@@ -34,7 +34,7 @@
       stripExtension: true,
       replaceUnderscores: true,
       replaceDashes: true,
-      removeNumbers: true,
+      removeNumbers: false,
       collapseWhitespace: true,
     },
     masterPrompt: "",
@@ -126,7 +126,11 @@
     if (config.promptCleaner.collapseWhitespace) {
       value = value.replace(/\s+/g, " ");
     }
-    return value.trim();
+    const cleaned = value.trim();
+    if (!cleaned) {
+      return String(name || "").replace(/\.[a-z0-9]+$/i, "").trim();
+    }
+    return cleaned;
   }
 
   function composePrompt(imagePrompt) {
@@ -501,14 +505,18 @@
     },
 
     async generateImageVideo(media, prompt, options = {}) {
+      const finalPrompt = String(prompt || "").trim() || String(media.name || "").replace(/\.[a-z0-9]+$/i, "").trim();
+      const mediaType = media.type || (media.isHumanTalkingVideo ? "human" : "image");
+      const isShared = media.isShared === true || media.isShared === "1" ? "1" : "0";
+
       const params = new URLSearchParams({
-        type: "human",
+        type: mediaType,
         imagePrompt: "",
-        prompt,
+        prompt: finalPrompt,
         uuid: media.uuid || "",
         mediaId: String(media.id),
         audioMediaId: "0",
-        isShared: media.isShared ? "1" : "0",
+        isShared,
         aspect: String(options.aspect || config.aspect),
         videoLength: String(options.videoLength || config.videoLength),
         enhanceHumanFace: "0",
@@ -628,9 +636,11 @@ function extractVideoIdFromStatus(payload) {
 
   function getQueueDownloadCounts() {
     let completed = 0, downloaded = 0, remaining = 0;
-    for (const item of state.queue) {
-      const rec = getRecord(state.selectedFolderId, item.media.id);
-      if (!rec || normalizeStatus(rec.status) !== "completed") continue;
+    const folderId = state.selectedFolderId;
+    if (!folderId) return { completed, downloaded, remaining };
+    for (const rec of Object.values(state.history.records)) {
+      if (String(rec.folderId) !== String(folderId)) continue;
+      if (normalizeStatus(rec.status) !== "completed") continue;
       completed++;
       if (rec.downloadedAt) downloaded++;
       else remaining++;
@@ -1904,21 +1914,19 @@ async function downloadQueueCompleted({ onlyRemaining }) {
   updateConfigFromInputs();
   const folder = getSelectedFolder();
   if (!folder) throw new Error("No folder selected.");
-  const entries = state.queue
-    .map(item => ({ item, rec: getRecord(folder.id, item.media.id) }))
-    .filter(({ rec }) => rec && normalizeStatus(rec.status) === "completed" && (!onlyRemaining || !rec.downloadedAt))
-    .filter(({ rec }) => rec.videoId || rec.uuid);
+  const entries = Object.values(state.history.records)
+    .filter((rec) => String(rec.folderId) === String(folder.id) && normalizeStatus(rec.status) === "completed" && (!onlyRemaining || !rec.downloadedAt))
+    .filter((rec) => rec.videoId)
+    .map((rec) => ({ rec }));
 
-  if (!entries.length) throw new Error(onlyRemaining ? "No remaining downloads." : "No completed videos to download.");
-
-  const missing = entries.filter(({ rec }) => !rec.videoId);
-  let fallbackMap = new Map();
-  if (missing.length) {
-    logLine(`Resolving ${missing.length} missing videoIds via library fetch...`);
-    const payload = await api.getAllVideos(folder.id);
-    const vids = payload.results.filter(v => v.type === "video" || v.extension === "mp4").sort((a,b)=> new Date(b.datetime)-new Date(a.datetime));
-    missing.forEach(({ rec }, i) => { if (vids[i]) fallbackMap.set(rec.imageId, String(vids[i].id)); });
+  const missingWithoutVideoId = Object.values(state.history.records).filter(
+    (rec) => String(rec.folderId) === String(folder.id) && normalizeStatus(rec.status) === "completed" && (!onlyRemaining || !rec.downloadedAt) && !rec.videoId,
+  );
+  if (missingWithoutVideoId.length) {
+    logLine(`Warning: ${missingWithoutVideoId.length} completed without videoId (status payload not captured). Will skip. Wait for poll or check console [VE] videoId captured.`);
   }
+
+  if (!entries.length) throw new Error(onlyRemaining ? "No remaining downloads." : "No completed videos to download." + (missingWithoutVideoId.length ? ` (${missingWithoutVideoId.length} completed but videoId missing)` : ""));
 
   state.downloadInProgress = true;
   state.stopRequested = false;
@@ -1928,9 +1936,9 @@ async function downloadQueueCompleted({ onlyRemaining }) {
   els.queueDownloadProgress.style.width = "0%";
 
   try {
-    for (const { item, rec } of entries) {
+    for (const { rec } of entries) {
       if (state.stopRequested) break;
-      const vid = rec.videoId || fallbackMap.get(rec.imageId);
+      const vid = rec.videoId;
       if (!vid) { failed++; logLine(`Skip ${rec.imageName}: no videoId resolvable`); continue; }
       const fakeVideo = { id: vid, uuid: rec.uuid, name: rec.imageName, fileName: rec.imageFileName };
       const fileName = resolveVideoDownloadName(fakeVideo);
