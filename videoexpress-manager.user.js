@@ -3050,6 +3050,37 @@ async function downloadQueueCompleted({ onlyRemaining }) {
         element.dispatchEvent(new Event("input")),
       );
     });
+    // Retry: per-row button (delegated) and Retry All
+    if (els.queueBody) {
+      els.queueBody.addEventListener("click", (event) => {
+        const btn = event.target.closest("[data-retry-media-id]");
+        if (!btn) return;
+        const mediaId = btn.dataset.retryMediaId;
+        if (!mediaId) return;
+        if (btn.disabled) return;
+        handleAction(() => retryFailedItem(mediaId));
+      });
+      // Info icon click -> log full reason
+      els.queueBody.addEventListener("click", (event) => {
+        const info = event.target.closest(".ve-info");
+        if (!info || info.closest("[data-retry-media-id]")) return;
+        const fullReason = info.getAttribute("data-failure-reason") || info.getAttribute("title") || "";
+        const row = info.closest("tr");
+        const mediaLine = row ? (row.querySelector(".ve-title-line")?.textContent || row.querySelector(".ve-muted")?.textContent || "") : "";
+        const msg = `Failure reason for ${mediaLine || "item"}: ${fullReason || "(no detail)"}`;
+        logLine(msg);
+      });
+      els.queueBody.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        const info = event.target.closest(".ve-info");
+        if (!info) return;
+        event.preventDefault();
+        info.click();
+      });
+    }
+    if (els.retryAllFailedBtn) {
+      els.retryAllFailedBtn.addEventListener("click", () => handleAction(retryAllFailed));
+    }
   }
 
   async function bootstrap() {
