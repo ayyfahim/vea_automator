@@ -1898,6 +1898,71 @@ function extractVideoIdFromStatus(payload) {
     }
   }
 
+async function downloadQueueCompleted({ onlyRemaining }) {
+  if (state.downloadInProgress) return;
+  updateConfigFromInputs();
+  const folder = getSelectedFolder();
+  if (!folder) throw new Error("No folder selected.");
+  const entries = state.queue
+    .map(item => ({ item, rec: getRecord(folder.id, item.media.id) }))
+    .filter(({ rec }) => rec && normalizeStatus(rec.status) === "completed" && (!onlyRemaining || !rec.downloadedAt))
+    .filter(({ rec }) => rec.videoId || rec.uuid);
+
+  if (!entries.length) throw new Error(onlyRemaining ? "No remaining downloads." : "No completed videos to download.");
+
+  const missing = entries.filter(({ rec }) => !rec.videoId);
+  let fallbackMap = new Map();
+  if (missing.length) {
+    logLine(`Resolving ${missing.length} missing videoIds via library fetch...`);
+    const payload = await api.getAllVideos(folder.id);
+    const vids = payload.results.filter(v => v.type === "video" || v.extension === "mp4").sort((a,b)=> new Date(b.datetime)-new Date(a.datetime));
+    missing.forEach(({ rec }, i) => { if (vids[i]) fallbackMap.set(rec.imageId, String(vids[i].id)); });
+  }
+
+  state.downloadInProgress = true;
+  state.stopRequested = false;
+  updateButtonStates();
+  let completed = 0, failed = 0;
+  const total = entries.length;
+  els.queueDownloadProgress.style.width = "0%";
+
+  try {
+    for (const { item, rec } of entries) {
+      if (state.stopRequested) break;
+      const vid = rec.videoId || fallbackMap.get(rec.imageId);
+      if (!vid) { failed++; logLine(`Skip ${rec.imageName}: no videoId resolvable`); continue; }
+      const fakeVideo = { id: vid, uuid: rec.uuid, name: rec.imageName, fileName: rec.imageFileName };
+      const fileName = resolveVideoDownloadName(fakeVideo);
+      els.queueDownloadSummary.textContent = `${onlyRemaining ? "Remaining" : "Completed"}: downloading ${completed+1}/${total} | ${fileName}`;
+      try {
+        await fetchAndDownload(fakeVideo, fileName);
+        const next = { ...rec, downloadedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+        setRecord(folder.id, rec.imageId, next);
+        completed++;
+        logLine(`Queue download ${completed}/${total}: ${fileName}`);
+      } catch (e) {
+        failed++;
+        logLine(`Queue download failed ${fileName}: ${e.message}`);
+      }
+      els.queueDownloadProgress.style.width = `${Math.round(((completed+failed)/total)*100)}%`;
+      renderQueue(); updateButtonStates();
+      if (completed+failed < total && !state.stopRequested) {
+        const waitMs = randomDelay(config.downloadMinDelayMs, config.downloadMaxDelayMs);
+        els.queueDownloadSummary.textContent = `${onlyRemaining ? "Remaining" : "Completed"}: waiting ${Math.round(waitMs/1000)}s (${completed+failed}/${total})`;
+        await sleep(waitMs);
+      }
+    }
+  } finally {
+    state.downloadInProgress = false;
+    updateButtonStates(); renderQueue();
+    const ok = completed;
+    els.queueDownloadSummary.textContent = state.stopRequested
+      ? `${onlyRemaining ? "Remaining" : "Completed"}: stopped ${completed}/${total} downloaded`
+      : `${onlyRemaining ? "Remaining" : "Completed"}: ${ok}/${total} downloaded, ${failed} failed | Remaining: ${getQueueDownloadCounts().remaining}`;
+    logLine(state.stopRequested ? "Queue download stopped." : `Queue download finished ${ok}/${total}.`);
+  }
+}
+
   async function runQueue() {
     if (state.running) return;
     const folder = getSelectedFolder();
@@ -2370,6 +2435,8 @@ function extractVideoIdFromStatus(payload) {
         downloadVideos(getFilteredVideos(), "Visible downloads"),
       );
     });
+    els.downloadCompletedBtn.addEventListener("click", () => handleAction(() => downloadQueueCompleted({ onlyRemaining: false })));
+    els.downloadRemainingBtn.addEventListener("click", () => handleAction(() => downloadQueueCompleted({ onlyRemaining: true })));
     els.stopDownloadsBtn.addEventListener("click", () => {
       state.stopRequested = true;
       logLine(
