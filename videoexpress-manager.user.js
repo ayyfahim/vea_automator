@@ -437,13 +437,13 @@
       );
     },
 
-    async getMedia(folderId, page = 1, start = 0, filter = "image") {
+    async getMedia(folderId, page = 1, start = 0, filter = "image", query = "") {
       const params = new URLSearchParams({
         categoryId: String(folderId),
         page: String(page),
         start: String(start),
         limit: String(config.pageSize),
-        query: "",
+        query: String(query || ""),
         orderBy: "name",
         orderDir: "asc",
         filter,
@@ -452,6 +452,9 @@
         `/api/library/get_media/${config.libraryId}?${params.toString()}`,
         `Load media for folder ${folderId}`,
       );
+    },
+    async searchMedia(folderId, query, filter = "") {
+      return api.getMedia(folderId, 1, 0, filter, query);
     },
 
     async getAllImages(folderId) {
@@ -474,22 +477,26 @@
     },
 
     async getAllVideos(folderId) {
-      const items = [];
-      let page = 1;
-      let start = 0;
-      let total = Infinity;
-
-      while (start < total) {
-        const payload = await api.getMedia(folderId, page, start, "");
-        const results = Array.isArray(payload.results) ? payload.results : [];
-        total = Number(payload.total || results.length || 0);
-        items.push(...results);
-        if (!results.length || results.length < config.pageSize) break;
-        page += 1;
-        start += config.pageSize;
+      const first = await api.getMedia(folderId, 1, 0, "");
+      const firstResults = Array.isArray(first.results) ? first.results : [];
+      const total = Number(first.total || firstResults.length || 0);
+      if (firstResults.length >= total || firstResults.length < config.pageSize) {
+        return { total: firstResults.length, results: firstResults };
       }
-
-      return { total: items.length, results: items };
+      const remainingPages = [];
+      for (let start = config.pageSize; start < total; start += config.pageSize) {
+        const page = Math.floor(start / config.pageSize) + 1;
+        remainingPages.push({ page, start });
+      }
+      const rest = [];
+      await asyncPool(3, remainingPages, async ({ page, start }) => {
+        const payload = await api.getMedia(folderId, page, start, "");
+        const r = Array.isArray(payload.results) ? payload.results : [];
+        rest.push(...r);
+      });
+      const all = [...firstResults, ...rest];
+      // Sort by name to match previous behavior if needed, otherwise return as-is
+      return { total: all.length, results: all };
     },
 
     async uploadFile(folderId, file) {
@@ -568,7 +575,7 @@
     );
   }
 
-  async function fetchAiVideosMap() {
+  async function fetchAiVideosMap(targetUuids = null) {
     let aiFolder = getAiVideosFolder();
     if (!aiFolder) {
       state.folders = await api.getFolders();
@@ -576,6 +583,36 @@
       aiFolder = getAiVideosFolder();
     }
     if (!aiFolder) return new Map();
+
+    // Faster path: if caller only needs a few uuids, query them directly instead of paginating 2000+ items
+    if (Array.isArray(targetUuids) && targetUuids.length > 0 && targetUuids.length <= 20) {
+      const map = new Map();
+      await asyncPool(3, targetUuids, async (rawUuid) => {
+        const uuid = String(rawUuid).toLowerCase().trim();
+        if (!uuid || map.has(uuid)) return;
+        // Try server-side query first (if API indexes uuid), then fallback to status endpoint
+        try {
+          const payload = await api.searchMedia(aiFolder.id, uuid, "");
+          const hits = Array.isArray(payload.results) ? payload.results : [];
+          const hit = hits.find((it) => it && String(it.uuid).toLowerCase().trim() === uuid);
+          if (hit) {
+            map.set(uuid, hit);
+            return;
+          }
+        } catch {}
+        // Fallback: resolve via status endpoint (authoritative for completed videos)
+        try {
+          const status = await api.getStatus(rawUuid);
+          const vid = extractVideoIdFromStatus(status);
+          if (vid) {
+            map.set(uuid, { uuid: rawUuid, id: String(vid) });
+          }
+        } catch {}
+      });
+      // If we found at least some, return partial map; caller can fallback to full scan if needed
+      if (map.size > 0) return map;
+      // else fall through to full scan
+    }
 
     const { results } = await api.getAllVideos(aiFolder.id);
     const map = new Map();
@@ -585,6 +622,30 @@
       }
     }
     return map;
+  }
+
+  async function resolveMissingVideoIdsViaStatus(missingRecs) {
+    const resolved = [];
+    await asyncPool(3, missingRecs, async (rec) => {
+      if (!rec.uuid) return;
+      try {
+        const status = await api.getStatus(rec.uuid);
+        const vid = extractVideoIdFromStatus(status);
+        if (vid) {
+          rec.videoId = String(vid);
+          setRecord(rec.folderId, rec.imageId, {
+            ...rec,
+            videoId: String(vid),
+            updatedAt: new Date().toISOString(),
+          });
+          resolved.push(rec);
+          logLine(`Resolved ${rec.imageName} via status: video ID ${vid}`);
+        }
+      } catch (e) {
+        // ignore, will fallback to library map
+      }
+    });
+    return resolved;
   }
 
   function makeRecordKey(folderId, mediaId) {
@@ -2015,24 +2076,56 @@ async function downloadQueueCompleted({ onlyRemaining }) {
   );
 
   if (missingBefore.length) {
-    logLine(`Resolving ${missingBefore.length} completed video IDs from library...`);
+    logLine(`Resolving ${missingBefore.length} completed video IDs...`);
     try {
-      const aiMap = await fetchAiVideosMap();
-      for (const rec of missingBefore) {
-        const u = String(rec.uuid).toLowerCase().trim();
-        if (aiMap.has(u)) {
-          const matched = aiMap.get(u);
-          rec.videoId = String(matched.id);
-          setRecord(folder.id, rec.imageId, {
-            ...rec,
-            videoId: String(matched.id),
-            updatedAt: new Date().toISOString(),
-          });
-          logLine(`Resolved ${rec.imageName}: video ID ${matched.id}`);
+      // Fast path 1: resolve via status endpoint (authoritative, ~300ms each, concurrent 3 → ~500ms for 5 items)
+      const stillMissing = [...missingBefore];
+      const resolvedViaStatus = await resolveMissingVideoIdsViaStatus(stillMissing);
+      const remaining = stillMissing.filter((r) => !r.videoId);
+      if (remaining.length) {
+        logLine(`Status resolved ${resolvedViaStatus.length}/${missingBefore.length}, trying targeted library search for ${remaining.length} remaining...`);
+        const uuids = remaining.map((r) => r.uuid);
+        const aiMap = await fetchAiVideosMap(uuids);
+        for (const rec of remaining) {
+          const u = String(rec.uuid).toLowerCase().trim();
+          if (aiMap.has(u)) {
+            const matched = aiMap.get(u);
+            const vid = String(matched.id || matched.videoId || "");
+            if (vid) {
+              rec.videoId = vid;
+              setRecord(folder.id, rec.imageId, {
+                ...rec,
+                videoId: vid,
+                updatedAt: new Date().toISOString(),
+              });
+              logLine(`Resolved ${rec.imageName} via library: video ID ${vid}`);
+            }
+          }
         }
+        const still = remaining.filter((r) => !r.videoId);
+        if (still.length && uuids.length > 20) {
+          // Too many uuids for targeted path, fallback to full folder scan (2374 items ≈ 10s)
+          logLine(`Targeted search incomplete (${still.length} left), falling back to full library scan...`);
+          const fullMap = await fetchAiVideosMap();
+          for (const rec of still) {
+            const u = String(rec.uuid).toLowerCase().trim();
+            if (fullMap.has(u)) {
+              const matched = fullMap.get(u);
+              rec.videoId = String(matched.id);
+              setRecord(folder.id, rec.imageId, {
+                ...rec,
+                videoId: String(matched.id),
+                updatedAt: new Date().toISOString(),
+              });
+              logLine(`Resolved ${rec.imageName}: video ID ${matched.id}`);
+            }
+          }
+        }
+      } else {
+        logLine(`All ${resolvedViaStatus.length} IDs resolved via status endpoint (no library scan).`);
       }
     } catch (e) {
-      logLine(`Library resolution error: ${e.message}`);
+      logLine(`Resolve error: ${e.message}`);
     }
   }
 
@@ -2337,7 +2430,8 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       );
       if (completedWithoutVid.length) {
         try {
-          const aiMap = await fetchAiVideosMap();
+          const uuids = completedWithoutVid.map((r) => r.uuid);
+          const aiMap = await fetchAiVideosMap(uuids);
           for (const record of completedWithoutVid) {
             const u = String(record.uuid).toLowerCase().trim();
             if (aiMap.has(u)) {
