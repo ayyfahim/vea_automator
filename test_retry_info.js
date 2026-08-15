@@ -108,3 +108,25 @@ const failedWithSpecial={ media:{id:99, name:"a.mp4"}, status:"failed", record:{
 const htmlNew=renderRow_NEW(failedWithSpecial);
 if (!htmlNew.includes("&amp;")) { console.error("FAIL escaping missing &amp; in new template"); process.exitCode=1; } else console.log("PASS task2 escaping check");
 })();
+
+// Task 3: retry single item — record reset logic
+function makeRecordKey(lib, fid, mid){ return `library:${lib}:folder:${fid}:media:${mid}`; }
+function resetRecordForRetry_CURRENT(rec){
+  if(!rec) return null;
+  return { ...rec, status:"idle", error:undefined, response:undefined, statusPayload:undefined, failedAt:undefined, parallelLimitRetries:0, updatedAt: new Date().toISOString() };
+}
+const recFailed = {
+  libraryId:4, folderId:"10", imageId:37357782, imageName:"117.mp4",
+  status:"failed", error:"GPU overloaded", response:{error:"GPU overloaded"},
+  startedAt:"2026-08-07T07:30:10.000Z", updatedAt:"2026-08-07T07:30:10.000Z",
+  uuid:null, videoId:null, prompt:"Slowly approach Bruce..."
+};
+const reset = resetRecordForRetry_CURRENT(recFailed);
+if (reset.status === "failed" || reset.error) { console.error("FAIL reset should clear failed status/error"); process.exitCode=1; }
+else console.log("PASS reset");
+// Step 4 green checks: normalizeStatus idle and keeps identity
+if (normalizeStatus(reset.status)!=="idle" || reset.error || reset.response) { console.error("FAIL retry reset should be idle without error/response"); process.exitCode=1; } else console.log("PASS retry reset idle");
+if (reset.prompt !== recFailed.prompt || reset.imageName!==recFailed.imageName) { console.error("FAIL keeps identity"); process.exitCode=1; } else console.log("PASS keeps identity");
+if (reset.parallelLimitRetries !== 0) { console.error("FAIL parallelLimitRetries should be 0"); process.exitCode=1; } else console.log("PASS parallelLimitRetries reset");
+if (!reset.updatedAt) { console.error("FAIL updatedAt missing"); process.exitCode=1; } else console.log("PASS updatedAt set");
+if (resetRecordForRetry_CURRENT(null) !== null) { console.error("FAIL null returns null"); process.exitCode=1; } else console.log("PASS null handling");

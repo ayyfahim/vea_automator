@@ -2574,6 +2574,73 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     }
   }
 
+  function resetRecordForRetry(record) {
+    if (!record) return null;
+    return {
+      ...record,
+      status: "idle",
+      error: undefined,
+      response: undefined,
+      statusPayload: undefined,
+      failedAt: undefined,
+      parallelLimitRetries: 0,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  async function retryFailedItem(mediaId) {
+    const folder = getSelectedFolder();
+    if (!folder) throw new Error("No folder selected.");
+    const key = makeRecordKey(folder.id, mediaId);
+    const existing = state.history.records[key];
+    if (!existing) throw new Error(`No history record for media ${mediaId} in folder ${folder.id}`);
+    const st = normalizeStatus(existing.status);
+    if (st !== "failed" && st !== "parallel_limit") throw new Error(`Item ${mediaId} is not failed (status: ${existing.status || "idle"})`);
+    const next = resetRecordForRetry(existing);
+    if (next) {
+      delete next.error;
+      delete next.response;
+      delete next.statusPayload;
+      delete next.failedAt;
+    }
+    state.history.records[key] = next;
+    saveHistory();
+    logLine(`Retrying failed item ${existing.imageName || mediaId} — reason: ${getFailureReason(existing) || st}`);
+    if (folder && state.items.length) {
+      state.queue = buildQueue(folder, state.items);
+      renderQueue();
+    }
+    if (!state.running) {
+      await runQueue();
+    } else {
+      logLine(`Queue running — item ${mediaId} will be retried after current item finishes.`);
+    }
+  }
+  async function retryAllFailed() {
+    const folder = getSelectedFolder();
+    if (!folder) throw new Error("No folder selected.");
+    const failedKeys = Object.keys(state.history.records).filter((k) => {
+      const rec = state.history.records[k];
+      if (!rec || String(rec.folderId) !== String(folder.id)) return false;
+      const s = normalizeStatus(rec.status);
+      return s === "failed" || s === "parallel_limit";
+    });
+    if (!failedKeys.length) throw new Error("No failed items to retry in this folder.");
+    for (const key of failedKeys) {
+      const rec = state.history.records[key];
+      const next = resetRecordForRetry(rec);
+      if (next) { delete next.error; delete next.response; delete next.statusPayload; delete next.failedAt; }
+      state.history.records[key] = next;
+    }
+    saveHistory();
+    logLine(`Retrying ${failedKeys.length} failed item(s) in folder ${folder.title || folder.name}`);
+    if (folder && state.items.length) {
+      state.queue = buildQueue(folder, state.items);
+      renderQueue();
+    }
+    if (!state.running) await runQueue();
+    else logLine(`Queue running — ${failedKeys.length} item(s) queued for retry.`);
+  }
+
   async function pollStatuses() {
     const pendingRecords = Object.values(state.history.records).filter(
       (record) => {
