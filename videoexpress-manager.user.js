@@ -1354,6 +1354,10 @@ function extractVideoIdFromStatus(payload) {
             <button class="ve-button primary" id="ve-download-completed-btn" type="button"><i class="bi bi-download"></i> Download Completed</button>
             <button class="ve-button success" id="ve-download-remaining-btn" type="button"><i class="bi bi-download"></i> Download Remaining</button>
           </div>
+          <div class="ve-row" style="margin-top:10px">
+            <button class="ve-button warn" id="ve-retry-all-failed-btn" type="button" title="Retry every failed item in this folder"><i class="bi bi-arrow-clockwise"></i> Retry all failed</button>
+            <span class="ve-muted" id="ve-retry-all-summary"></span>
+          </div>
         </div>
         <div class="ve-section">
           <div class="ve-section-title">
@@ -1508,6 +1512,8 @@ function extractVideoIdFromStatus(payload) {
     queueDownloadProgress: root.querySelector("#ve-queue-download-progress"),
     downloadCompletedBtn: root.querySelector("#ve-download-completed-btn"),
     downloadRemainingBtn: root.querySelector("#ve-download-remaining-btn"),
+    retryAllFailedBtn: root.querySelector("#ve-retry-all-failed-btn"),
+    retryAllSummary: root.querySelector("#ve-retry-all-summary"),
     log: root.querySelector("#ve-log"),
   };
 
@@ -1755,9 +1761,10 @@ function extractVideoIdFromStatus(payload) {
     const doneCount = state.queue.filter(
       (item) => normalizeStatus(item.status) === "completed",
     ).length;
-    const failedCount = state.queue.filter(
-      (item) => normalizeStatus(item.status) === "failed",
-    ).length;
+    const failedCount = state.queue.filter((item) => {
+      const s = normalizeStatus(item.status);
+      return s === "failed" || s === "parallel_limit";
+    }).length;
     const queuedCount = state.queue.filter((item) => {
       const status = normalizeStatus(item.status);
       return !item.skip || status === "failed" || status === "parallel_limit";
@@ -1768,6 +1775,9 @@ function extractVideoIdFromStatus(payload) {
     els.statRunning.textContent = String(runningCount);
     els.statDone.textContent = String(doneCount);
     els.statFailed.textContent = String(failedCount);
+    if (els.retryAllSummary) {
+      els.retryAllSummary.textContent = failedCount ? `${failedCount} failed — click Retry all failed or per-row Retry` : "";
+    }
 
     const folder = getSelectedFolder();
     els.folderSummary.textContent = folder
@@ -2782,6 +2792,13 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     const queueCounts = getQueueDownloadCounts();
     els.downloadCompletedBtn.disabled = state.running || state.uploadInProgress || state.downloadInProgress || queueCounts.completed === 0;
     els.downloadRemainingBtn.disabled = state.running || state.uploadInProgress || state.downloadInProgress || queueCounts.remaining === 0;
+    const failedCountForBtn = state.queue.filter((item) => {
+      const s = normalizeStatus(item.status);
+      return s === "failed" || s === "parallel_limit";
+    }).length;
+    if (els.retryAllFailedBtn) {
+      els.retryAllFailedBtn.disabled = state.running || state.uploadInProgress || state.downloadInProgress || failedCountForBtn === 0;
+    }
     els.masterPromptEnabled.disabled = state.running;
     els.promptListEnabled.disabled = state.running;
     updateMasterPromptControls();

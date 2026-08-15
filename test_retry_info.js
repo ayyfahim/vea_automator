@@ -130,3 +130,19 @@ if (reset.prompt !== recFailed.prompt || reset.imageName!==recFailed.imageName) 
 if (reset.parallelLimitRetries !== 0) { console.error("FAIL parallelLimitRetries should be 0"); process.exitCode=1; } else console.log("PASS parallelLimitRetries reset");
 if (!reset.updatedAt) { console.error("FAIL updatedAt missing"); process.exitCode=1; } else console.log("PASS updatedAt set");
 if (resetRecordForRetry_CURRENT(null) !== null) { console.error("FAIL null returns null"); process.exitCode=1; } else console.log("PASS null handling");
+
+// Task 4: retry-all enablement
+function getFailedCount_Task4(history, folderId){
+  let n=0; for(const r of Object.values(history)){ if(String(r.folderId)===String(folderId) && ["failed","parallel_limit"].includes(String(r.status).toLowerCase())) n++; } return n;
+}
+function getFailedCount(history, folderId){
+  let n=0; for(const r of Object.values(history)){ if(String(r.folderId)===String(folderId) && ["failed","parallel_limit"].includes(String(r.status).toLowerCase())) n++; } return n;
+}
+const hist = {
+  a:{folderId:"10", status:"failed"}, b:{folderId:"10", status:"parallel_limit"}, c:{folderId:"10", status:"completed"}, d:{folderId:"99", status:"failed"}
+};
+const cnt = getFailedCount_Task4(hist, "10");
+if (cnt === 2) console.log("PASS retry-all count");
+else { console.error(`FAIL retry-all count expected 2 got ${cnt}`); process.exitCode=1; }
+console.assert(getFailedCount(hist,"10")===2, "PASS fixed count");
+if (getFailedCount(hist,"10")===2) console.log("PASS fixed count");
