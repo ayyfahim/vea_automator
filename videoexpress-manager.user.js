@@ -626,6 +626,18 @@ function extractVideoIdFromStatus(payload) {
     });
   }
 
+  function getQueueDownloadCounts() {
+    let completed = 0, downloaded = 0, remaining = 0;
+    for (const item of state.queue) {
+      const rec = getRecord(state.selectedFolderId, item.media.id);
+      if (!rec || normalizeStatus(rec.status) !== "completed") continue;
+      completed++;
+      if (rec.downloadedAt) downloaded++;
+      else remaining++;
+    }
+    return { completed, downloaded, remaining };
+  }
+
   const root = document.createElement("div");
   root.id = "ve-manager-root";
   root.innerHTML = `
@@ -1130,6 +1142,15 @@ function extractVideoIdFromStatus(payload) {
             <div class="ve-stat failures"><span>Failed</span><strong id="ve-stat-failed">0</strong></div>
           </div>
         </div>
+        <div class="ve-section" id="ve-queue-download-section">
+          <div class="ve-section-title"><span><i class="bi bi-download"></i> Download generated</span></div>
+          <div class="ve-muted" id="ve-queue-download-summary">No completed videos yet.</div>
+          <div class="ve-progress" title="Queue download progress"><div class="ve-progress-bar" id="ve-queue-download-progress"></div></div>
+          <div class="ve-row" style="margin-top:10px">
+            <button class="ve-button primary" id="ve-download-completed-btn" type="button"><i class="bi bi-download"></i> Download Completed</button>
+            <button class="ve-button success" id="ve-download-remaining-btn" type="button"><i class="bi bi-download"></i> Download Remaining</button>
+          </div>
+        </div>
         <div class="ve-section">
           <div class="ve-section-title">
             <span><i class="bi bi-table"></i> Queue preview</span>
@@ -1276,6 +1297,10 @@ function extractVideoIdFromStatus(payload) {
     statFailed: root.querySelector("#ve-stat-failed"),
     folderSummary: root.querySelector("#ve-folder-summary"),
     queueBody: root.querySelector("#ve-queue-body"),
+    queueDownloadSummary: root.querySelector("#ve-queue-download-summary"),
+    queueDownloadProgress: root.querySelector("#ve-queue-download-progress"),
+    downloadCompletedBtn: root.querySelector("#ve-download-completed-btn"),
+    downloadRemainingBtn: root.querySelector("#ve-download-remaining-btn"),
     log: root.querySelector("#ve-log"),
   };
 
@@ -1555,6 +1580,7 @@ function extractVideoIdFromStatus(payload) {
             const imageUrl = item.media.thumbUrl || item.media.mediaPath || "";
             const displayStatus =
               latestStatus || (item.skip ? "skipped" : "idle");
+            const isDownloaded = record && record.downloadedAt;
             return `
               <tr>
                 <td>
@@ -1567,13 +1593,18 @@ function extractVideoIdFromStatus(payload) {
                   </div>
                 </td>
                 <td>${escapeHtml(item.prompt || "(empty prompt)")}</td>
-                <td><span class="ve-badge ${getBadgeClass(displayStatus)}">${escapeHtml(displayStatus)}</span></td>
+                <td><span class="ve-badge ${getBadgeClass(displayStatus)}">${escapeHtml(displayStatus)}</span>${isDownloaded ? ` <span class="ve-badge completed">downloaded</span>` : ""}</td>
                 <td>${escapeHtml(formatDateTime(updatedAt) || "-")}</td>
               </tr>
             `;
           })
           .join("")
       : `<tr><td colspan="4" class="ve-muted">No items loaded yet.</td></tr>`;
+    const counts = getQueueDownloadCounts();
+    els.queueDownloadSummary.textContent = counts.completed
+      ? `Completed: ${counts.completed} | Downloaded: ${counts.downloaded} | Remaining: ${counts.remaining}`
+      : "No completed videos yet. Run queue and wait for completion.";
+    els.queueDownloadProgress.style.width = counts.completed ? `${Math.round((counts.downloaded / counts.completed) * 100)}%` : "0%";
   }
 
   function escapeHtml(value) {
@@ -2144,6 +2175,9 @@ function extractVideoIdFromStatus(payload) {
       state.downloadInProgress ||
       !visibleVideoCount;
     els.stopDownloadsBtn.disabled = !state.downloadInProgress;
+    const queueCounts = getQueueDownloadCounts();
+    els.downloadCompletedBtn.disabled = state.running || state.uploadInProgress || state.downloadInProgress || queueCounts.completed === 0;
+    els.downloadRemainingBtn.disabled = state.running || state.uploadInProgress || state.downloadInProgress || queueCounts.remaining === 0;
     els.masterPromptEnabled.disabled = state.running;
     els.promptListEnabled.disabled = state.running;
     updateMasterPromptControls();
