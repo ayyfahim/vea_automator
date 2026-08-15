@@ -28,8 +28,9 @@
     maxParallelLimitRetries: Infinity,
     pollIntervalMs: 15000,
     skipStartedWithoutUuid: true,
-    downloadMinDelayMs: 6000,
-    downloadMaxDelayMs: 14000,
+    downloadMinDelayMs: 800,
+    downloadMaxDelayMs: 1200,
+    downloadConcurrency: 3,
     promptCleaner: {
       stripExtension: true,
       replaceUnderscores: true,
@@ -1250,8 +1251,9 @@ function extractVideoIdFromStatus(payload) {
               <button class="ve-button ghost" id="ve-clear-video-filters-btn" type="button"><i class="bi bi-x-lg"></i> Clear filters</button>
             </div>
             <div class="ve-row">
-              <input class="ve-input" id="ve-download-min-delay" type="number" min="1000" step="1000" value="${config.downloadMinDelayMs}" />
-              <input class="ve-input" id="ve-download-max-delay" type="number" min="1000" step="1000" value="${config.downloadMaxDelayMs}" />
+              <input class="ve-input" id="ve-download-min-delay" type="number" min="0" step="100" value="${config.downloadMinDelayMs}" title="Min delay between downloads (ms)" />
+              <input class="ve-input" id="ve-download-max-delay" type="number" min="0" step="100" value="${config.downloadMaxDelayMs}" title="Max delay between downloads (ms)" />
+              <input class="ve-input" id="ve-download-concurrency" type="number" min="1" max="5" step="1" value="${config.downloadConcurrency}" title="Parallel downloads (1-5)" />
             </div>
             <div class="ve-download-controls">
               <button class="ve-button ghost" id="ve-select-all-videos-btn" type="button"><i class="bi bi-check2-square"></i> Select all</button>
@@ -1340,6 +1342,7 @@ function extractVideoIdFromStatus(payload) {
     clearVideoFiltersBtn: root.querySelector("#ve-clear-video-filters-btn"),
     downloadMinDelay: root.querySelector("#ve-download-min-delay"),
     downloadMaxDelay: root.querySelector("#ve-download-max-delay"),
+    downloadConcurrency: root.querySelector("#ve-download-concurrency"),
     selectAllVideosBtn: root.querySelector("#ve-select-all-videos-btn"),
     downloadSelectedBtn: root.querySelector("#ve-download-selected-btn"),
     downloadAllBtn: root.querySelector("#ve-download-all-btn"),
@@ -1714,10 +1717,11 @@ function extractVideoIdFromStatus(payload) {
   }
 
   async function fetchAndDownload(video, fileName) {
-    const response = await fetch(`/library/download/${video.id}`);
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status} ${response.statusText}`);
-    }
+    const response = await sessionFetch(
+      `/library/download/${video.id}`,
+      { method: "GET" },
+      `Download ${fileName}`,
+    );
     const blob = await response.blob();
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
@@ -1728,13 +1732,39 @@ function extractVideoIdFromStatus(payload) {
     document.body.appendChild(link);
     link.click();
     link.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
   }
 
   function randomDelay(minMs, maxMs) {
-    const min = Math.max(1000, Number(minMs || 1000));
+    const min = Math.max(0, Number(minMs || 0));
     const max = Math.max(min, Number(maxMs || min));
     return Math.round(min + Math.random() * (max - min));
+  }
+
+  async function asyncPool(poolLimit, items, iteratorFn) {
+    const limit = Math.max(1, Number(poolLimit) || 1);
+    if (limit === 1) {
+      const results = [];
+      for (const item of items) {
+        if (state.stopRequested) break;
+        results.push(await iteratorFn(item, items.indexOf(item)));
+      }
+      return results;
+    }
+    const ret = [];
+    const executing = new Set();
+    for (const [index, item] of items.entries()) {
+      if (state.stopRequested) break;
+      const p = (async () => iteratorFn(item, index))();
+      ret.push(p);
+      executing.add(p);
+      const clean = () => executing.delete(p);
+      p.then(clean).catch(clean);
+      if (executing.size >= limit) {
+        await Promise.race(executing);
+      }
+    }
+    return Promise.allSettled(ret);
   }
 
   async function refreshFolders() {
@@ -1873,10 +1903,12 @@ function extractVideoIdFromStatus(payload) {
     config.parallelLimitRetryDelayMs = Number(
       els.retryDelayInput.value || 60000,
     );
-    config.downloadMinDelayMs = Number(els.downloadMinDelay.value || 6000);
+    config.downloadMinDelayMs = Number(els.downloadMinDelay.value || 800);
     config.downloadMaxDelayMs = Number(
       els.downloadMaxDelay.value || config.downloadMinDelayMs,
     );
+    config.downloadConcurrency = Math.min(5, Math.max(1, Number(els.downloadConcurrency.value || 3)));
+    if (els.downloadConcurrency) els.downloadConcurrency.value = String(config.downloadConcurrency);
     config.masterPromptEnabled = Boolean(els.masterPromptEnabled.checked);
     config.appendFilenamePrompt = Boolean(els.appendFilenamePrompt.checked);
     config.masterPrompt = els.masterPrompt.value.trim();
@@ -1918,47 +1950,49 @@ function extractVideoIdFromStatus(payload) {
     state.stopRequested = false;
     updateButtonStates();
 
-    let completed = 0;
+    let processed = 0;
     let failCount = 0;
     const failedNames = [];
     const total = videos.length;
+    const concurrency = Math.max(1, Number(config.downloadConcurrency) || 3);
     els.downloadProgress.style.width = "0%";
+    els.downloadSummary.textContent = `${label}: starting ${total} files (x${concurrency})`;
 
     try {
-      for (const video of videos) {
-        if (state.stopRequested) break;
+      await asyncPool(concurrency, videos, async (video) => {
+        if (state.stopRequested) return;
         const downloadName = resolveVideoDownloadName(video);
-        completed += 1;
-        els.downloadSummary.textContent = `${label}: downloading ${completed}/${total} | ${downloadName}`;
-
+        const idx = processed + 1;
+        els.downloadSummary.textContent = `${label}: downloading ${idx}/${total} | ${downloadName}`;
         try {
           await fetchAndDownload(video, downloadName);
-          logLine(`Download completed ${completed}/${total}: ${downloadName}`);
+          logLine(`Download completed ${idx}/${total}: ${downloadName}`);
         } catch (error) {
           failCount += 1;
           failedNames.push(downloadName);
           logLine(`Download failed for ${downloadName}: ${error.message}`);
+        } finally {
+          processed += 1;
+          els.downloadProgress.style.width = `${Math.round((processed / total) * 100)}%`;
+          if (concurrency === 1 && processed < total && !state.stopRequested) {
+            const waitMs = randomDelay(config.downloadMinDelayMs, config.downloadMaxDelayMs);
+            if (waitMs > 0) {
+              const failedText = failedNames.length ? ` | Failed: ${failedNames.slice(-2).join(", ")}` : "";
+              els.downloadSummary.textContent = `${label}: waiting ${Math.round(waitMs / 1000)}s before next (${processed}/${total})${failedText}`;
+              await sleep(waitMs);
+            }
+          } else {
+            els.downloadSummary.textContent = `${label}: ${processed}/${total} | success ${processed - failCount} failed ${failCount}`;
+          }
         }
-
-        els.downloadProgress.style.width = `${Math.round((completed / total) * 100)}%`;
-
-        if (completed < total && !state.stopRequested) {
-          const waitMs = randomDelay(
-            config.downloadMinDelayMs,
-            config.downloadMaxDelayMs,
-          );
-          const failedText = failedNames.length ? ` | Failed: ${failedNames.join(", ")}` : "";
-          els.downloadSummary.textContent = `${label}: waiting ${Math.round(waitMs / 1000)}s before next (${completed}/${total})${failedText}`;
-          await sleep(waitMs);
-        }
-      }
+      });
     } finally {
       state.downloadInProgress = false;
       updateButtonStates();
-      const successCount = completed - failCount;
+      const successCount = processed - failCount;
       const failedText = failedNames.length ? ` | Failed: ${failedNames.join(", ")}` : "";
       if (state.stopRequested) {
-        els.downloadSummary.textContent = `${label}: stopped after ${completed}/${total}${failedText}`;
+        els.downloadSummary.textContent = `${label}: stopped after ${processed}/${total}${failedText}`;
       } else {
         els.downloadSummary.textContent = `${label}: ${successCount}/${total} downloaded, ${failCount} failed${failedText}`;
       }
@@ -2020,14 +2054,17 @@ async function downloadQueueCompleted({ onlyRemaining }) {
   const total = entries.length;
   els.queueDownloadProgress.style.width = "0%";
 
+  const concurrency = Math.max(1, Number(config.downloadConcurrency) || 3);
+  els.queueDownloadSummary.textContent = `${onlyRemaining ? "Remaining" : "Completed"}: starting ${total} files (x${concurrency})`;
+  let processed = 0;
   try {
-    for (const { rec } of entries) {
-      if (state.stopRequested) break;
+    await asyncPool(concurrency, entries, async ({ rec }) => {
+      if (state.stopRequested) return;
       const vid = rec.videoId;
-      if (!vid) { failed++; logLine(`Skip ${rec.imageName}: no videoId resolvable`); continue; }
+      if (!vid) { failed++; processed++; logLine(`Skip ${rec.imageName}: no videoId resolvable`); return; }
       const fakeVideo = { id: vid, uuid: rec.uuid, name: rec.imageName, fileName: rec.imageFileName };
       const fileName = resolveVideoDownloadName(fakeVideo);
-      els.queueDownloadSummary.textContent = `${onlyRemaining ? "Remaining" : "Completed"}: downloading ${completed+1}/${total} | ${fileName}`;
+      els.queueDownloadSummary.textContent = `${onlyRemaining ? "Remaining" : "Completed"}: downloading ${processed+1}/${total} | ${fileName}`;
       try {
         await fetchAndDownload(fakeVideo, fileName);
         const next = { ...rec, downloadedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
@@ -2037,21 +2074,27 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       } catch (e) {
         failed++;
         logLine(`Queue download failed ${fileName}: ${e.message}`);
+      } finally {
+        processed++;
+        els.queueDownloadProgress.style.width = `${Math.round((processed/total)*100)}%`;
+        renderQueue(); updateButtonStates();
+        if (concurrency === 1 && processed < total && !state.stopRequested) {
+          const waitMs = randomDelay(config.downloadMinDelayMs, config.downloadMaxDelayMs);
+          if (waitMs > 0) {
+            els.queueDownloadSummary.textContent = `${onlyRemaining ? "Remaining" : "Completed"}: waiting ${Math.round(waitMs/1000)}s (${processed}/${total})`;
+            await sleep(waitMs);
+          }
+        } else {
+          els.queueDownloadSummary.textContent = `${onlyRemaining ? "Remaining" : "Completed"}: ${processed}/${total} | ${completed} ok ${failed} failed`;
+        }
       }
-      els.queueDownloadProgress.style.width = `${Math.round(((completed+failed)/total)*100)}%`;
-      renderQueue(); updateButtonStates();
-      if (completed+failed < total && !state.stopRequested) {
-        const waitMs = randomDelay(config.downloadMinDelayMs, config.downloadMaxDelayMs);
-        els.queueDownloadSummary.textContent = `${onlyRemaining ? "Remaining" : "Completed"}: waiting ${Math.round(waitMs/1000)}s (${completed+failed}/${total})`;
-        await sleep(waitMs);
-      }
-    }
+    });
   } finally {
     state.downloadInProgress = false;
     updateButtonStates(); renderQueue();
     const ok = completed;
     els.queueDownloadSummary.textContent = state.stopRequested
-      ? `${onlyRemaining ? "Remaining" : "Completed"}: stopped ${completed}/${total} downloaded`
+      ? `${onlyRemaining ? "Remaining" : "Completed"}: stopped ${processed}/${total} downloaded`
       : `${onlyRemaining ? "Remaining" : "Completed"}: ${ok}/${total} downloaded, ${failed} failed | Remaining: ${getQueueDownloadCounts().remaining}`;
     logLine(state.stopRequested ? "Queue download stopped." : `Queue download finished ${ok}/${total}.`);
   }
@@ -2636,6 +2679,13 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       config.downloadMinDelayMs = savedUi.downloadMinDelayMs;
     if (savedUi.downloadMaxDelayMs)
       config.downloadMaxDelayMs = savedUi.downloadMaxDelayMs;
+    if (savedUi.downloadConcurrency)
+      config.downloadConcurrency = Math.min(5, Math.max(1, Number(savedUi.downloadConcurrency) || 3));
+    // Migrate old slow defaults (6-14s) to new fast defaults once
+    if (config.downloadMinDelayMs === 6000 && config.downloadMaxDelayMs === 14000) {
+      config.downloadMinDelayMs = 800;
+      config.downloadMaxDelayMs = 1200;
+    }
     if (typeof savedUi.masterPromptEnabled === "boolean") {
       config.masterPromptEnabled = savedUi.masterPromptEnabled;
     }
@@ -2667,6 +2717,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     els.retryDelayInput.value = String(config.parallelLimitRetryDelayMs);
     els.downloadMinDelay.value = String(config.downloadMinDelayMs);
     els.downloadMaxDelay.value = String(config.downloadMaxDelayMs);
+    if (els.downloadConcurrency) els.downloadConcurrency.value = String(config.downloadConcurrency);
     els.masterPromptEnabled.checked = config.masterPromptEnabled;
     els.appendFilenamePrompt.checked = config.appendFilenamePrompt;
     els.masterPrompt.value = config.masterPrompt;
@@ -2683,8 +2734,10 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       "retryDelayInput",
       "downloadMinDelay",
       "downloadMaxDelay",
+      "downloadConcurrency",
     ].forEach((key) => {
       const element = els[key];
+      if (!element) return;
       element.addEventListener("change", () => {
         updateConfigFromInputs();
         saveUiState({
@@ -2694,6 +2747,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
           parallelLimitRetryDelayMs: config.parallelLimitRetryDelayMs,
           downloadMinDelayMs: config.downloadMinDelayMs,
           downloadMaxDelayMs: config.downloadMaxDelayMs,
+          downloadConcurrency: config.downloadConcurrency,
           masterPromptEnabled: config.masterPromptEnabled,
           appendFilenamePrompt: config.appendFilenamePrompt,
           masterPrompt: config.masterPrompt,
