@@ -1707,7 +1707,9 @@ function extractVideoIdFromStatus(payload) {
         }
       }
     }
-    const rawName = String(video.name || video.fileName || video.id).replace(/\.[a-z0-9]+$/i, "");
+    const rawName = String(
+      video.name || video.fileName || video.id || "video",
+    ).replace(/\.[a-z0-9]+$/i, "");
     return sanitizeFileName(rawName) + ".mp4";
   }
 
