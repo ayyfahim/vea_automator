@@ -703,6 +703,25 @@
     );
   }
 
+  function getFailureReason(record) {
+    if (!record || typeof record !== "object") return "";
+    const status = normalizeStatus(record.status);
+    if (status !== "failed" && status !== "parallel_limit") return "";
+    const candidates = [
+      record.error,
+      record.response && (record.response.error || record.response.message),
+      record.statusPayload && (record.statusPayload.error || record.statusPayload.message || record.statusPayload.status),
+      typeof record.response === "string" ? record.response : "",
+      typeof record.statusPayload === "string" ? record.statusPayload : "",
+    ].filter(Boolean).map((v) => String(v).trim()).filter(Boolean);
+    if (!candidates.length) return status === "parallel_limit" ? "Parallel limit — up to 5 AI videos in progress" : "Failed — no detail from server";
+    let raw = candidates[0];
+    raw = raw.replace(/^Generate video failed:\s*/i, "").replace(/^Status poll failed.*?:\s*/i, "").replace(/\n[\s\S]*$/, (m) => m.slice(0, 180));
+    raw = raw.split("\n")[0].trim();
+    if (raw.length > 180) raw = raw.slice(0, 177) + "...";
+    return raw || (status === "parallel_limit" ? "Parallel limit" : "Failed");
+  }
+
 function extractVideoIdFromStatus(payload) {
   if (!payload || typeof payload !== "object") return null;
   const candidates = [
