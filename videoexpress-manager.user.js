@@ -47,6 +47,7 @@
 
   const HISTORY_KEY = "videoexpress.manager.history.v1";
   const UI_STATE_KEY = "videoexpress.manager.ui-state.v1";
+  let _queryUuidSupported = null; // cache probe for server-side uuid query support (I3)
 
   const state = {
     folders: [],
@@ -479,21 +480,27 @@
     async getAllVideos(folderId) {
       const first = await api.getMedia(folderId, 1, 0, "");
       const firstResults = Array.isArray(first.results) ? first.results : [];
-      const total = Number(first.total || firstResults.length || 0);
+      const total = Number(first.total ?? firstResults.length ?? 0);
       if (firstResults.length >= total || firstResults.length < config.pageSize) {
-        return { total: firstResults.length, results: firstResults };
+        return { total: first.total ?? firstResults.length, results: firstResults };
       }
       const remainingPages = [];
       for (let start = config.pageSize; start < total; start += config.pageSize) {
         const page = Math.floor(start / config.pageSize) + 1;
-        remainingPages.push({ page, start });
+        remainingPages.push({ page, start, idx: remainingPages.length });
       }
-      const rest = [];
-      await asyncPool(3, remainingPages, async ({ page, start }) => {
-        const payload = await api.getMedia(folderId, page, start, "");
-        const r = Array.isArray(payload.results) ? payload.results : [];
-        rest.push(...r);
+      const buckets = new Array(remainingPages.length);
+      await asyncPool(3, remainingPages, async ({ page, start, idx }) => {
+        try {
+          const payload = await api.getMedia(folderId, page, start, "");
+          const r = Array.isArray(payload.results) ? payload.results : [];
+          buckets[idx] = r;
+        } catch (e) {
+          console.warn(`[VE] getAllVideos page ${page} failed:`, e);
+          buckets[idx] = [];
+        }
       });
+      const rest = buckets.flat();
       const all = [...firstResults, ...rest];
       // Sort by name to match previous behavior if needed, otherwise return as-is
       return { total: all.length, results: all };
@@ -575,7 +582,7 @@
     );
   }
 
-  async function fetchAiVideosMap(targetUuids = null) {
+  async function fetchAiVideosMap(targetUuids = null, opts = {}) {
     let aiFolder = getAiVideosFolder();
     if (!aiFolder) {
       state.folders = await api.getFolders();
@@ -584,22 +591,34 @@
     }
     if (!aiFolder) return new Map();
 
+    const skipStatusFallback = Boolean(opts.skipStatusFallback);
     // Faster path: if caller only needs a few uuids, query them directly instead of paginating 2000+ items
     if (Array.isArray(targetUuids) && targetUuids.length > 0 && targetUuids.length <= 20) {
       const map = new Map();
       await asyncPool(3, targetUuids, async (rawUuid) => {
         const uuid = String(rawUuid).toLowerCase().trim();
         if (!uuid || map.has(uuid)) return;
-        // Try server-side query first (if API indexes uuid), then fallback to status endpoint
-        try {
-          const payload = await api.searchMedia(aiFolder.id, uuid, "");
-          const hits = Array.isArray(payload.results) ? payload.results : [];
-          const hit = hits.find((it) => it && String(it.uuid).toLowerCase().trim() === uuid);
-          if (hit) {
-            map.set(uuid, hit);
-            return;
+        // Try server-side query first if not yet proven unsupported (I3)
+        if (_queryUuidSupported !== false) {
+          try {
+            const payload = await api.searchMedia(aiFolder.id, uuid, "");
+            const hits = Array.isArray(payload.results) ? payload.results : [];
+            const hit = hits.find((it) => it && String(it.uuid).toLowerCase().trim() === uuid);
+            if (hit) {
+              _queryUuidSupported = true;
+              map.set(uuid, hit);
+              return;
+            }
+            // No hit - don't yet conclude unsupported; could be transient. Only cache negative after probing known uuid.
+          } catch (e) {
+            console.warn(`[VE] searchMedia failed for ${uuid}:`, e);
           }
-        } catch {}
+          // If we reach here, probe result suggests query may not index uuid; cache after first full miss when map still empty
+          if (_queryUuidSupported === null && map.size === 0) {
+            // Leave as null for one more try; will be set to false after full targeted batch shows 0 hits
+          }
+        }
+        if (skipStatusFallback) return;
         // Fallback: resolve via status endpoint (authoritative for completed videos)
         try {
           const status = await api.getStatus(rawUuid);
@@ -607,11 +626,18 @@
           if (vid) {
             map.set(uuid, { uuid: rawUuid, id: String(vid) });
           }
-        } catch {}
+        } catch (e) {
+          console.warn(`[VE] getStatus fallback failed for ${uuid}:`, e);
+        }
       });
+      if (_queryUuidSupported === null && map.size === 0) {
+        // All queries missed and status fallback skipped or also missed -> likely query doesn't index uuid
+        _queryUuidSupported = false;
+        console.warn("[VE] query=uuid appears unsupported by server, will skip searchMedia next time");
+      }
       // If we found at least some, return partial map; caller can fallback to full scan if needed
       if (map.size > 0) return map;
-      // else fall through to full scan
+      // else fall through to full scan (caller handles)
     }
 
     const { results } = await api.getAllVideos(aiFolder.id);
@@ -1806,9 +1832,15 @@ function extractVideoIdFromStatus(payload) {
     const limit = Math.max(1, Number(poolLimit) || 1);
     if (limit === 1) {
       const results = [];
-      for (const item of items) {
+      for (const [idx, item] of items.entries()) {
         if (state.stopRequested) break;
-        results.push(await iteratorFn(item, items.indexOf(item)));
+        try {
+          const v = await iteratorFn(item, idx);
+          results.push({ status: "fulfilled", value: v });
+        } catch (e) {
+          console.warn(`[VE] asyncPool task failed idx ${idx}:`, e);
+          results.push({ status: "rejected", reason: e });
+        }
       }
       return results;
     }
@@ -1825,7 +1857,11 @@ function extractVideoIdFromStatus(payload) {
         await Promise.race(executing);
       }
     }
-    return Promise.allSettled(ret);
+    const settled = await Promise.allSettled(ret);
+    settled.forEach((r, i) => {
+      if (r.status === "rejected") console.warn(`[VE] asyncPool task failed idx ${i}:`, r.reason);
+    });
+    return settled;
   }
 
   async function refreshFolders() {
@@ -2012,6 +2048,7 @@ function extractVideoIdFromStatus(payload) {
     updateButtonStates();
 
     let processed = 0;
+    let nextIdx = 0;
     let failCount = 0;
     const failedNames = [];
     const total = videos.length;
@@ -2022,12 +2059,12 @@ function extractVideoIdFromStatus(payload) {
     try {
       await asyncPool(concurrency, videos, async (video) => {
         if (state.stopRequested) return;
+        const myIdx = ++nextIdx;
         const downloadName = resolveVideoDownloadName(video);
-        const idx = processed + 1;
-        els.downloadSummary.textContent = `${label}: downloading ${idx}/${total} | ${downloadName}`;
+        els.downloadSummary.textContent = `${label}: downloading ${myIdx}/${total} | ${downloadName}`;
         try {
           await fetchAndDownload(video, downloadName);
-          logLine(`Download completed ${idx}/${total}: ${downloadName}`);
+          logLine(`Download completed ${myIdx}/${total}: ${downloadName}`);
         } catch (error) {
           failCount += 1;
           failedNames.push(downloadName);
@@ -2085,7 +2122,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       if (remaining.length) {
         logLine(`Status resolved ${resolvedViaStatus.length}/${missingBefore.length}, trying targeted library search for ${remaining.length} remaining...`);
         const uuids = remaining.map((r) => r.uuid);
-        const aiMap = await fetchAiVideosMap(uuids);
+        const aiMap = await fetchAiVideosMap(uuids, { skipStatusFallback: true });
         for (const rec of remaining) {
           const u = String(rec.uuid).toLowerCase().trim();
           if (aiMap.has(u)) {
@@ -2103,8 +2140,8 @@ async function downloadQueueCompleted({ onlyRemaining }) {
           }
         }
         const still = remaining.filter((r) => !r.videoId);
-        if (still.length && uuids.length > 20) {
-          // Too many uuids for targeted path, fallback to full folder scan (2374 items ≈ 10s)
+        if (still.length) {
+          // Fallback to full library scan if targeted search missed (covers query=uuid not indexed case)
           logLine(`Targeted search incomplete (${still.length} left), falling back to full library scan...`);
           const fullMap = await fetchAiVideosMap();
           for (const rec of still) {
@@ -2150,23 +2187,25 @@ async function downloadQueueCompleted({ onlyRemaining }) {
   const concurrency = Math.max(1, Number(config.downloadConcurrency) || 3);
   els.queueDownloadSummary.textContent = `${onlyRemaining ? "Remaining" : "Completed"}: starting ${total} files (x${concurrency})`;
   let processed = 0;
+  let nextQIdx = 0;
   try {
     await asyncPool(concurrency, entries, async ({ rec }) => {
       if (state.stopRequested) return;
       const vid = rec.videoId;
       if (!vid) { failed++; processed++; logLine(`Skip ${rec.imageName}: no videoId resolvable`); return; }
+      const myQIdx = ++nextQIdx;
       const fakeVideo = { id: vid, uuid: rec.uuid, name: rec.imageName, fileName: rec.imageFileName };
       const fileName = resolveVideoDownloadName(fakeVideo);
-      els.queueDownloadSummary.textContent = `${onlyRemaining ? "Remaining" : "Completed"}: downloading ${processed+1}/${total} | ${fileName}`;
+      els.queueDownloadSummary.textContent = `${onlyRemaining ? "Remaining" : "Completed"}: downloading ${myQIdx}/${total} | ${fileName}`;
       try {
         await fetchAndDownload(fakeVideo, fileName);
         const next = { ...rec, downloadedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
         setRecord(folder.id, rec.imageId, next);
         completed++;
-        logLine(`Queue download ${completed}/${total}: ${fileName}`);
+        logLine(`Queue download ${myQIdx}/${total}: ${fileName} (${completed} ok)`);
       } catch (e) {
         failed++;
-        logLine(`Queue download failed ${fileName}: ${e.message}`);
+        logLine(`Queue download failed ${fileName} [${myQIdx}/${total}]: ${e.message}`);
       } finally {
         processed++;
         els.queueDownloadProgress.style.width = `${Math.round((processed/total)*100)}%`;
@@ -2430,19 +2469,29 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       );
       if (completedWithoutVid.length) {
         try {
-          const uuids = completedWithoutVid.map((r) => r.uuid);
-          const aiMap = await fetchAiVideosMap(uuids);
-          for (const record of completedWithoutVid) {
-            const u = String(record.uuid).toLowerCase().trim();
-            if (aiMap.has(u)) {
-              const vidItem = aiMap.get(u);
-              record.videoId = String(vidItem.id);
-              setRecord(record.folderId, record.imageId, {
-                ...record,
-                videoId: String(vidItem.id),
-                updatedAt: new Date().toISOString()
-              });
-              logLine(`Matched video ID ${vidItem.id} for ${record.imageName || record.uuid}`);
+          // I5: cap to avoid 15s-interval full scan DOS; prefer status endpoint (cheaper) before library query
+          const toResolve = completedWithoutVid.length > 20 ? completedWithoutVid.slice(0, 20) : completedWithoutVid;
+          if (completedWithoutVid.length > 20) logLine(`Poll capping resolution to 20/${completedWithoutVid.length} to avoid full library scan`);
+          await resolveMissingVideoIdsViaStatus(toResolve);
+          const still = toResolve.filter((r) => !r.videoId);
+          if (still.length) {
+            const uuids = still.map((r) => r.uuid);
+            const aiMap = await fetchAiVideosMap(uuids, { skipStatusFallback: true });
+            for (const record of still) {
+              const u = String(record.uuid).toLowerCase().trim();
+              if (aiMap.has(u)) {
+                const vidItem = aiMap.get(u);
+                const vid = String(vidItem.id || vidItem.videoId || "");
+                if (vid) {
+                  record.videoId = vid;
+                  setRecord(record.folderId, record.imageId, {
+                    ...record,
+                    videoId: vid,
+                    updatedAt: new Date().toISOString()
+                  });
+                  logLine(`Matched video ID ${vid} for ${record.imageName || record.uuid} via library`);
+                }
+              }
             }
           }
         } catch (e) {
@@ -2775,10 +2824,11 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       config.downloadMaxDelayMs = savedUi.downloadMaxDelayMs;
     if (savedUi.downloadConcurrency)
       config.downloadConcurrency = Math.min(5, Math.max(1, Number(savedUi.downloadConcurrency) || 3));
-    // Migrate old slow defaults (6-14s) to new fast defaults once
-    if (config.downloadMinDelayMs === 6000 && config.downloadMaxDelayMs === 14000) {
+    // Migrate old slow defaults (6-14s) to new fast defaults once — only if user had old defaults saved
+    if (savedUi.downloadMinDelayMs === 6000 && savedUi.downloadMaxDelayMs === 14000) {
       config.downloadMinDelayMs = 800;
       config.downloadMaxDelayMs = 1200;
+      saveUiState({ downloadMinDelayMs: 800, downloadMaxDelayMs: 1200 });
     }
     if (typeof savedUi.masterPromptEnabled === "boolean") {
       config.masterPromptEnabled = savedUi.masterPromptEnabled;
