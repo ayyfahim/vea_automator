@@ -31,6 +31,8 @@
     downloadMinDelayMs: 800,
     downloadMaxDelayMs: 1200,
     downloadConcurrency: 3,
+    downloadRetryCount: 3,
+    downloadRetryBaseDelayMs: 5000,
     promptCleaner: {
       stripExtension: true,
       replaceUnderscores: true,
@@ -1803,6 +1805,10 @@ function extractVideoIdFromStatus(payload) {
     return sanitizeFileName(rawName) + ".mp4";
   }
 
+  function isRetryableDownloadStatus(status) {
+    return [400, 404, 429, 500, 502, 503].includes(Number(status));
+  }
+
   async function fetchAndDownload(video, fileName) {
     const response = await sessionFetch(
       `/library/download/${video.id}`,
@@ -1820,6 +1826,32 @@ function extractVideoIdFromStatus(payload) {
     link.click();
     link.remove();
     setTimeout(() => URL.revokeObjectURL(url), 10000);
+  }
+
+  async function fetchAndDownloadWithRetry(video, fileName, opts = {}) {
+    const maxRetries = Number(opts.retries ?? config.downloadRetryCount ?? 3);
+    const baseDelay = Number(opts.baseDelayMs ?? config.downloadRetryBaseDelayMs ?? 5000);
+    let lastError = null;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        await fetchAndDownload(video, fileName);
+        if (attempt > 0) logLine(`Retry succeeded for ${fileName} on attempt ${attempt + 1}`);
+        return;
+      } catch (e) {
+        lastError = e;
+        const msg = String(e.message || "");
+        const m = msg.match(/(\d{3})/);
+        const status = m ? Number(m[1]) : 0;
+        const retryable = isRetryableDownloadStatus(status) || /file not found|not ready|400|404/i.test(msg);
+        if (attempt >= maxRetries || !retryable || state.stopRequested) throw e;
+        const delay = Math.round(baseDelay * Math.pow(1.7, attempt) + randomDelay(0, 1000));
+        logLine(`Download ${fileName} got ${status || "error"} (attempt ${attempt + 1}/${maxRetries + 1}), retrying in ${Math.round(delay / 1000)}s...`);
+        els.queueDownloadSummary && (els.queueDownloadSummary.textContent = `Retrying ${fileName} in ${Math.round(delay / 1000)}s (${attempt + 1}/${maxRetries})`);
+        els.downloadSummary && (els.downloadSummary.textContent = `Retrying ${fileName} in ${Math.round(delay / 1000)}s`);
+        await sleep(delay);
+      }
+    }
+    throw lastError;
   }
 
   function randomDelay(minMs, maxMs) {
@@ -2063,7 +2095,7 @@ function extractVideoIdFromStatus(payload) {
         const downloadName = resolveVideoDownloadName(video);
         els.downloadSummary.textContent = `${label}: downloading ${myIdx}/${total} | ${downloadName}`;
         try {
-          await fetchAndDownload(video, downloadName);
+          await fetchAndDownloadWithRetry(video, downloadName);
           logLine(`Download completed ${myIdx}/${total}: ${downloadName}`);
         } catch (error) {
           failCount += 1;
@@ -2171,11 +2203,32 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     .filter((rec) => rec.videoId)
     .map((rec) => ({ rec }));
 
-  const missingWithoutVideoId = Object.values(state.history.records).filter(
+  let missingWithoutVideoId = Object.values(state.history.records).filter(
     (rec) => String(rec.folderId) === String(folder.id) && normalizeStatus(rec.status) === "completed" && (!onlyRemaining || !rec.downloadedAt) && !rec.videoId,
   );
 
-  if (!entries.length) throw new Error(onlyRemaining ? "No remaining downloads." : "No completed videos to download." + (missingWithoutVideoId.length ? ` (${missingWithoutVideoId.length} completed but videoId missing — wait for status poll or re-check payload)` : ""));
+  // Retry timer for eventual consistency: videoId MISSING often resolves on next 15s poll; wait 8s and retry once via status
+  if (!entries.length && missingWithoutVideoId.length) {
+    logLine(`No videoId yet for ${missingWithoutVideoId.length} completed items, retrying in 8s via status...`);
+    els.queueDownloadSummary.textContent = `VideoId missing for ${missingWithoutVideoId.length}, retrying in 8s...`;
+    await sleep(8000);
+    await resolveMissingVideoIdsViaStatus(missingWithoutVideoId);
+    const retryEntries = Object.values(state.history.records)
+      .filter((rec) => String(rec.folderId) === String(folder.id) && normalizeStatus(rec.status) === "completed" && (!onlyRemaining || !rec.downloadedAt))
+      .filter((rec) => rec.videoId)
+      .map((rec) => ({ rec }));
+    if (retryEntries.length) {
+      logLine(`Retry resolved ${retryEntries.length} videoIds, proceeding to download`);
+      // Mutate entries for outer scope
+      entries.push(...retryEntries);
+    }
+    // Refresh missing count after retry
+    missingWithoutVideoId = Object.values(state.history.records).filter(
+      (rec) => String(rec.folderId) === String(folder.id) && normalizeStatus(rec.status) === "completed" && (!onlyRemaining || !rec.downloadedAt) && !rec.videoId,
+    );
+  }
+
+  if (!entries.length) throw new Error(onlyRemaining ? "No remaining downloads." : "No completed videos to download." + (missingWithoutVideoId.length ? ` (${missingWithoutVideoId.length} completed but videoId missing — retrying poll, will auto-resolve in ~15s)` : ""));
 
   state.downloadInProgress = true;
   state.stopRequested = false;
@@ -2198,7 +2251,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       const fileName = resolveVideoDownloadName(fakeVideo);
       els.queueDownloadSummary.textContent = `${onlyRemaining ? "Remaining" : "Completed"}: downloading ${myQIdx}/${total} | ${fileName}`;
       try {
-        await fetchAndDownload(fakeVideo, fileName);
+        await fetchAndDownloadWithRetry(fakeVideo, fileName);
         const next = { ...rec, downloadedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
         setRecord(folder.id, rec.imageId, next);
         completed++;
