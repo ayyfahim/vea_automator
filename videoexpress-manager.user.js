@@ -584,17 +584,33 @@ function extractVideoIdFromStatus(payload) {
     payload.mediaId,
     payload.video_id,
     payload.media_id,
+    payload.libraryVideoId,
+    payload.library_video_id,
     payload.id,
     payload.data && payload.data.id,
     payload.data && payload.data.videoId,
     payload.data && payload.data.mediaId,
+    payload.data && payload.data.video_id,
+    payload.data && payload.data.videoId,
     payload.result && payload.result.id,
+    payload.result && payload.result.videoId,
     payload.video && payload.video.id,
+    payload.video && payload.video.videoId,
+    payload.media && payload.media.id,
   ];
   for (const v of candidates) if (v) return String(v);
-  for (const k of Object.keys(payload)) {
-    if (/^(video|media)_?id$/i.test(k) && payload[k]) return String(payload[k]);
+  const searchObjects = [payload, payload.data, payload.result, payload.video, payload.media].filter(Boolean);
+  for (const obj of searchObjects) {
+    for (const k of Object.keys(obj)) {
+      if (/^(video|media|library).*_?id$/i.test(k) && obj[k]) return String(obj[k]);
+      if (k === "id" && typeof obj[k] === "string" && /^\d+$/.test(obj[k])) return String(obj[k]);
+    }
   }
+  try {
+    const str = JSON.stringify(payload);
+    const m = str.match(/"videoId"\s*:\s*"?(\d+)"?/i) || str.match(/"mediaId"\s*:\s*"?(\d+)"?/i);
+    if (m) return m[1];
+  } catch {}
   return null;
 }
 
@@ -2187,6 +2203,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
 
         const videoId = mapped === "completed" ? extractVideoIdFromStatus(statusPayload) : record.videoId || null;
         if (mapped === "completed" && videoId) console.log("[VE] videoId captured", record.uuid, videoId, statusPayload);
+        if (mapped === "completed" && !videoId) console.warn("[VE] videoId MISSING for completed", record.uuid, statusPayload);
         const nextRecord = {
           ...record,
           status: mapped,
