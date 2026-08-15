@@ -1626,10 +1626,13 @@ function extractVideoIdFromStatus(payload) {
           })
           .join("")
       : `<tr><td colspan="4" class="ve-muted">No items loaded yet.</td></tr>`;
+    const missing = Object.values(state.history.records).filter(r => String(r.folderId)===String(state.selectedFolderId) && normalizeStatus(r.status)==="completed" && !r.videoId).length;
     const counts = getQueueDownloadCounts();
     els.queueDownloadSummary.textContent = counts.completed
-      ? `Completed: ${counts.completed} | Downloaded: ${counts.downloaded} | Remaining: ${counts.remaining}`
-      : "No completed videos yet. Run queue and wait for completion.";
+      ? missing
+        ? `Completed: ${counts.completed} | Downloaded: ${counts.downloaded} | Remaining: ${counts.remaining} | Attention: ${missing} missing videoId — wait 15s for poll or click Load images`
+        : `Completed: ${counts.completed} | Downloaded: ${counts.downloaded} | Remaining: ${counts.remaining}`
+      : missing ? `No completed with videoId yet — ${missing} completed but videoId missing (see Activity log)` : "No completed videos yet. Run queue and wait for completion.";
     els.queueDownloadProgress.style.width = counts.completed ? `${Math.round((counts.downloaded / counts.completed) * 100)}%` : "0%";
     updateButtonStates();
   }
