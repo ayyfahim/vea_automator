@@ -1605,6 +1605,7 @@ function extractVideoIdFromStatus(payload) {
       ? `Completed: ${counts.completed} | Downloaded: ${counts.downloaded} | Remaining: ${counts.remaining}`
       : "No completed videos yet. Run queue and wait for completion.";
     els.queueDownloadProgress.style.width = counts.completed ? `${Math.round((counts.downloaded / counts.completed) * 100)}%` : "0%";
+    updateButtonStates();
   }
 
   function escapeHtml(value) {
