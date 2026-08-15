@@ -554,6 +554,46 @@
     );
   }
 
+  function getAiVideosFolder(folders = state.folders) {
+    if (!Array.isArray(folders)) return null;
+    return (
+      folders.find(
+        (f) =>
+          f.name === "my_ai_videos" ||
+          /^my_?ai_?videos$/i.test(f.name) ||
+          /my ai videos/i.test(f.title || "")
+      ) || null
+    );
+  }
+
+  async function fetchAiVideosMap() {
+    let aiFolder = getAiVideosFolder();
+    if (!aiFolder) {
+      state.folders = await api.getFolders();
+      renderFolders();
+      aiFolder = getAiVideosFolder();
+    }
+    if (!aiFolder) return new Map();
+
+    const map = new Map();
+    let page = 1;
+    let start = 0;
+    const maxPages = 5;
+    while (page <= maxPages) {
+      const payload = await api.getMedia(aiFolder.id, page, start, "");
+      const results = Array.isArray(payload.results) ? payload.results : [];
+      for (const item of results) {
+        if (item && item.uuid) {
+          map.set(String(item.uuid).toLowerCase().trim(), item);
+        }
+      }
+      if (!results.length || results.length < config.pageSize) break;
+      page += 1;
+      start += config.pageSize;
+    }
+    return map;
+  }
+
   function makeRecordKey(folderId, mediaId) {
     return `library:${config.libraryId}:folder:${folderId}:media:${mediaId}`;
   }
