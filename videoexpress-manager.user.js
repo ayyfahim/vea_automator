@@ -809,6 +809,19 @@ function extractVideoIdFromStatus(payload) {
     return { completed, downloaded, remaining };
   }
 
+  function getQueuePositionForMedia(mediaId) {
+    const needle = String(mediaId);
+    const q = Array.isArray(state.queue) ? state.queue : [];
+    for (let i = 0; i < q.length; i++) {
+      if (String(q[i] && q[i].media && q[i].media.id) === needle) return i + 1;
+    }
+    const items = Array.isArray(state.items) ? state.items : [];
+    for (let i = 0; i < items.length; i++) {
+      if (String(items[i] && items[i].id) === needle) return i + 1;
+    }
+    return null;
+  }
+
   const root = document.createElement("div");
   root.id = "ve-manager-root";
   root.innerHTML = `
