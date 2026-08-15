@@ -576,21 +576,12 @@
     }
     if (!aiFolder) return new Map();
 
+    const { results } = await api.getAllVideos(aiFolder.id);
     const map = new Map();
-    let page = 1;
-    let start = 0;
-    const maxPages = 5;
-    while (page <= maxPages) {
-      const payload = await api.getMedia(aiFolder.id, page, start, "");
-      const results = Array.isArray(payload.results) ? payload.results : [];
-      for (const item of results) {
-        if (item && item.uuid) {
-          map.set(String(item.uuid).toLowerCase().trim(), item);
-        }
+    for (const item of results) {
+      if (item && item.uuid) {
+        map.set(String(item.uuid).toLowerCase().trim(), item);
       }
-      if (!results.length || results.length < config.pageSize) break;
-      page += 1;
-      start += config.pageSize;
     }
     return map;
   }
