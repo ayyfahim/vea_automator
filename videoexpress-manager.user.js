@@ -200,9 +200,13 @@
   async function assertOk(response, label) {
     if (response.ok) return response;
     const text = await response.text().catch(() => "");
-    throw new Error(
+    const err = new Error(
       `${label} failed: ${response.status} ${response.statusText}\n${text}`,
     );
+    err.status = response.status;
+    err.statusText = response.statusText;
+    err.bodyText = text;
+    throw err;
   }
 
   function readCookie(name) {
@@ -1839,16 +1843,19 @@ function extractVideoIdFromStatus(payload) {
         return;
       } catch (e) {
         lastError = e;
-        const msg = String(e.message || "");
-        const m = msg.match(/(\d{3})/);
-        const status = m ? Number(m[1]) : 0;
-        const retryable = isRetryableDownloadStatus(status) || /file not found|not ready|400|404/i.test(msg);
+        const status = Number(e.status || 0) || (() => {
+          const m = String(e.message || "").match(/failed:\s*(\d{3})/i);
+          return m ? Number(m[1]) : 0;
+        })();
+        const retryable = isRetryableDownloadStatus(status) || /file not found|not ready/i.test(String(e.message || ""));
         if (attempt >= maxRetries || !retryable || state.stopRequested) throw e;
         const delay = Math.round(baseDelay * Math.pow(1.7, attempt) + randomDelay(0, 1000));
         logLine(`Download ${fileName} got ${status || "error"} (attempt ${attempt + 1}/${maxRetries + 1}), retrying in ${Math.round(delay / 1000)}s...`);
-        els.queueDownloadSummary && (els.queueDownloadSummary.textContent = `Retrying ${fileName} in ${Math.round(delay / 1000)}s (${attempt + 1}/${maxRetries})`);
-        els.downloadSummary && (els.downloadSummary.textContent = `Retrying ${fileName} in ${Math.round(delay / 1000)}s`);
+        const retryText = `Retrying ${fileName} in ${Math.round(delay / 1000)}s (${attempt + 1}/${maxRetries})`;
+        if (els.queueDownloadSummary) els.queueDownloadSummary.textContent = retryText;
+        if (els.downloadSummary) els.downloadSummary.textContent = retryText;
         await sleep(delay);
+        if (state.stopRequested) throw new Error("stopped");
       }
     }
     throw lastError;
@@ -2198,7 +2205,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     }
   }
 
-  const entries = Object.values(state.history.records)
+  let entries = Object.values(state.history.records)
     .filter((rec) => String(rec.folderId) === String(folder.id) && normalizeStatus(rec.status) === "completed" && (!onlyRemaining || !rec.downloadedAt))
     .filter((rec) => rec.videoId)
     .map((rec) => ({ rec }));
@@ -2207,28 +2214,65 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     (rec) => String(rec.folderId) === String(folder.id) && normalizeStatus(rec.status) === "completed" && (!onlyRemaining || !rec.downloadedAt) && !rec.videoId,
   );
 
-  // Retry timer for eventual consistency: videoId MISSING often resolves on next 15s poll; wait 8s and retry once via status
-  if (!entries.length && missingWithoutVideoId.length) {
-    logLine(`No videoId yet for ${missingWithoutVideoId.length} completed items, retrying in 8s via status...`);
-    els.queueDownloadSummary.textContent = `VideoId missing for ${missingWithoutVideoId.length}, retrying in 8s...`;
-    await sleep(8000);
-    await resolveMissingVideoIdsViaStatus(missingWithoutVideoId);
-    const retryEntries = Object.values(state.history.records)
-      .filter((rec) => String(rec.folderId) === String(folder.id) && normalizeStatus(rec.status) === "completed" && (!onlyRemaining || !rec.downloadedAt))
-      .filter((rec) => rec.videoId)
-      .map((rec) => ({ rec }));
-    if (retryEntries.length) {
-      logLine(`Retry resolved ${retryEntries.length} videoIds, proceeding to download`);
-      // Mutate entries for outer scope
-      entries.push(...retryEntries);
+  // Retry timer for eventual consistency: I2 fix — handle partial as well as full missing; I4 full fallback on retry; I6 dedupe by recompute; I3 cancellable
+  if (missingWithoutVideoId.length) {
+    const needRetry = entries.length === 0 || missingWithoutVideoId.length > 0;
+    if (needRetry) {
+      const retryMsg = entries.length === 0
+        ? `No videoId yet for ${missingWithoutVideoId.length} completed items, retrying in 8s...`
+        : `${missingWithoutVideoId.length} of ${missingWithoutVideoId.length + entries.length} completed items still missing videoId, retrying missing in 8s...`;
+      logLine(retryMsg);
+      els.queueDownloadSummary.textContent = `VideoId missing for ${missingWithoutVideoId.length}, retrying in 8s... (Stop to cancel)`;
+      for (let waited = 0; waited < 8000; waited += 500) {
+        if (state.stopRequested) break;
+        await sleep(500);
+      }
+      if (state.stopRequested) throw new Error("stopped");
+      // I4: reuse same 3-stage fallback as initial missingBefore block
+      const toRetry = [...missingWithoutVideoId];
+      await resolveMissingVideoIdsViaStatus(toRetry);
+      let still = toRetry.filter((r) => !r.videoId);
+      if (still.length) {
+        const uuids = still.map((r) => r.uuid);
+        const aiMap = await fetchAiVideosMap(uuids, { skipStatusFallback: true });
+        for (const rec of still) {
+          const u = String(rec.uuid).toLowerCase().trim();
+          if (aiMap.has(u)) {
+            const matched = aiMap.get(u);
+            const vid = String(matched.id || matched.videoId || "");
+            if (vid) {
+              rec.videoId = vid;
+              setRecord(folder.id, rec.imageId, { ...rec, videoId: vid, updatedAt: new Date().toISOString() });
+            }
+          }
+        }
+        still = still.filter((r) => !r.videoId);
+        if (still.length) {
+          logLine(`Retry still missing ${still.length}, falling back to full library scan...`);
+          const fullMap = await fetchAiVideosMap();
+          for (const rec of still) {
+            const u = String(rec.uuid).toLowerCase().trim();
+            if (fullMap.has(u)) {
+              const matched = fullMap.get(u);
+              rec.videoId = String(matched.id);
+              setRecord(folder.id, rec.imageId, { ...rec, videoId: String(matched.id), updatedAt: new Date().toISOString() });
+            }
+          }
+        }
+      }
+      // Recompute from scratch to avoid duplicates (I6) and include newly resolved
+      entries = Object.values(state.history.records)
+        .filter((rec) => String(rec.folderId) === String(folder.id) && normalizeStatus(rec.status) === "completed" && (!onlyRemaining || !rec.downloadedAt))
+        .filter((rec) => rec.videoId)
+        .map((rec) => ({ rec }));
+      missingWithoutVideoId = Object.values(state.history.records).filter(
+        (rec) => String(rec.folderId) === String(folder.id) && normalizeStatus(rec.status) === "completed" && (!onlyRemaining || !rec.downloadedAt) && !rec.videoId,
+      );
+      if (entries.length) logLine(`Retry resolved ${entries.length} total entries, ${missingWithoutVideoId.length} still missing`);
     }
-    // Refresh missing count after retry
-    missingWithoutVideoId = Object.values(state.history.records).filter(
-      (rec) => String(rec.folderId) === String(folder.id) && normalizeStatus(rec.status) === "completed" && (!onlyRemaining || !rec.downloadedAt) && !rec.videoId,
-    );
   }
 
-  if (!entries.length) throw new Error(onlyRemaining ? "No remaining downloads." : "No completed videos to download." + (missingWithoutVideoId.length ? ` (${missingWithoutVideoId.length} completed but videoId missing — retrying poll, will auto-resolve in ~15s)` : ""));
+  if (!entries.length) throw new Error(onlyRemaining ? "No remaining downloads." : "No completed videos to download." + (missingWithoutVideoId.length ? ` (${missingWithoutVideoId.length} completed but videoId missing — will auto-resolve on next 15s poll)` : ""));
 
   state.downloadInProgress = true;
   state.stopRequested = false;
