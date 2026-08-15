@@ -569,6 +569,27 @@
     );
   }
 
+function extractVideoIdFromStatus(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const candidates = [
+    payload.videoId,
+    payload.mediaId,
+    payload.video_id,
+    payload.media_id,
+    payload.id,
+    payload.data && payload.data.id,
+    payload.data && payload.data.videoId,
+    payload.data && payload.data.mediaId,
+    payload.result && payload.result.id,
+    payload.video && payload.video.id,
+  ];
+  for (const v of candidates) if (v) return String(v);
+  for (const k of Object.keys(payload)) {
+    if (/^(video|media)_?id$/i.test(k) && payload[k]) return String(payload[k]);
+  }
+  return null;
+}
+
   function buildQueue(folder, items) {
     const promptList = config.promptListEnabled
       ? parsePromptList(config.promptList)
@@ -1901,6 +1922,9 @@
             startedAt,
             updatedAt: startedAt,
             status: "started",
+            videoId: null,
+            downloadedAt: null,
+            completedAt: null,
           };
           setRecord(folder.id, item.media.id, baseRecord);
           item.record = baseRecord;
@@ -2056,10 +2080,15 @@
           mapped = "running";
         }
 
+        const videoId = mapped === "completed" ? extractVideoIdFromStatus(statusPayload) : record.videoId || null;
+        if (mapped === "completed" && videoId) console.log("[VE] videoId captured", record.uuid, videoId, statusPayload);
         const nextRecord = {
           ...record,
           status: mapped,
           statusPayload,
+          videoId: videoId || record.videoId || null,
+          completedAt: mapped === "completed" ? (record.completedAt || new Date().toISOString()) : record.completedAt || null,
+          downloadedAt: record.downloadedAt || null,
           updatedAt: new Date().toISOString(),
         };
         setRecord(record.folderId, record.imageId, nextRecord);
