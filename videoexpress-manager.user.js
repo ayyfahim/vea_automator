@@ -559,9 +559,10 @@
     return (
       folders.find(
         (f) =>
-          f.name === "my_ai_videos" ||
-          /^my_?ai_?videos$/i.test(f.name) ||
-          /my ai videos/i.test(f.title || "")
+          f &&
+          (f.name === "my_ai_videos" ||
+            (f.name && /^my_?ai_?videos$/i.test(f.name)) ||
+            (f.title && /my ai videos/i.test(f.title)))
       ) || null
     );
   }
@@ -1701,14 +1702,22 @@ function extractVideoIdFromStatus(payload) {
   function resolveVideoDownloadName(video) {
     if (video.uuid) {
       const records = state.history.records;
+      const targetUuid = String(video.uuid).toLowerCase().trim();
       for (const key of Object.keys(records)) {
         const record = records[key];
-        if (record.uuid === video.uuid && record.imageName) {
-          return sanitizeFileName(record.imageName) + ".mp4";
+        if (
+          record &&
+          record.uuid &&
+          String(record.uuid).toLowerCase().trim() === targetUuid &&
+          record.imageName
+        ) {
+          const baseName = String(record.imageName).replace(/\.[a-z0-9]+$/i, "");
+          return sanitizeFileName(baseName) + ".mp4";
         }
       }
     }
-    return sanitizeFileName(video.name || video.fileName || video.id) + ".mp4";
+    const rawName = String(video.name || video.fileName || video.id).replace(/\.[a-z0-9]+$/i, "");
+    return sanitizeFileName(rawName) + ".mp4";
   }
 
   async function fetchAndDownload(video, fileName) {
@@ -2286,27 +2295,29 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       }
     }
 
-    const completedWithoutVid = Object.values(state.history.records).filter(
-      (r) => normalizeStatus(r.status) === "completed" && r.uuid && !r.videoId
-    );
-    if (completedWithoutVid.length) {
-      try {
-        const aiMap = await fetchAiVideosMap();
-        for (const record of completedWithoutVid) {
-          const u = String(record.uuid).toLowerCase().trim();
-          if (aiMap.has(u)) {
-            const vidItem = aiMap.get(u);
-            record.videoId = String(vidItem.id);
-            setRecord(record.folderId, record.imageId, {
-              ...record,
-              videoId: String(vidItem.id),
-              updatedAt: new Date().toISOString()
-            });
-            logLine(`Matched video ID ${vidItem.id} for ${record.imageName || record.uuid}`);
+    if (pendingRecords.length > 0) {
+      const completedWithoutVid = Object.values(state.history.records).filter(
+        (r) => normalizeStatus(r.status) === "completed" && r.uuid && !r.videoId
+      );
+      if (completedWithoutVid.length) {
+        try {
+          const aiMap = await fetchAiVideosMap();
+          for (const record of completedWithoutVid) {
+            const u = String(record.uuid).toLowerCase().trim();
+            if (aiMap.has(u)) {
+              const vidItem = aiMap.get(u);
+              record.videoId = String(vidItem.id);
+              setRecord(record.folderId, record.imageId, {
+                ...record,
+                videoId: String(vidItem.id),
+                updatedAt: new Date().toISOString()
+              });
+              logLine(`Matched video ID ${vidItem.id} for ${record.imageName || record.uuid}`);
+            }
           }
+        } catch (e) {
+          console.warn("[VE] AI videos map resolution failed in pollStatuses:", e);
         }
-      } catch (e) {
-        console.warn("[VE] AI videos map resolution failed in pollStatuses:", e);
       }
     }
 
