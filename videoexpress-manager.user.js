@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoExpress Library Manager
 // @namespace    https://app.videoexpress.ai/
-// @version      0.8.2
+// @version      0.8.3
 // @description  Manage folders, upload images, and batch convert images to videos inside VideoExpress AI.
 // @match        https://app.videoexpress.ai/*
 // @grant        none
@@ -1246,9 +1246,9 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       <div id="ve-manager-header">
         <div>
           <div id="ve-manager-title">VideoExpress Manager</div>
-          <div class="ve-muted">Batch media workflow for My Media</div>
+          <div class="ve-muted">Image → Video batch • Library 4 • 5-parallel safe</div>
         </div>
-        <select id="ve-theme-select" class="ve-select" style="width:auto;min-width:138px;padding:6px 28px 6px 10px;font-family:'Barlow Condensed',sans-serif;font-size:11px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;border:1.5px solid #000;background:#fff;color:#111827;border-radius:1px;cursor:pointer" title="Palette">
+        <select id="ve-theme-select" class="ve-select" style="width:auto;min-width:138px;padding:6px 28px 6px 10px;font-family:'Barlow Condensed',sans-serif;font-size:11px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;border:1.5px solid #000;background:#fff;color:#111827;border-radius:1px;cursor:pointer" title="Palette — VideoExpress is site-matched (default); Bench is red on black">
             <option value="videoexpress">VideoExpress</option>
             <option value="bench">Bench Red</option>
             <option value="teal">Teal Dark</option>
@@ -1258,17 +1258,17 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       </div>
       <div id="ve-manager-body">
         <div class="ve-tabs" role="tablist">
-          <button class="ve-tab active" data-tab="folders" type="button"><i class="bi bi-folder2-open"></i>Folders</button>
-          <button class="ve-tab" data-tab="upload" type="button"><i class="bi bi-upload"></i>Upload</button>
-          <button class="ve-tab" data-tab="queue" type="button"><i class="bi bi-play-circle"></i>Queue</button>
-          <button class="ve-tab" data-tab="downloads" type="button"><i class="bi bi-download"></i>Downloads</button>
-          <button class="ve-tab" data-tab="timeline" type="button"><i class="bi bi-view-list"></i>Timeline</button>
-          <button class="ve-tab" data-tab="activity" type="button"><i class="bi bi-activity"></i>Activity</button>
+          <button class="ve-tab active" data-tab="folders" type="button" title="Browse library folders (ID 4)"><i class="bi bi-folder2-open"></i>Folders</button>
+          <button class="ve-tab" data-tab="upload" type="button" title="Add images to a folder"><i class="bi bi-upload"></i>Add</button>
+          <button class="ve-tab" data-tab="queue" type="button" title="Generate videos from images"><i class="bi bi-play-circle"></i>Generate</button>
+          <button class="ve-tab" data-tab="downloads" type="button" title="Download completed videos"><i class="bi bi-download"></i>Downloads</button>
+          <button class="ve-tab" data-tab="timeline" type="button" title="Stitch videos into a timeline"><i class="bi bi-view-list"></i>Timeline</button>
+          <button class="ve-tab" data-tab="activity" type="button" title="Event log"><i class="bi bi-activity"></i>Log</button>
         </div>
         <div class="ve-tab-panel active" data-panel="folders">
         <div class="ve-section">
           <div class="ve-section-title">
-            <span><i class="bi bi-collection-play"></i> Media folders</span>
+            <span><i class="bi bi-collection-play"></i> Library folders</span>
             <button class="ve-button ghost ve-icon-button" id="ve-refresh-btn" title="Refresh folders"><i class="bi bi-arrow-clockwise"></i></button>
           </div>
           <div class="ve-row">
@@ -1283,17 +1283,17 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
         <div class="ve-section">
           <div class="ve-section-title"><span><i class="bi bi-folder-plus"></i> Create folder</span></div>
           <div class="ve-row">
-            <input class="ve-input" id="ve-new-folder-input" placeholder="New folder name" />
-            <button class="ve-button success" id="ve-create-folder-btn"><i class="bi bi-plus-lg"></i> Create</button>
+            <input class="ve-input" id="ve-new-folder-input" placeholder="e.g. product-shots-04" aria-label="New folder name" />
+            <button class="ve-button success" id="ve-create-folder-btn"><i class="bi bi-plus-lg"></i> Create folder</button>
           </div>
           <div class="ve-row">
-            <button class="ve-button danger" id="ve-delete-folder-btn"><i class="bi bi-trash3"></i> Delete selected folder</button>
+            <button class="ve-button danger" id="ve-delete-folder-btn" title="Delete the selected library folder — references only, not source files"><i class="bi bi-trash3"></i> Delete folder</button>
           </div>
         </div>
         </div>
         <div class="ve-tab-panel" data-panel="upload">
         <div class="ve-section">
-          <div class="ve-section-title"><span><i class="bi bi-cloud-arrow-up"></i> Upload images</span></div>
+          <div class="ve-section-title"><span><i class="bi bi-cloud-arrow-up"></i> Add images to folder</span></div>
           <div class="ve-row">
             <select class="ve-select" id="ve-upload-folder-select"></select>
           </div>
@@ -1304,26 +1304,26 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
           <input class="ve-file-input" id="ve-file-input" type="file" accept="image/*" multiple />
           <input class="ve-file-input" id="ve-folder-input" type="file" accept="image/*" multiple webkitdirectory directory />
           <div class="ve-row">
-            <button class="ve-button success" id="ve-upload-btn"><i class="bi bi-upload"></i> Upload selected images</button>
+            <button class="ve-button success" id="ve-upload-btn"><i class="bi bi-upload"></i> Upload to library</button>
             <button class="ve-button ghost" id="ve-clear-files-btn" type="button"><i class="bi bi-x-lg"></i> Clear</button>
           </div>
-          <div class="ve-muted" id="ve-upload-summary">No files selected.</div>
+          <div class="ve-muted" id="ve-upload-summary">No images chosen — pick files or a folder above.</div>
         </div>
         </div>
         <div class="ve-tab-panel" data-panel="queue">
         <div class="ve-section">
-          <div class="ve-section-title"><span><i class="bi bi-camera-video"></i> Image to video</span></div>
+          <div class="ve-section-title"><span><i class="bi bi-camera-video"></i> Generate — Image → Video (10s)</span></div>
           <div class="ve-row">
-            <input class="ve-input" id="ve-video-length" type="number" min="1" max="60" value="${config.videoLength}" />
-            <select class="ve-select" id="ve-aspect">
+            <input class="ve-input" id="ve-video-length" type="number" min="1" max="60" value="${config.videoLength}" aria-label="Video length (seconds, 1–60)" title="Video length in seconds" />
+            <select class="ve-select" id="ve-aspect" aria-label="Aspect ratio" title="Aspect ratio">
               <option value="16:9">16:9</option>
               <option value="9:16">9:16</option>
               <option value="1:1">1:1</option>
             </select>
           </div>
           <div class="ve-row">
-            <input class="ve-input" id="ve-delay-input" type="number" min="0" step="100" value="${config.delayBetweenRequestsMs}" />
-            <input class="ve-input" id="ve-retry-delay-input" type="number" min="1000" step="1000" value="${config.parallelLimitRetryDelayMs}" />
+            <input class="ve-input" id="ve-delay-input" type="number" min="0" step="100" value="${config.delayBetweenRequestsMs}" aria-label="Delay between requests (ms)" title="Wait between each generate request" />
+            <input class="ve-input" id="ve-retry-delay-input" type="number" min="1000" step="1000" value="${config.parallelLimitRetryDelayMs}" aria-label="Retry delay on parallel limit (ms)" title="Wait after “5 videos in progress” before retry" />
           </div>
           <div class="ve-row" style="align-items:center">
             <label class="ve-muted" style="display:flex;align-items:center;gap:8px;cursor:pointer">
@@ -1338,9 +1338,9 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
             </label>
           </div>
           <div class="ve-row">
-            <textarea class="ve-textarea" id="ve-master-prompt" placeholder="e.g. cinematic product shot, soft studio light. {{image}} is optional when the individual prompt option is enabled."></textarea>
+            <textarea class="ve-textarea" id="ve-master-prompt" placeholder="e.g. cinematic product shot, soft studio light — use {{image}} where image name should appear" aria-label="Master prompt"></textarea>
           </div>
-          <div class="ve-muted" style="margin-top:-4px;margin-bottom:10px">Master mode uses only this text unless you turn on the individual prompt option.</div>
+          <div class="ve-muted" style="margin-top:-4px;margin-bottom:10px">With “Use a master prompt” on, every image uses this text. Turn on “Also include individual prompt” to append the image name.</div>
           <div class="ve-row" style="align-items:center">
             <label class="ve-muted" style="display:flex;align-items:center;gap:8px;cursor:pointer">
               <input class="ve-checkbox" id="ve-prompt-list-enabled" type="checkbox" />
@@ -1348,34 +1348,34 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
             </label>
           </div>
           <div class="ve-row ve-hidden" id="ve-prompt-list-row">
-            <textarea class="ve-textarea" id="ve-prompt-list" placeholder="Paste one prompt per line. Line 1 = first sorted image, line 2 = second sorted image, etc."></textarea>
+            <textarea class="ve-textarea" id="ve-prompt-list" placeholder="One prompt per line — line 1 → first sorted image, line 2 → second, …" aria-label="Prompt list"></textarea>
           </div>
-          <div class="ve-muted ve-hidden" id="ve-prompt-list-summary" style="margin-top:-4px;margin-bottom:10px">Prompt list is off.</div>
+          <div class="ve-muted ve-hidden" id="ve-prompt-list-summary" style="margin-top:-4px;margin-bottom:10px">Off — turn on “Use prompt list” to map one prompt per sorted image (line 1 → first image).</div>
           <div class="ve-row">
-            <button class="ve-button primary" id="ve-load-media-btn"><i class="bi bi-list-check"></i> Load images</button>
-            <button class="ve-button success" id="ve-run-btn"><i class="bi bi-play-fill"></i> Run queue</button>
-            <button class="ve-button warn" id="ve-stop-btn"><i class="bi bi-stop-fill"></i> Stop</button>
+            <button class="ve-button primary" id="ve-load-media-btn"><i class="bi bi-list-check"></i> Show images in folder</button>
+            <button class="ve-button success" id="ve-run-btn"><i class="bi bi-play-fill"></i> Start generating</button>
+            <button class="ve-button warn" id="ve-stop-btn"><i class="bi bi-stop-fill"></i> Pause queue</button>
           </div>
         </div>
         <div class="ve-section">
           <div class="ve-stats">
-            <div class="ve-stat"><span class="ve-muted">Images</span><strong id="ve-stat-images">0</strong></div>
-            <div class="ve-stat"><span class="ve-muted">Queued</span><strong id="ve-stat-queued">0</strong></div>
-            <div class="ve-stat"><span class="ve-muted">Running</span><strong id="ve-stat-running">0</strong></div>
-            <div class="ve-stat"><span class="ve-muted">Done</span><strong id="ve-stat-done">0</strong></div>
-            <div class="ve-stat failures"><span>Failed</span><strong id="ve-stat-failed">0</strong></div>
+            <div class="ve-stat"><span class="ve-muted">In folder</span><strong id="ve-stat-images">0</strong></div>
+            <div class="ve-stat"><span class="ve-muted">Ready</span><strong id="ve-stat-queued">0</strong></div>
+            <div class="ve-stat"><span class="ve-muted">Generating</span><strong id="ve-stat-running">0</strong></div>
+            <div class="ve-stat"><span class="ve-muted">Completed</span><strong id="ve-stat-done">0</strong></div>
+            <div class="ve-stat failures"><span>Needs retry</span><strong id="ve-stat-failed">0</strong></div>
           </div>
         </div>
         <div class="ve-section" id="ve-queue-download-section">
-          <div class="ve-section-title"><span><i class="bi bi-download"></i> Download generated</span></div>
-          <div class="ve-muted" id="ve-queue-download-summary">No completed videos yet.</div>
+          <div class="ve-section-title"><span><i class="bi bi-download"></i> Download completed</span></div>
+          <div class="ve-muted" id="ve-queue-download-summary">No completed videos in this folder yet. Generate some in Generate, then download here.</div>
           <div class="ve-progress" title="Queue download progress"><div class="ve-progress-bar" id="ve-queue-download-progress"></div></div>
           <div class="ve-row" style="margin-top:10px">
-            <button class="ve-button primary" id="ve-download-completed-btn" type="button"><i class="bi bi-download"></i> Download Completed</button>
-            <button class="ve-button success" id="ve-download-remaining-btn" type="button"><i class="bi bi-download"></i> Download Remaining</button>
+            <button class="ve-button primary" id="ve-download-completed-btn" type="button"><i class="bi bi-download"></i> Download completed</button>
+            <button class="ve-button success" id="ve-download-remaining-btn" type="button"><i class="bi bi-download"></i> Download remaining</button>
           </div>
           <div class="ve-row" style="margin-top:10px">
-            <button class="ve-button warn" id="ve-retry-all-failed-btn" type="button" title="Retry every failed item in this folder"><i class="bi bi-arrow-clockwise"></i> Retry all failed</button>
+            <button class="ve-button warn" id="ve-retry-all-failed-btn" type="button" title="Retry every failed item in this folder"><i class="bi bi-arrow-clockwise"></i> Retry failed</button>
             <span class="ve-muted" id="ve-retry-all-summary"></span>
           </div>
         </div>
@@ -1385,7 +1385,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
             <button class="ve-button ghost ve-icon-button" id="ve-reset-history-btn" type="button" title="Clear saved queue history"><i class="bi bi-eraser"></i></button>
           </div>
           <div class="ve-row">
-            <div class="ve-muted" id="ve-folder-summary">Select a folder to begin.</div>
+            <div class="ve-muted" id="ve-folder-summary">Choose a folder, then “Show images in folder” to build the queue.</div>
           </div>
             <table class="ve-table">
             <thead>
@@ -1403,13 +1403,13 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
         </div>
         <div class="ve-tab-panel" data-panel="downloads">
           <div class="ve-section">
-            <div class="ve-section-title"><span><i class="bi bi-download"></i> Download videos</span></div>
+            <div class="ve-section-title"><span><i class="bi bi-download"></i> Download from library</span></div>
             <div class="ve-row">
               <select class="ve-select" id="ve-download-folder-select"></select>
-              <button class="ve-button primary" id="ve-load-videos-btn" type="button"><i class="bi bi-collection-play"></i> Load videos</button>
+              <button class="ve-button primary" id="ve-load-videos-btn" type="button"><i class="bi bi-collection-play"></i> Load videos in folder</button>
             </div>
             <div class="ve-row">
-              <input class="ve-input" id="ve-video-filter-query" type="search" placeholder="Filter by name or media ID" />
+              <input class="ve-input" id="ve-video-filter-query" type="search" placeholder="Search videos by name or ID" aria-label="Search videos" />
             </div>
             <div class="ve-row">
               <input class="ve-input" id="ve-video-filter-date-from" type="date" title="Created from" />
@@ -1427,14 +1427,14 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
             </div>
             <div class="ve-download-controls">
               <button class="ve-button ghost" id="ve-select-all-videos-btn" type="button"><i class="bi bi-check2-square"></i> Select all</button>
-              <button class="ve-button success" id="ve-download-selected-btn" type="button"><i class="bi bi-download"></i> Selected</button>
-              <button class="ve-button primary" id="ve-download-all-btn" type="button"><i class="bi bi-download"></i> Visible</button>
+              <button class="ve-button success" id="ve-download-selected-btn" type="button"><i class="bi bi-download"></i> Download selected</button>
+              <button class="ve-button primary" id="ve-download-all-btn" type="button"><i class="bi bi-download"></i> Download visible</button>
             </div>
             <div class="ve-row" style="margin-top:10px">
-              <button class="ve-button warn" id="ve-stop-downloads-btn" type="button"><i class="bi bi-stop-fill"></i> Stop downloads</button>
+              <button class="ve-button warn" id="ve-stop-downloads-btn" type="button"><i class="bi bi-stop-fill"></i> Pause downloads</button>
             </div>
             <div class="ve-progress" title="Download queue progress"><div class="ve-progress-bar" id="ve-download-progress"></div></div>
-            <div class="ve-muted" id="ve-download-summary" style="margin-top:8px">Load a video folder to begin.</div>
+            <div class="ve-muted" id="ve-download-summary" style="margin-top:8px">Choose a folder and “Load videos in folder” to browse.</div>
           </div>
           <div class="ve-section">
             <table class="ve-table">
@@ -1453,19 +1453,19 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
         </div>
         <div class="ve-tab-panel" data-panel="timeline">
   <div class="ve-section">
-    <div class="ve-section-title"><span><i class="bi bi-view-list"></i> Timeline export (chronological)</span></div>
-    <div class="ve-muted" style="margin-bottom:8px">Load videos sorted by name (numeric) → stitched timeline video. Monitoring <code>/render_project/tmp</code> + <code>/project/progress</code>.</div>
+    <div class="ve-section-title"><span><i class="bi bi-view-list"></i> Stitch timeline — chronological</span></div>
+    <div class="ve-muted" style="margin-bottom:8px">Combine videos in numeric name order into one timeline.</div>
     <div class="ve-row">
       <select class="ve-select" id="ve-timeline-folder-select"></select>
-      <button class="ve-button ghost" id="ve-timeline-load-btn" type="button"><i class="bi bi-collection-play"></i> Load videos</button>
+      <button class="ve-button ghost" id="ve-timeline-load-btn" type="button"><i class="bi bi-collection-play"></i> Load videos in folder</button>
     </div>
     <div class="ve-row">
-      <button class="ve-button success" id="ve-timeline-add-completed-btn" type="button"><i class="bi bi-plus-circle"></i> Add Completed Generated</button>
+      <button class="ve-button success" id="ve-timeline-add-completed-btn" type="button"><i class="bi bi-plus-circle"></i> Add completed to timeline</button>
       <button class="ve-button ghost" id="ve-timeline-clear-btn" type="button"><i class="bi bi-x-lg"></i> Clear</button>
     </div>
     <div class="ve-muted" id="ve-timeline-completed-summary" style="margin-top:2px;margin-bottom:8px"></div>
     <div class="ve-row">
-      <input class="ve-input" id="ve-timeline-name" placeholder="Project name (e.g. timeline_2026)" />
+      <input class="ve-input" id="ve-timeline-name" placeholder="Timeline name — e.g. timeline_2026" aria-label="Timeline project name" />
       <select class="ve-select" id="ve-timeline-aspect">
         <option value="16:9">16:9</option><option value="9:16">9:16</option><option value="1:1">1:1</option>
       </select>
@@ -1474,11 +1474,11 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       </select>
     </div>
     <div class="ve-row">
-      <button class="ve-button primary" id="ve-timeline-export-btn" type="button"><i class="bi bi-play-fill"></i> Export Timeline</button>
-      <button class="ve-button warn" id="ve-timeline-stop-btn" type="button"><i class="bi bi-stop-fill"></i> Stop</button>
+      <button class="ve-button primary" id="ve-timeline-export-btn" type="button"><i class="bi bi-play-fill"></i> Stitch & export timeline</button>
+      <button class="ve-button warn" id="ve-timeline-stop-btn" type="button"><i class="bi bi-stop-fill"></i> Pause queue</button>
     </div>
     <div class="ve-progress" title="Timeline export progress"><div class="ve-progress-bar" id="ve-timeline-progress"></div></div>
-    <div class="ve-muted" id="ve-timeline-status" style="margin-top:8px">Idle — load a folder and export.</div>
+    <div class="ve-muted" id="ve-timeline-status" style="margin-top:8px">Idle — choose a folder, load videos, then export.</div>
     <div class="ve-row" style="margin-top:10px">
       <button class="ve-button success ve-hidden" id="ve-timeline-download-btn" type="button"><i class="bi bi-download"></i> Download Result</button>
       <span class="ve-muted" id="ve-timeline-result-info"></span>
@@ -1486,13 +1486,13 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
   </div>
   <div class="ve-section">
     <div class="ve-section-title"><span><i class="bi bi-table"></i> Videos to stitch (<span id="ve-timeline-count">0</span>)</span></div>
-    <div class="ve-muted" id="ve-timeline-list-summary">No videos loaded.</div>
+    <div class="ve-muted" id="ve-timeline-list-summary">No videos — load a folder to stich.</div>
     <table class="ve-table"><thead><tr><th>#</th><th>Video</th><th>Duration</th></tr></thead><tbody id="ve-timeline-body"></tbody></table>
   </div>
 </div>
         <div class="ve-tab-panel" data-panel="activity">
           <div class="ve-section">
-            <div class="ve-section-title"><span><i class="bi bi-terminal"></i> Activity log</span></div>
+            <div class="ve-section-title"><span><i class="bi bi-terminal"></i> Event log</span></div>
             <div class="ve-log" id="ve-log"></div>
           </div>
         </div>
@@ -1713,7 +1713,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     ).length;
     els.downloadSummary.textContent = total
       ? `${visibleVideos.length}/${total} visible | ${visibleSelectedCount} visible selected | ${selectedCount} total selected`
-      : "No videos loaded yet.";
+      : "No videos loaded — choose a folder and “Load videos in folder.”";
     els.videoMasterCheckbox.checked =
       visibleVideos.length > 0 && visibleSelectedCount === visibleVideos.length;
     els.videoMasterCheckbox.indeterminate =
@@ -1800,7 +1800,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
   function renderSelectedFiles() {
     const files = state.selectedFiles;
     if (!files.length) {
-      els.uploadSummary.textContent = "No files selected.";
+      els.uploadSummary.textContent = "No images chosen — pick files or a folder above.";
       return;
     }
 
@@ -1947,7 +1947,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     const folder = getSelectedFolder();
     els.folderSummary.textContent = folder
       ? `${folder.title || folder.name} | ${state.items.length} images loaded | history updated ${formatDateTime(state.history.updatedAt) || "never"}`
-      : "Select a folder to begin.";
+      : "Choose a folder, then “Show images in folder” to build the queue.";
 
     els.queueBody.innerHTML = state.queue.length
       ? state.queue
@@ -2003,7 +2003,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       ? missing
         ? `Completed: ${counts.completed} | Downloaded: ${counts.downloaded} | Remaining: ${counts.remaining} | Attention: ${missing} missing videoId — wait 15s for poll or click Load images`
         : `Completed: ${counts.completed} | Downloaded: ${counts.downloaded} | Remaining: ${counts.remaining}`
-      : missing ? `No completed with videoId yet — ${missing} completed but videoId missing (see Activity log)` : "No completed videos yet. Run queue and wait for completion.";
+      : missing ? `No completed with videoId yet — ${missing} completed but videoId missing (see Activity log)` : "No completed videos in this folder yet. Generate some in Generate, then download here. Run queue and wait for completion.";
     els.queueDownloadProgress.style.width = counts.completed ? `${Math.round((counts.downloaded / counts.completed) * 100)}%` : "0%";
     updateButtonStates();
   }
@@ -2011,7 +2011,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
   function renderTimelineExport() {
     if (!els.timelineProgress) return;
     els.timelineProgress.style.width = `${Math.max(0, Math.min(100, Number(state.timelineExport.percent || 0)))}%`;
-    els.timelineStatus.textContent = state.timelineExport.statusText || (state.timelineExport.running ? `Exporting ${state.timelineExport.percent}%` : "Idle — load a folder and export.");
+    els.timelineStatus.textContent = state.timelineExport.statusText || (state.timelineExport.running ? `Exporting ${state.timelineExport.percent}%` : "Idle — choose a folder, load videos, then export.");
     const hasResult = Boolean(state.timelineExport.exportedVideo && state.timelineExport.exportedVideo.mediaPath);
     els.timelineDownloadBtn.classList.toggle("ve-hidden", !hasResult);
     if (hasResult) {
@@ -2677,7 +2677,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     els.promptListSummary.classList.toggle("ve-hidden", !promptListEnabled);
     els.promptListSummary.textContent = promptListEnabled
       ? `${promptCountText}. Line 1 matches the first sorted image.${promptMismatchText}`
-      : "Prompt list is off.";
+      : "Off — turn on “Use prompt list” to map one prompt per sorted image (line 1 → first image).";
     els.masterPrompt.disabled = state.running || !masterEnabled;
     els.appendFilenamePrompt.disabled = state.running || !masterEnabled;
     els.promptList.disabled = state.running || !promptListEnabled;
