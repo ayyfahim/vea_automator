@@ -394,6 +394,16 @@
     }
   }
 
+  async function postJson(url, bodyObj, label) {
+    const response = await sessionFetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest" },
+      body: JSON.stringify(bodyObj),
+    }, label);
+    const text = await response.text();
+    try { return JSON.parse(text); } catch { return text; }
+  }
+
   async function postMultipart(url, formData, label) {
     const response = await sessionFetch(
       url,
@@ -564,6 +574,32 @@
         `/ai/api/status/${uuid}?_=${cacheBust}`,
         `Load status ${uuid}`,
       );
+    },
+    async renderTimeline(bricks, options = {}) {
+      const now = Date.now();
+      const opts = {
+        name: String(options.name || `timeline_${now}`).slice(0, 80),
+        quality: options.quality || "high",
+        size: options.size || "1080",
+        format: options.format || "mp4",
+        aspect: options.aspect || config.aspect || "16:9",
+        project_id: 0,
+        project_title: "",
+        ...options,
+      };
+      const payload = buildTimelinePayload(bricks, opts, now);
+      return postJson(`/render_project/tmp`, payload, "Render timeline");
+    },
+    async getProjectProgress(start) {
+      const cacheBust = Date.now();
+      return getJson(`/project/progress?start=${start ? "true" : "false"}&_=${cacheBust}`, "Project progress");
+    },
+    async getUserQueue() {
+      const cacheBust = Date.now();
+      return getJson(`/user_queue?_=${cacheBust}`, "User queue");
+    },
+    async getListOutput() {
+      return getJson(`/api/get_list_output`, "List output");
     },
   };
 
@@ -1748,6 +1784,70 @@ function extractVideoIdFromStatus(payload) {
       sensitivity: "base",
     });
   }
+
+  function buildTimelineBricks(sortedVideos, trackId = "30") {
+    let left = 0;
+    return sortedVideos.map((v, idx) => {
+      const duration = Number(v.duration_time ?? v.duration ?? v.durationMs ?? 5000) || 5000;
+      const brick = {
+        id: String(310 + idx), // vendor uses incremental numeric ids; 310 in HAR example
+        media_id: Number(v.id ?? v.media_id ?? v.mediaId),
+        type: "video",
+        fileName: String(v.fileName || v.name || v.filename || v.id).replace(/\.[a-z0-9]+$/i,""),
+        path: String(v.path || v.mediaPath || v.videoUrl || ""),
+        videoUrl: String(v.videoUrl || v.mediaPath || v.path || ""),
+        audioUrl: "",
+        imageUrl: String(v.imageUrl || v.thumbUrl || ""),
+        isPrivate: Boolean(v.isPrivate ?? true),
+        duration,
+        duration_time: duration,
+        start_time: 0,
+        left,
+        filters: "",
+        track_id: String(trackId),
+        title: String(v.name || v.title || v.fileName || ""),
+        frameSize: "1080x1920",
+        frameRate: 24,
+        thumbUrl: String(v.thumbUrl || v.thumbnail || ""),
+        brickThumbUrl: `library/image/video?src=${String(v.fileName || v.name || "").replace(/\.[a-z0-9]+$/i,"")}&isPrivate=1&w=40&h=40&userId=${v.userId || ""}&ext=mp4&fit=0`,
+        libraryId: config.libraryId,
+        workCopyPath: "",
+        imagePath: String(v.imagePath || ""),
+        userId: Number(v.userId || 0),
+        resizable: true,
+        volume: 100,
+        transitionIn: "",
+        transitionOut: "",
+        transitionBetween: null,
+        options: {},
+      };
+      // fallback fileName for brickThumbUrl if empty
+      if (!brick.fileName || brick.fileName.includes("undefined")) {
+        brick.fileName = String(v.id);
+        brick.brickThumbUrl = "";
+      }
+      left += duration;
+      return brick;
+    });
+  }
+  function buildTimelinePayload(bricks, options, now = Date.now()) {
+    const trackId = "30";
+    const trackData = {
+      title: "#",
+      index: 0,
+      id: trackId,
+      muted: false,
+      video_disabled: false,
+      fast_cut_enabled: false,
+      fast_cut_type: "zoom",
+      timestamp: now,
+      bricks,
+    };
+    const emptyTrack = { title: "#", index: 1, id: "32", muted: false, video_disabled: false, fast_cut_enabled: false, fast_cut_type: "zoom", timestamp: now, bricks: [] };
+    return { options, data: [trackData, emptyTrack] };
+  }
+  // expose for tests (no global leak in prod except test env)
+  if (typeof window !== "undefined") { window.__ve_test = { buildTimelineBricks, buildTimelinePayload, compareMediaName }; }
 
   function setSelectedFiles(fileList) {
     state.selectedFiles = Array.from(fileList || [])
