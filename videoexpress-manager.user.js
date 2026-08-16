@@ -2272,7 +2272,7 @@ function extractVideoIdFromStatus(payload) {
     if (state.timelineExport.pollTimer) clearInterval(state.timelineExport.pollTimer);
     const intervalMs = Number(config.timelineExportDefaults.pollIntervalMs || 2000);
     state.timelineExport.pollTimer = setInterval(async () => {
-      if (!state.timelineExport.running) { clearInterval(state.timelineExport.pollTimer); return; }
+      if (!state.timelineExport.running) { clearInterval(state.timelineExport.pollTimer); state.timelineExport.pollTimer = null; return; }
       try {
         const startFlag = !_timelineProgressStarted;
         const progress = await api.getProjectProgress(startFlag);
@@ -2343,6 +2343,8 @@ function extractVideoIdFromStatus(payload) {
       }
       await sleep(2000);
     }
+    if (!state.timelineExport.running && state.timelineExport.lastError === "stopped") return null;
+    if (tries < maxTries) return null;
     state.timelineExport.running = false;
     state.timelineExport.lastError = "Result not found after polling get_list_output";
     state.timelineExport.statusText = "Export finished but result file not found — check My Videos > get_list_output.";
