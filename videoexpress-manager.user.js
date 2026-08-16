@@ -1608,7 +1608,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     toggle: root.querySelector("#ve-manager-toggle"),
     closeBtn: root.querySelector("#ve-close-btn"),
     themeSelect: root.querySelector("#ve-theme-select"),
-    tabs: Array.from(root.querySelectorAll(".ve-tab")),
+    tabs: Array.from(root.querySelectorAll(".ve-step,.ve-tab")),
     tabPanels: Array.from(root.querySelectorAll(".ve-tab-panel")),
     folderSelect: root.querySelector("#ve-folder-select"),
     uploadFolderSelect: root.querySelector("#ve-upload-folder-select"),
@@ -1692,6 +1692,24 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     timelineBody: root.querySelector("#ve-timeline-body"),
     timelineListSummary: root.querySelector("#ve-timeline-list-summary"),
     log: root.querySelector("#ve-log"),
+    contextSelect: root.querySelector("#ve-context-select"),
+    contextPill: root.querySelector("#ve-context-pill"),
+    contextName: root.querySelector("#ve-context-name"),
+    contextId: root.querySelector("#ve-context-id"),
+    contextCount: root.querySelector("#ve-context-count"),
+    contextDone: root.querySelector("#ve-context-done"),
+    contextChangeBtn: root.querySelector("#ve-context-change-btn"),
+    onboarding: root.querySelector("#ve-onboarding"),
+    onboardingDismiss: root.querySelector("#ve-onboarding-dismiss"),
+    fileDrop: root.querySelector("#ve-file-drop"),
+    uploadFolderName: root.querySelector("#ve-upload-folder-name"),
+    uploadCount: root.querySelector("#ve-upload-count"),
+    advancedTimingsToggle: root.querySelector("#ve-advanced-timings-toggle"),
+    advancedTimings: root.querySelector("#ve-advanced-timings"),
+    downloadFiltersToggle: root.querySelector("#ve-download-filters-toggle"),
+    downloadFilters: root.querySelector("#ve-download-filters"),
+    statusLine: root.querySelector("#ve-status-line"),
+    filterCount: root.querySelector("#ve-filter-count"),
   };
 
   function logLine(message) {
@@ -1744,18 +1762,51 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     logLine(`Palette: ${next}`);
   }
   function setActiveTab(tab) {
-    state.activeTab = tab;
+    const domTab = tab === "folders" ? "library" : tab === "upload" ? "library" : tab;
+    const persistTab = domTab;
+    state.activeTab = persistTab;
     els.tabs.forEach((element) => {
-      element.classList.toggle("active", element.dataset.tab === tab);
+      const t = element.dataset.tab;
+      element.classList.toggle("active", t === persistTab || t === tab || (persistTab === "library" && (t === "folders" || t === "upload")));
     });
     els.tabPanels.forEach((element) => {
-      element.classList.toggle("active", element.dataset.panel === tab);
+      const p = element.dataset.panel;
+      element.classList.toggle("active", p === persistTab || p === tab || (persistTab === "library" && (p === "folders" || p === "upload")));
     });
-    saveUiState({ activeTab: tab });
+    saveUiState({ activeTab: persistTab });
   }
   if(els.themeSelect){
     els.themeSelect.addEventListener("change", () => applyTheme(els.themeSelect.value));
   }
+  if (els.advancedTimingsToggle && els.advancedTimings) {
+    els.advancedTimingsToggle.addEventListener("click", () => {
+      const exp = els.advancedTimingsToggle.getAttribute("aria-expanded") === "true";
+      els.advancedTimingsToggle.setAttribute("aria-expanded", String(!exp));
+      els.advancedTimings.classList.toggle("collapsed", exp);
+      els.advancedTimings.classList.toggle("expanded", !exp);
+    });
+  }
+  if (els.downloadFiltersToggle && els.downloadFilters) {
+    els.downloadFiltersToggle.addEventListener("click", () => {
+      const exp = els.downloadFiltersToggle.getAttribute("aria-expanded") === "true";
+      els.downloadFiltersToggle.setAttribute("aria-expanded", String(!exp));
+      els.downloadFilters.classList.toggle("collapsed", exp);
+      els.downloadFilters.classList.toggle("expanded", !exp);
+    });
+  }
+  if (els.fileDrop) {
+    els.fileDrop.addEventListener("click", () => els.fileInput && els.fileInput.click());
+    els.fileDrop.addEventListener("dragover", (e) => { e.preventDefault(); els.fileDrop.style.borderColor = "#6F5CCF"; });
+    els.fileDrop.addEventListener("dragleave", () => { els.fileDrop.style.borderColor = ""; });
+    els.fileDrop.addEventListener("drop", (e) => {
+      e.preventDefault(); els.fileDrop.style.borderColor = "";
+      const files = Array.from(e.dataTransfer.files || []).filter(isImageFile);
+      if (files.length) { setSelectedFiles(files); logLine(`Dropped ${files.length} image(s)`); }
+    });
+  }
+  if (els.onboardingDismiss && els.onboarding) els.onboardingDismiss.addEventListener("click", () => { els.onboarding.classList.add("ve-hidden"); saveUiState({ onboardingDismissed: true }); });
+  if (els.contextSelect) els.contextSelect.addEventListener("change", () => selectFolder(els.contextSelect.value));
+  if (els.contextChangeBtn) els.contextChangeBtn.addEventListener("click", () => { setActiveTab("library"); const g=document.getElementById("ve-folder-grid"); if(g) g.scrollIntoView({behavior:"smooth", block:"center"}); });
 
   function getBadgeClass(status) {
     const value = normalizeStatus(status);
@@ -1785,6 +1836,23 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       els.timelineFolderSelect.innerHTML = options || `<option value="">No folders found</option>`;
       els.timelineFolderSelect.value = state.selectedFolderId || "";
     }
+    if (els.contextSelect) {
+      els.contextSelect.innerHTML = options || `<option value="">No folders found</option>`;
+      els.contextSelect.value = state.selectedFolderId || "";
+    }
+    const sel = getSelectedFolder();
+    if (sel) {
+      if (els.contextName) els.contextName.textContent = sel.title || sel.name;
+      if (els.contextId) els.contextId.textContent = `#${sel.id}`;
+      if (els.uploadFolderName) els.uploadFolderName.textContent = `\u2192 ${sel.title || sel.name}`;
+    }
+    if (els.folderCount) els.folderCount.textContent = String(state.folders.length);
+    if (els.contextCount) els.contextCount.textContent = String(state.items.length);
+    try {
+      const counts = getQueueDownloadCounts();
+      if (els.contextDone) els.contextDone.textContent = String(counts.completed || state.queue.filter((q) => normalizeStatus(q.status) === "completed").length);
+    } catch {}
+
     els.folderGrid.innerHTML = state.folders.length
       ? state.folders
           .map((folder) => {
@@ -1901,6 +1969,8 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     const files = state.selectedFiles;
     if (!files.length) {
       els.uploadSummary.textContent = "No images chosen — pick files or a folder above.";
+      if (els.fileDrop) els.fileDrop.classList.remove("has-files");
+      if (els.uploadCount) els.uploadCount.textContent = "0 selected";
       return;
     }
 
@@ -1911,6 +1981,8 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       .join(", ");
     const more = files.length > 3 ? `, +${files.length - 3} more` : "";
     els.uploadSummary.textContent = `${files.length} image${files.length === 1 ? "" : "s"} selected | ${formatBytes(totalBytes)} | ${sample}${more}`;
+    if (els.fileDrop) els.fileDrop.classList.toggle("has-files", state.selectedFiles.length > 0);
+    if (els.uploadCount) els.uploadCount.textContent = state.selectedFiles.length ? `${state.selectedFiles.length} selected` : "0 selected";
   }
 
   function isImageFile(file) {
@@ -2040,6 +2112,9 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     els.statRunning.textContent = String(runningCount);
     els.statDone.textContent = String(doneCount);
     els.statFailed.textContent = String(failedCount);
+    if (els.statusLine) {
+      els.statusLine.innerHTML = `<span><strong>${state.items.length}</strong> images</span><span class="dot running"></span><span><strong>${runningCount}</strong> running</span><span class="dot done"></span><span><strong>${doneCount}</strong> done</span><span class="dot fail"></span><span><strong>${failedCount}</strong> need retry</span><span style="opacity:.4">\u00b7</span><span><strong>${queuedCount}</strong> ready</span>`;
+    }
     if (els.retryAllSummary) {
       els.retryAllSummary.textContent = failedCount ? `${failedCount} failed — click Retry all failed or per-row Retry` : "";
     }
