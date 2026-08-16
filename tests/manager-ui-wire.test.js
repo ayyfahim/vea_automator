@@ -145,4 +145,15 @@ describe("DOM contract (source-string, pre-wire)", ()=>{
     assert.match(src, /ve-tab|ve-step/);
     assert.match(src, /els\s*=\s*\{/);
   });
+  it("preview distilled elements present (context bar, file-drop, status-line, collapsibles)", ()=>{
+    const src=fs.readFileSync("videoexpress-manager.user.js","utf8");
+    for(const id of ["ve-context-bar","ve-context-select","ve-context-pill","ve-file-drop","ve-status-line","ve-advanced-timings","ve-advanced-timings-toggle","ve-download-filters","ve-onboarding"]){
+      assert.match(src, new RegExp(id), `missing preview ${id}`);
+    }
+    assert.match(src, /data-tab="library"/);
+    assert.match(src, /data-tab="queue"/);
+    assert.match(src, /data-tab="downloads"/);
+    assert.match(src, /data-tab="timeline"/);
+    assert.match(src, /ve-step/);
+  });
 });
