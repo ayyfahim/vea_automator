@@ -1858,7 +1858,15 @@ function extractVideoIdFromStatus(payload) {
     });
   }
 
-  function buildTimelineBricks(sortedVideos, trackId = "30") {
+  function getTimelineFrameSize(aspect, size) {
+    const a = aspect || config.timelineExportDefaults?.aspect || "16:9";
+    const s = String(size || config.timelineExportDefaults?.size || "1080");
+    if (a === "16:9") return s === "720" ? "1280x720" : "1920x1080";
+    if (a === "9:16") return s === "720" ? "720x1280" : "1080x1920";
+    return s === "720" ? "720x720" : "1080x1080";
+  }
+  function buildTimelineBricks(sortedVideos, trackId = "30", brickOptions = null) {
+    const frameSize = getTimelineFrameSize(brickOptions?.aspect, brickOptions?.size);
     let left = 0;
     return sortedVideos.map((v, idx) => {
       const duration = Number(v.duration_time ?? v.duration ?? v.durationMs ?? 5000) || 5000;
@@ -1879,7 +1887,7 @@ function extractVideoIdFromStatus(payload) {
         filters: "",
         track_id: String(trackId),
         title: String(v.name || v.title || v.fileName || ""),
-        frameSize: "1080x1920",
+        frameSize,
         frameRate: 24,
         thumbUrl: String(v.thumbUrl || v.thumbnail || ""),
         brickThumbUrl: `library/image/video?src=${String(v.fileName || v.name || "").replace(/\.[a-z0-9]+$/i,"")}&isPrivate=1&w=40&h=40&userId=${v.userId || ""}&ext=mp4&fit=0`,
@@ -1920,7 +1928,7 @@ function extractVideoIdFromStatus(payload) {
     return { options, data: [trackData, emptyTrack] };
   }
   // expose for tests (no global leak in prod except test env)
-  if (typeof window !== "undefined") { window.__ve_test = { buildTimelineBricks, buildTimelinePayload, compareMediaName }; }
+  if (typeof window !== "undefined") { window.__ve_test = { buildTimelineBricks, buildTimelinePayload, compareMediaName, getTimelineFrameSize }; }
 
   function setSelectedFiles(fileList) {
     state.selectedFiles = Array.from(fileList || [])
@@ -2269,14 +2277,18 @@ function extractVideoIdFromStatus(payload) {
   let _timelineProgressStarted = false;
   let _timelineStallCount = 0;
   let _timelineLastPercent = null;
+  let _timelinePollInFlight = false;
   function startTimelineProgressPolling(projectName) {
     _timelineProgressStarted = false;
     _timelineStallCount = 0;
     _timelineLastPercent = null;
+    _timelinePollInFlight = false;
     if (state.timelineExport.pollTimer) clearInterval(state.timelineExport.pollTimer);
     const intervalMs = Number(config.timelineExportDefaults.pollIntervalMs || 2000);
     state.timelineExport.pollTimer = setInterval(async () => {
       if (!state.timelineExport.running) { clearInterval(state.timelineExport.pollTimer); state.timelineExport.pollTimer = null; return; }
+      if (_timelinePollInFlight) return;
+      _timelinePollInFlight = true;
       try {
         const startFlag = !_timelineProgressStarted;
         const progress = await api.getProjectProgress(startFlag);
@@ -2314,6 +2326,8 @@ function extractVideoIdFromStatus(payload) {
         state.timelineExport.statusText = `Progress poll error: ${state.timelineExport.lastError}`;
         logLine(`Timeline progress error: ${e.message}`);
         renderTimelineExport();
+      } finally {
+        _timelinePollInFlight = false;
       }
     }, intervalMs);
     (async()=>{
@@ -2335,11 +2349,23 @@ function extractVideoIdFromStatus(payload) {
         const results = Array.isArray(out.results) ? out.results : [];
         let match = results.find(r => String(r.title) === String(projectName));
         if (!match && results.length) {
-          match = results.slice().sort((a,b)=>{
+          const newest = results.slice().sort((a,b)=>{
             const da = new Date((a.datetime||"").replace(/(\d+)\/(\d+)\/(\d+)/, "$3-$1-$2")).getTime();
             const db = new Date((b.datetime||"").replace(/(\d+)\/(\d+)\/(\d+)/, "$3-$1-$2")).getTime();
             return db - da;
           })[0];
+          if (newest) {
+            const dtStr = String(newest.datetime || "");
+            const parsed = new Date(dtStr.replace(/(\d+)\/(\d+)\/(\d+)/, "$3-$1-$2")).getTime();
+            const ageMs = Date.now() - parsed;
+            const isRecent = Number.isFinite(parsed) && ageMs >= 0 && ageMs < 5 * 60 * 1000;
+            if (isRecent) {
+              logLine(`Warning: title "${projectName}" not found — falling back to newest result "${newest.title}" (${newest.datetime}, age ${Math.round(ageMs/1000)}s)`);
+              match = newest;
+            } else {
+              logLine(`Warning: title "${projectName}" not found and newest result "${newest.title}" is not recent (${newest.datetime}) — not using fallback (requires <5 min)`);
+            }
+          }
         }
         if (match && match.mediaPath) {
           state.timelineExport.exportedVideo = { id: match.id, filename: match.filename, mediaPath: match.mediaPath, title: match.title, datetime: match.datetime, filesize: match.filesize };
@@ -2361,7 +2387,7 @@ function extractVideoIdFromStatus(payload) {
     if (tries < maxTries) return null;
     state.timelineExport.running = false;
     state.timelineExport.lastError = "Result not found after polling get_list_output";
-    state.timelineExport.statusText = "Export finished but result file not found — check My Videos > get_list_output.";
+    state.timelineExport.statusText = "Export finished but result not found — check My Videos";
     renderTimelineExport(); updateButtonStates();
     return null;
   }
@@ -2374,8 +2400,7 @@ function extractVideoIdFromStatus(payload) {
       if (v.id) {
         await fetchAndDownloadWithRetry({ id: v.id, name: v.title || v.filename, fileName: v.filename }, fileName);
       } else {
-        const res = await fetch(v.mediaPath, { credentials: "include" });
-        if (!res.ok) throw new Error(`Fetch result ${res.status}`);
+        const res = await sessionFetch(v.mediaPath, { method: "GET" }, "Download timeline result");
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a"); a.href = url; a.download = fileName; a.rel="noopener"; a.style.display="none"; document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(url),10000);
@@ -2403,8 +2428,6 @@ function extractVideoIdFromStatus(payload) {
     saveUiState({ timelineExportName: projectName });
     renderTimelineExport(); updateButtonStates();
     try {
-      const bricks = buildTimelineBricks(state.timelineVideos, "30");
-      logLine(`Exporting timeline "${projectName}" — ${bricks.length} bricks, left total ${bricks.length ? (bricks[bricks.length-1].left + bricks[bricks.length-1].duration) : 0}ms`);
       const options = {
         name: projectName,
         quality: config.timelineExportDefaults.quality,
@@ -2412,6 +2435,8 @@ function extractVideoIdFromStatus(payload) {
         format: config.timelineExportDefaults.format,
         aspect: config.timelineExportDefaults.aspect,
       };
+      const bricks = buildTimelineBricks(state.timelineVideos, "30", options);
+      logLine(`Exporting timeline "${projectName}" — ${bricks.length} bricks, left total ${bricks.length ? (bricks[bricks.length-1].left + bricks[bricks.length-1].duration) : 0}ms frameSize=${bricks[0]?.frameSize || "n/a"}`);
       const res = await api.renderTimeline(bricks, options);
       if (!res || res.success === false) throw new Error(`Render failed: ${JSON.stringify(res).slice(0,300)}`);
       logLine(`Render queued: ${res.action || "pending"} queue_size=${res.queue_size ?? "?"}`);
