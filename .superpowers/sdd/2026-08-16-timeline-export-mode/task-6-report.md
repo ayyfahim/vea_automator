@@ -309,5 +309,54 @@ Previous: `28d2371 feat: add timeline export core (sorted bricks, renderTimeline
 ### Commit
 - `fix: timeline polling stop guard and timer leak` — `git add videoexpress-manager.user.js .superpowers/sdd/2026-08-16-timeline-export-mode/task-6-report.md` then commit (this report appended).
 
+## Fix round 2 — 2026-08-16 (final review: merge-order bug)
+
+### Finding addressed
+- **videoexpress-manager.user.js:597 merge-order bug (parked Task 2) — Important/Must fix** — `renderTimeline` built `opts` as `{ name: sliced, quality:..., ...options }` so `...options` overwrote the sliced `name` with the unsliced `options.name`. Long name >80 bypassed truncation. Per report, fix is to move slice after spread.
+
+### Change
+- `videoexpress-manager.user.js:597-608` — `renderTimeline` opts now:
+  ```js
+  const opts = {
+    quality:"high", size:"1080", format:"mp4", aspect: config.aspect||"16:9", project_id:0, project_title:"",
+    ...options,
+    name: String(options.name || `timeline_${now}`).slice(0,80),
+  };
+  ```
+  Defaults use literal fallbacks (no `||` needed, spread overrides); `name` sliced after spread, so >80-char inputs are truncated. Minimal diff (8 lines, no other files).
+
+### Verification
+- `node --check videoexpress-manager.user.js` → PASS (exit 0)
+- `node --test tests/timeline-export.test.js` → **PASS 11/11** (6 suites, 0 fail)
+  ```
+  # tests 11
+  # suites 6
+  # pass 11
+  # fail 0
+  ```
+
+### Diff (fix round 2)
+```diff
+-        name: String(options.name || `timeline_${now}`).slice(0, 80),
+-        quality: options.quality || "high",
+-        size: options.size || "1080",
+-        format: options.format || "mp4",
+-        aspect: options.aspect || config.aspect || "16:9",
++        quality: "high",
++        size: "1080",
++        format: "mp4",
++        aspect: config.aspect || "16:9",
+         project_id: 0,
+         project_title: "",
+         ...options,
++        name: String(options.name || `timeline_${now}`).slice(0, 80),
+```
+
+### Commit
+- `fix: timeline render opts merge-order preserves name truncation` — `git add videoexpress-manager.user.js .superpowers/sdd/2026-08-16-timeline-export-mode/task-6-report.md`
+
+### Deferred (not merge-blocking, follow-up)
+- async setInterval overlap, stall seed, loadTimelineVideos guard — triaged as non-blocking per final review instruction; left as follow-up.
+
 ## Handoff
-Plan: `docs/superpowers/plans/2026-08-16-timeline-export-mode.md` Task 6 complete (fix round 1 applied). Next: Task 7 Final wiring / E2E per plan (depends on this polling + download).
+Plan: `docs/superpowers/plans/2026-08-16-timeline-export-mode.md` Task 6 complete (fix round 2 applied — merge-order bug fixed, 11/11 pass). Next: Task 7 Final wiring / E2E per plan (depends on this polling + download).

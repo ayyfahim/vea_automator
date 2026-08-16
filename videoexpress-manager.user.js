@@ -597,14 +597,14 @@
     async renderTimeline(bricks, options = {}) {
       const now = Date.now();
       const opts = {
-        name: String(options.name || `timeline_${now}`).slice(0, 80),
-        quality: options.quality || "high",
-        size: options.size || "1080",
-        format: options.format || "mp4",
-        aspect: options.aspect || config.aspect || "16:9",
+        quality: "high",
+        size: "1080",
+        format: "mp4",
+        aspect: config.aspect || "16:9",
         project_id: 0,
         project_title: "",
         ...options,
+        name: String(options.name || `timeline_${now}`).slice(0, 80),
       };
       const payload = buildTimelinePayload(bricks, opts, now);
       return postJson(`/render_project/tmp`, payload, "Render timeline");
