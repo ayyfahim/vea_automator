@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoExpress Library Manager
 // @namespace    https://app.videoexpress.ai/
-// @version      0.7.0
+// @version      0.7.1
 // @description  Manage folders, upload images, and batch convert images to videos inside VideoExpress AI.
 // @match        https://app.videoexpress.ai/*
 // @grant        none
@@ -1510,6 +1510,11 @@ function extractVideoIdFromStatus(payload) {
       <button class="ve-button ghost" id="ve-timeline-load-btn" type="button"><i class="bi bi-collection-play"></i> Load videos</button>
     </div>
     <div class="ve-row">
+      <button class="ve-button success" id="ve-timeline-add-completed-btn" type="button"><i class="bi bi-plus-circle"></i> Add Completed Generated</button>
+      <button class="ve-button ghost" id="ve-timeline-clear-btn" type="button"><i class="bi bi-x-lg"></i> Clear</button>
+    </div>
+    <div class="ve-muted" id="ve-timeline-completed-summary" style="margin-top:2px;margin-bottom:8px"></div>
+    <div class="ve-row">
       <input class="ve-input" id="ve-timeline-name" placeholder="Project name (e.g. timeline_2026)" />
       <select class="ve-select" id="ve-timeline-aspect">
         <option value="16:9">16:9</option><option value="9:16">9:16</option><option value="1:1">1:1</option>
@@ -1620,6 +1625,9 @@ function extractVideoIdFromStatus(payload) {
     retryAllSummary: root.querySelector("#ve-retry-all-summary"),
     timelineFolderSelect: root.querySelector("#ve-timeline-folder-select"),
     timelineLoadBtn: root.querySelector("#ve-timeline-load-btn"),
+    timelineAddCompletedBtn: root.querySelector("#ve-timeline-add-completed-btn"),
+    timelineClearBtn: root.querySelector("#ve-timeline-clear-btn"),
+    timelineCompletedSummary: root.querySelector("#ve-timeline-completed-summary"),
     timelineName: root.querySelector("#ve-timeline-name"),
     timelineAspect: root.querySelector("#ve-timeline-aspect"),
     timelineQuality: root.querySelector("#ve-timeline-quality"),
@@ -2054,6 +2062,17 @@ function extractVideoIdFromStatus(payload) {
     els.timelineBody.innerHTML = vids.length ? vids.slice(0,150).map((v,i)=>`
       <tr><td>${i+1}</td><td><div class="ve-media-cell"><div class="ve-thumb" style="background-image:url('${escapeAttr(v.thumbUrl||"")}')"></div><div><div class="ve-title-line">${escapeHtml(v.name||v.fileName||String(v.id))}</div><div class="ve-muted">${v.id} | ${escapeHtml(v.fileName||"")}</div></div></div></td><td>${escapeHtml(formatDuration(v.duration||v.duration_time||0))}</td></tr>
     `).join("") : `<tr><td colspan="3" class="ve-muted">Load videos first.</td></tr>`;
+    if (els.timelineCompletedSummary) {
+      const completedTotal = Object.values(state.history.records).filter((r)=> normalizeStatus(r && r.status)==="completed").length;
+      const completedScoped = state.selectedFolderId ? Object.values(state.history.records).filter((r)=> normalizeStatus(r && r.status)==="completed" && String(r.folderId)===String(state.selectedFolderId)).length : completedTotal;
+      const note = vids.length ? `${vids.length} on timeline` : "Timeline empty";
+      if (completedTotal) {
+        const scopeLabel = state.selectedFolderId ? ` — ${completedScoped} completed in this folder, ${completedTotal} total` : ` — ${completedTotal} completed total`;
+        els.timelineCompletedSummary.textContent = `${note}${scopeLabel}. Click "Add Completed Generated" to add them.`;
+      } else {
+        els.timelineCompletedSummary.textContent = `${note}. No completed generated videos yet — run queue first.`;
+      }
+    }
   }
 
   function escapeHtml(value) {
@@ -2269,6 +2288,118 @@ function extractVideoIdFromStatus(payload) {
     logLine(`Timeline: ${videos.length} videos sorted by name (chronological).`);
   }
 
+  async function addCompletedGeneratedToTimeline() {
+    const completedRecs = Object.values(state.history.records).filter(
+      (r) => r && normalizeStatus(r.status) === "completed"
+    );
+    if (!completedRecs.length) throw new Error("No completed generated videos found — run queue first and wait for status to become completed.");
+    // Scope: if a folder is selected, prefer its completed items, but allow fallback to all when empty
+    const selectedFolderId = state.selectedFolderId ? String(state.selectedFolderId) : "";
+    let scoped = selectedFolderId
+      ? completedRecs.filter((r) => String(r.folderId) === selectedFolderId)
+      : completedRecs.slice();
+    // If folder selected but no completed in that folder, offer all and log hint
+    if (selectedFolderId && !scoped.length) {
+      logLine(`No completed items in folder ${selectedFolderId} — showing completed from all folders (${completedRecs.length})`);
+      scoped = completedRecs.slice();
+    }
+    logLine(`Adding ${scoped.length} completed generated video(s) to timeline${selectedFolderId ? ` (folder ${selectedFolderId})` : " (all folders)"}...`);
+
+    // Resolve missing videoIds first (up to 20 at a time, then bulk)
+    const missing = scoped.filter((r) => !r.videoId && r.uuid);
+    if (missing.length) {
+      logLine(`Resolving ${missing.length} missing videoId(s) before adding to timeline...`);
+      try {
+        const toResolve = missing.length > 20 ? missing.slice(0, 20) : missing;
+        await resolveMissingVideoIdsViaStatus(toResolve);
+        const still = toResolve.filter((r) => !r.videoId);
+        if (still.length) {
+          const uuids = still.map((r) => r.uuid);
+          const aiMap = await fetchAiVideosMap(uuids, { skipStatusFallback: true });
+          for (const rec of still) {
+            const u = String(rec.uuid).toLowerCase().trim();
+            if (aiMap.has(u)) {
+              const m = aiMap.get(u);
+              const vid = String(m.id || m.videoId || "");
+              if (vid) { rec.videoId = vid; setRecord(rec.folderId, rec.imageId, { ...rec, videoId: vid, updatedAt: new Date().toISOString() }); }
+            }
+          }
+        }
+        const stillAfter = scoped.filter((r) => !r.videoId && r.uuid);
+        if (stillAfter.length) logLine(`Still missing videoId for ${stillAfter.length} item(s) — they will be skipped`);
+      } catch (e) {
+        logLine(`Resolve error while preparing timeline add: ${e.message}`);
+      }
+    }
+
+    const withId = scoped.filter((r) => r.videoId);
+    if (!withId.length) throw new Error(`All ${scoped.length} completed items are missing videoId — try again in ~15s or check Activity log`);
+    // Sort by queue position (chronological generation order), fallback to completedAt
+    withId.sort((a, b) => {
+      const posA = getQueuePositionForMedia(a.imageId);
+      const posB = getQueuePositionForMedia(b.imageId);
+      if (posA != null && posB != null) return posA - posB;
+      if (posA != null) return -1;
+      if (posB != null) return 1;
+      const tA = a.completedAt ? new Date(a.completedAt).getTime() : 0;
+      const tB = b.completedAt ? new Date(b.completedAt).getTime() : 0;
+      return tA - tB;
+    });
+
+    // Fetch video metadata from AI library so bricks have path/thumb/duration
+    let aiMapById = new Map();
+    let aiMapByUuid = new Map();
+    try {
+      const fullMap = await fetchAiVideosMap();
+      for (const v of fullMap.values()) {
+        aiMapById.set(String(v.id), v);
+        if (v.uuid) aiMapByUuid.set(String(v.uuid).toLowerCase().trim(), v);
+      }
+    } catch (e) {
+      logLine(`AI library fetch failed, using history fallback: ${e.message}`);
+    }
+
+    const existingIds = new Set((state.timelineVideos || []).map((v) => String(v.id)));
+    let added = 0;
+    let skipped = 0;
+    for (const rec of withId) {
+      const vid = String(rec.videoId);
+      if (existingIds.has(vid)) { skipped++; continue; }
+      let video = aiMapById.get(vid) || (rec.uuid ? aiMapByUuid.get(String(rec.uuid).toLowerCase().trim()) : null);
+      if (!video) {
+        // Fallback synthetic entry — still stitchable if server accepts media_id only, but warn
+        video = {
+          id: vid,
+          uuid: rec.uuid || "",
+          name: rec.imageName || `video_${vid}`,
+          fileName: rec.imageFileName || `${vid}.mp4`,
+          duration: 5000,
+          thumbUrl: "",
+          path: "",
+          videoUrl: "",
+          imageUrl: "",
+        };
+        logLine(`Using synthetic metadata for ${rec.imageName || vid} (not found in AI library)`);
+      }
+      state.timelineVideos.push(video);
+      existingIds.add(vid);
+      added++;
+    }
+    // Keep stitch order chronological by name (numeric) + retain generation order for ties
+    state.timelineVideos.sort(compareMediaName);
+    renderTimelineExport();
+    updateButtonStates();
+    logLine(`Added ${added} completed video(s) to timeline${skipped ? ` (${skipped} already present)` : ""} — total ${state.timelineVideos.length}`);
+  }
+
+  function clearTimelineVideos() {
+    const n = (state.timelineVideos || []).length;
+    state.timelineVideos = [];
+    renderTimelineExport();
+    updateButtonStates();
+    logLine(n ? `Cleared ${n} video(s) from timeline stitch list` : "Timeline already empty");
+  }
+
   function isTimelinePollCompleted(progressRes) {
     const pct = Number(progressRes?.percent ?? 0);
     const qs = progressRes?.queue_status || {};
@@ -2462,7 +2593,7 @@ function extractVideoIdFromStatus(payload) {
     renderTimelineExport(); updateButtonStates();
   }
   if (typeof window !== "undefined") {
-    window.__ve_test = Object.assign(window.__ve_test || {}, { loadTimelineVideos, exportTimeline, stopTimelineExport, startTimelineProgressPolling, isTimelinePollCompleted, checkTimelineResult, downloadTimelineResult });
+    window.__ve_test = Object.assign(window.__ve_test || {}, { loadTimelineVideos, addCompletedGeneratedToTimeline, clearTimelineVideos, exportTimeline, stopTimelineExport, startTimelineProgressPolling, isTimelinePollCompleted, checkTimelineResult, downloadTimelineResult });
   }
 
   async function createFolder() {
@@ -3243,6 +3374,9 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     if (els.timelineStopBtn) els.timelineStopBtn.disabled = !state.timelineExport.running;
     if (els.timelineDownloadBtn) els.timelineDownloadBtn.disabled = state.downloadInProgress || !state.timelineExport.exportedVideo;
     if (els.timelineLoadBtn) els.timelineLoadBtn.disabled = state.timelineExport.running || state.downloadInProgress;
+    const completedTotalForBtn = Object.values(state.history.records).filter((r)=> normalizeStatus(r && r.status)==="completed").length;
+    if (els.timelineAddCompletedBtn) els.timelineAddCompletedBtn.disabled = state.timelineExport.running || state.downloadInProgress || completedTotalForBtn === 0;
+    if (els.timelineClearBtn) els.timelineClearBtn.disabled = state.timelineExport.running || !hasVideos;
     els.masterPromptEnabled.disabled = state.running;
     els.promptListEnabled.disabled = state.running;
     updateMasterPromptControls();
@@ -3526,6 +3660,8 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       els.retryAllFailedBtn.addEventListener("click", () => handleAction(retryAllFailed));
     }
     if (els.timelineLoadBtn) els.timelineLoadBtn.addEventListener("click", () => handleAction(loadTimelineVideos));
+    if (els.timelineAddCompletedBtn) els.timelineAddCompletedBtn.addEventListener("click", () => handleAction(addCompletedGeneratedToTimeline));
+    if (els.timelineClearBtn) els.timelineClearBtn.addEventListener("click", () => { clearTimelineVideos(); });
     if (els.timelineExportBtn) els.timelineExportBtn.addEventListener("click", () => handleAction(exportTimeline));
     if (els.timelineStopBtn) els.timelineStopBtn.addEventListener("click", () => { stopTimelineExport(); });
     if (els.timelineDownloadBtn) els.timelineDownloadBtn.addEventListener("click", () => handleAction(downloadTimelineResult));
