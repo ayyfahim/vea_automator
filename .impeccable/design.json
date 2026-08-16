@@ -4,44 +4,376 @@
   "title": "Design System: VideoExpress Library Manager",
   "extensions": {
     "colorMeta": {
-      "cut-orange": { "role": "primary", "displayName": "Flag Orange", "canonical": "#FF3B0A", "tonalRamp": ["#571505", "#8d2207", "#c32f0a", "#f34014", "#f56c4a", "#f89880", "#fbc4b6", "#feefec"] },
-      "cut-orange-deep": { "role": "primary", "displayName": "Flag Deep", "canonical": "#D12E04", "tonalRamp": ["#4a1203", "#7a1e04", "#ab2a06", "#dc3608", "#e85a37", "#f07e6b", "#f7a99b", "#fdeae6"] },
-      "cut-black": { "role": "neutral", "displayName": "True Black", "canonical": "#0A0A0D", "tonalRamp": ["#292933", "#424253", "#5b5b73", "#757592", "#9494ab", "#b4b4c4", "#d4d4dd", "#f4f4f6"] },
-      "cut-panel": { "role": "neutral", "displayName": "Panel", "canonical": "#0F1012", "tonalRamp": ["#2b2b30", "#464650", "#626270", "#7e7e8e", "#9b9ba7", "#b8b8c1", "#d6d6db", "#f4f4f5"] },
-      "cut-window": { "role": "neutral", "displayName": "Window", "canonical": "#F5F1EB", "tonalRamp": ["#3c3120", "#614f34", "#866d48", "#a88b5e", "#bca583", "#d0c0a8", "#e4dbcd", "#f8f5f2"] },
-      "cut-window-warm": { "role": "neutral", "displayName": "Window Warm", "canonical": "#F7F3EC", "tonalRamp": ["#3f321d", "#66522f", "#8c7141", "#b19056", "#c3a97d", "#d5c3a3", "#e7dcca", "#f9f6f1"] },
-      "cut-line": { "role": "neutral", "displayName": "Line", "canonical": "#1A1D20", "tonalRamp": ["#2a2e32", "#434a51", "#5d6770", "#78838f", "#97a0a8", "#b6bcc2", "#d5d8dc", "#f4f5f6"] },
-      "cut-line-soft": { "role": "neutral", "displayName": "Line Soft", "canonical": "#2A2E33", "tonalRamp": ["#2a2d32", "#444a51", "#5e6670", "#78828e", "#979fa8", "#b6bbc2", "#d5d8dc", "#f4f5f6"] },
-      "cut-border-warm": { "role": "neutral", "displayName": "Border Warm", "canonical": "#D8D0C2", "tonalRamp": ["#373025", "#594e3c", "#7b6c52", "#9c8a6b", "#b2a58d", "#c9c0af", "#e0dad1", "#f7f5f3"] },
-      "cut-border-warm-2": { "role": "neutral", "displayName": "Border Warm 2", "canonical": "#E0D8CC", "tonalRamp": ["#3a3328", "#5d523f", "#817158", "#a49072", "#b7ac93", "#cac7b4", "#dcd9d0", "#f0ede8"] },
-      "cut-ink": { "role": "neutral", "displayName": "Ink", "canonical": "#1A1A18", "tonalRamp": ["#2e2e2c", "#4b4b47", "#686862", "#85857e", "#a1a19b", "#bdbdb7", "#dadad7", "#f6f6f4"] },
-      "cut-muted": { "role": "neutral", "displayName": "Muted", "canonical": "#5A5752", "tonalRamp": ["#2c2b29", "#474642", "#63625c", "#7f7d78", "#9c9b97", "#b9b8b5", "#d6d5d3", "#f3f2f1"] },
-      "cut-muted-light": { "role": "neutral", "displayName": "Muted Light", "canonical": "#6B6760", "tonalRamp": ["#2e2d2b", "#4a4946", "#666561", "#83827f", "#a1a09d", "#bebdbc", "#dbdbda", "#f7f6f5"] },
-      "success": { "role": "success", "displayName": "Success", "canonical": "#0EA768", "tonalRamp": ["#0b5134", "#128354", "#19b575", "#25e194", "#57e8ac", "#89efc5", "#bbf6de", "#edfdf6"] },
-      "warn": { "role": "warn", "displayName": "Warn", "canonical": "#FFC83D", "tonalRamp": ["#574005", "#8d6707", "#c38f0a", "#f3b314", "#f5c54a", "#f8d680", "#fbe7b6", "#fef9ec"] },
-      "danger-ink": { "role": "danger", "displayName": "Danger Ink", "canonical": "#1A1A1E", "tonalRamp": ["#2a2a2e", "#44444c", "#5f5f6a", "#7a7a8a", "#9797a3", "#b4b4bc", "#d2d2d6", "#f0f0f1"] }
+      "cut-orange": {
+        "role": "primary",
+        "displayName": "VideoExpress Violet",
+        "canonical": "#7C3AED",
+        "tonalRamp": [
+          "#3b1a6b",
+          "#5a2ab2",
+          "#7C3AED",
+          "#8B5CF6",
+          "#a78bfa",
+          "#c4b5fd",
+          "#ddd6fe",
+          "#f5f3ff"
+        ]
+      },
+      "cut-orange-deep": {
+        "role": "primary",
+        "displayName": "Violet Deep",
+        "canonical": "#6D28D9",
+        "tonalRamp": [
+          "#4a1203",
+          "#7a1e04",
+          "#ab2a06",
+          "#dc3608",
+          "#e85a37",
+          "#f07e6b",
+          "#f7a99b",
+          "#fdeae6"
+        ]
+      },
+      "cut-black": {
+        "role": "neutral",
+        "displayName": "True Black",
+        "canonical": "#0A0A0D",
+        "tonalRamp": [
+          "#292933",
+          "#424253",
+          "#5b5b73",
+          "#757592",
+          "#9494ab",
+          "#b4b4c4",
+          "#d4d4dd",
+          "#f4f4f6"
+        ]
+      },
+      "cut-panel": {
+        "role": "neutral",
+        "displayName": "Panel Light",
+        "canonical": "#F3F4F6",
+        "tonalRamp": [
+          "#1f2937",
+          "#374151",
+          "#4b5563",
+          "#6b7280",
+          "#9ca3af",
+          "#d1d5db",
+          "#e5e7eb",
+          "#f9fafb"
+        ]
+      },
+      "cut-window": {
+        "role": "neutral",
+        "displayName": "Window",
+        "canonical": "#FFFFFF",
+        "tonalRamp": [
+          "#e5e7eb",
+          "#f3f4f6",
+          "#ffffff",
+          "#ffffff",
+          "#ffffff",
+          "#ffffff",
+          "#ffffff",
+          "#ffffff"
+        ]
+      },
+      "cut-window-warm": {
+        "role": "neutral",
+        "displayName": "Window Warm",
+        "canonical": "#F7F3EC",
+        "tonalRamp": [
+          "#3f321d",
+          "#66522f",
+          "#8c7141",
+          "#b19056",
+          "#c3a97d",
+          "#d5c3a3",
+          "#e7dcca",
+          "#f9f6f1"
+        ]
+      },
+      "cut-line": {
+        "role": "neutral",
+        "displayName": "Line",
+        "canonical": "#E5E7EB",
+        "tonalRamp": [
+          "#2a2e32",
+          "#434a51",
+          "#5d6770",
+          "#78838f",
+          "#97a0a8",
+          "#b6bcc2",
+          "#d5d8dc",
+          "#f4f5f6"
+        ]
+      },
+      "cut-line-soft": {
+        "role": "neutral",
+        "displayName": "Line Soft",
+        "canonical": "#D1D5DB",
+        "tonalRamp": [
+          "#2a2d32",
+          "#444a51",
+          "#5e6670",
+          "#78828e",
+          "#979fa8",
+          "#b6bbc2",
+          "#d5d8dc",
+          "#f4f5f6"
+        ]
+      },
+      "cut-border-warm": {
+        "role": "neutral",
+        "displayName": "Border Warm",
+        "canonical": "#E5E7EB",
+        "tonalRamp": [
+          "#373025",
+          "#594e3c",
+          "#7b6c52",
+          "#9c8a6b",
+          "#b2a58d",
+          "#c9c0af",
+          "#e0dad1",
+          "#f7f5f3"
+        ]
+      },
+      "cut-border-warm-2": {
+        "role": "neutral",
+        "displayName": "Border Warm 2",
+        "canonical": "#E0D8CC",
+        "tonalRamp": [
+          "#3a3328",
+          "#5d523f",
+          "#817158",
+          "#a49072",
+          "#b7ac93",
+          "#cac7b4",
+          "#dcd9d0",
+          "#f0ede8"
+        ]
+      },
+      "cut-ink": {
+        "role": "neutral",
+        "displayName": "Ink",
+        "canonical": "#111827",
+        "tonalRamp": [
+          "#2e2e2c",
+          "#4b4b47",
+          "#686862",
+          "#85857e",
+          "#a1a19b",
+          "#bdbdb7",
+          "#dadad7",
+          "#f6f6f4"
+        ]
+      },
+      "cut-muted": {
+        "role": "neutral",
+        "displayName": "Muted",
+        "canonical": "#6B7280",
+        "tonalRamp": [
+          "#2c2b29",
+          "#474642",
+          "#63625c",
+          "#7f7d78",
+          "#9c9b97",
+          "#b9b8b5",
+          "#d6d5d3",
+          "#f3f2f1"
+        ]
+      },
+      "cut-muted-light": {
+        "role": "neutral",
+        "displayName": "Muted Light",
+        "canonical": "#9CA3AF",
+        "tonalRamp": [
+          "#2e2d2b",
+          "#4a4946",
+          "#666561",
+          "#83827f",
+          "#a1a09d",
+          "#bebdbc",
+          "#dbdbda",
+          "#f7f6f5"
+        ]
+      },
+      "success": {
+        "role": "success",
+        "displayName": "Success",
+        "canonical": "#0EA768",
+        "tonalRamp": [
+          "#0b5134",
+          "#128354",
+          "#19b575",
+          "#25e194",
+          "#57e8ac",
+          "#89efc5",
+          "#bbf6de",
+          "#edfdf6"
+        ]
+      },
+      "warn": {
+        "role": "warn",
+        "displayName": "Warn",
+        "canonical": "#FFC83D",
+        "tonalRamp": [
+          "#574005",
+          "#8d6707",
+          "#c38f0a",
+          "#f3b314",
+          "#f5c54a",
+          "#f8d680",
+          "#fbe7b6",
+          "#fef9ec"
+        ]
+      },
+      "danger-ink": {
+        "role": "danger",
+        "displayName": "Danger Ink",
+        "canonical": "#1A1A1E",
+        "tonalRamp": [
+          "#2a2a2e",
+          "#44444c",
+          "#5f5f6a",
+          "#7a7a8a",
+          "#9797a3",
+          "#b4b4bc",
+          "#d2d2d6",
+          "#f0f0f1"
+        ]
+      },
+      "bench-orange": {
+        "role": "primary",
+        "displayName": "Bench Red",
+        "canonical": "#FF3B0A",
+        "tonalRamp": [
+          "#571505",
+          "#8d2207",
+          "#c32f0a",
+          "#f34014",
+          "#f56c4a",
+          "#f89880",
+          "#fbc4b6",
+          "#feefec"
+        ]
+      },
+      "bench-black": {
+        "role": "primary",
+        "displayName": "Bench Black",
+        "canonical": "#0A0A0D",
+        "tonalRamp": [
+          "#292933",
+          "#424253",
+          "#5b5b73",
+          "#757592",
+          "#9494ab",
+          "#b4b4c4",
+          "#d4d4dd",
+          "#f4f4f6"
+        ]
+      },
+      "teal-accent": {
+        "role": "primary",
+        "displayName": "Teal",
+        "canonical": "#0F766E",
+        "tonalRamp": [
+          "#0b2e2b",
+          "#0f4a45",
+          "#0f766e",
+          "#14b8a6",
+          "#2dd4bf",
+          "#5eead4",
+          "#99f6e4",
+          "#ccfbf1"
+        ]
+      },
+      "amber-accent": {
+        "role": "primary",
+        "displayName": "Amber",
+        "canonical": "#D97706",
+        "tonalRamp": [
+          "#3b1a04",
+          "#6b2f05",
+          "#92400e",
+          "#d97706",
+          "#f59e0b",
+          "#fbbf24",
+          "#fde68a",
+          "#fef3c7"
+        ]
+      }
     },
     "typographyMeta": {
-      "display": { "displayName": "Display", "purpose": "Panel title on orange — Barlow Condensed 17px 700 caps." },
-      "headline": { "displayName": "Headline", "purpose": "Section titles on windows — Barlow 12px 700 caps with warm divider." },
-      "title": { "displayName": "Title", "purpose": "Rail tabs and table heads — Barlow 11px caps, mono 9.5 for th." },
-      "body": { "displayName": "Body", "purpose": "Inputs and title-lines — Instrument Sans 12.5px on white." },
-      "label": { "displayName": "Label", "purpose": "Badges and stats mono caps — JetBrains 10px." },
-      "mono": { "displayName": "Mono", "purpose": "Log and textarea — JetBrains 11px on black." }
+      "display": {
+        "displayName": "Display",
+        "purpose": "Panel title on orange \u2014 Barlow Condensed 17px 700 caps."
+      },
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "Section titles on windows \u2014 Barlow 12px 700 caps with warm divider."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Rail tabs and table heads \u2014 Barlow 11px caps, mono 9.5 for th."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Inputs and title-lines \u2014 Instrument Sans 12.5px on white."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Badges and stats mono caps \u2014 JetBrains 10px."
+      },
+      "mono": {
+        "displayName": "Mono",
+        "purpose": "Log and textarea \u2014 JetBrains 11px on black."
+      }
     },
     "shadows": [
-      { "name": "panel-throw", "value": "0 22px 70px rgba(0,0,0,0.72)", "purpose": "Single throw for panel — bench onto host, no card blur." },
-      { "name": "hard-edge", "value": "0 1px 0 #000", "purpose": "Window hairline edge — pin, not glow." },
-      { "name": "hard-edge-2", "value": "0 2px 0 #000", "purpose": "Active folder pin." }
+      {
+        "name": "panel-throw",
+        "value": "0 22px 70px rgba(0,0,0,0.72)",
+        "purpose": "Single throw for panel \u2014 bench onto host, no card blur."
+      },
+      {
+        "name": "hard-edge",
+        "value": "0 1px 0 #000",
+        "purpose": "Window hairline edge \u2014 pin, not glow."
+      },
+      {
+        "name": "hard-edge-2",
+        "value": "0 2px 0 #000",
+        "purpose": "Active folder pin."
+      }
     ],
     "motion": [
-      { "name": "step-in", "value": "0.16s steps(2)", "purpose": "Panel and tab in — bench hinge, no easing." },
-      { "name": "rail-lift", "value": "transform 0.06s steps(2)", "purpose": "Button lift on orange." },
-      { "name": "progress-step", "value": "width 0.2s steps(2)", "purpose": "Progress fill stepped." }
+      {
+        "name": "step-in",
+        "value": "0.16s steps(2)",
+        "purpose": "Panel and tab in \u2014 bench hinge, no easing."
+      },
+      {
+        "name": "rail-lift",
+        "value": "transform 0.06s steps(2)",
+        "purpose": "Button lift on orange."
+      },
+      {
+        "name": "progress-step",
+        "value": "width 0.2s steps(2)",
+        "purpose": "Progress fill stepped."
+      }
     ],
     "breakpoints": [
-      { "name": "rail-wrap", "value": "700px" },
-      { "name": "mobile", "value": "640px" }
+      {
+        "name": "rail-wrap",
+        "value": "700px"
+      },
+      {
+        "name": "mobile",
+        "value": "640px"
+      }
     ]
   },
   "components": [
@@ -49,7 +381,7 @@
       "name": "Primary Button",
       "kind": "button",
       "refersTo": "button-primary",
-      "description": "Flag orange on black — Run / Download.",
+      "description": "Flag orange on black \u2014 Run / Download.",
       "html": "<button class=\"ds-btn-primary\">RUN QUEUE</button>",
       "css": ".ds-btn-primary { background: #FF3B0A; color: #fff; border: 1.5px solid #000; border-radius: 1px; padding: 9px 10px; font-family: 'Barlow Condensed', sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; } .ds-btn-primary:hover { background: #FF4D1A; transform: translateY(-1px); box-shadow: 0 3px 0 #000; }"
     },
@@ -81,7 +413,7 @@
       "name": "Running Badge",
       "kind": "chip",
       "refersTo": "badge-running",
-      "description": "Orange flag — running state mark.",
+      "description": "Orange flag \u2014 running state mark.",
       "html": "<span class=\"ds-badge-running\">RUNNING</span>",
       "css": ".ds-badge-running { display: inline-flex; align-items: center; gap: 5px; padding: 3px 6px; background: #FF3B0A; color: #fff; border: 1px solid #000; border-radius: 1px; font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; text-transform: uppercase; }"
     },
@@ -127,32 +459,48 @@
     }
   ],
   "narrative": {
-    "northStar": "The Cutting Bench Select Rail",
-    "overview": "The bench, not a card deck. True-black field (#0A0A0D) crossed by a flag-orange perforated rail. The rail is the primary device: a 44px orange bar with an 8px sprocket row, holding six frame-label tabs. Below, every section is a punched white window (#F5F1EB with 7px black rivets) and every folder is a frame cell. The bench lamp is orange; the work is white on black. Motion is stepped (90ms steps(2)), scrub snaps to perforation pitch.",
+    "northStar": "The Cutting Bench Select Rail \u2014 now site-matched by default",
+    "overview": "Batch deck \u2014 site-matched VideoExpress violet #7C3AED on light #F3F4F6/#FFFFFF by default; bench red #FF3B0A on #0A0A0D retained as opt-in, plus teal and amber dark variants via header picker (Barlow Condensed 11px). Rail is 44px perforated, windows punched with 7px rivets.",
     "keyCharacteristics": [
-      "Select rail as queue — position is physical, status is a mark not a hue.",
-      "Drenched accent — orange holds 33% via header + rail + progress + flags.",
-      "One ink, one flag, one window — #0A0A0D / #FF3B0A / #F5F1EB.",
-      "Perforated topology — rail fixed 44px, sections string along it; deferred hangs on pins.",
-      "Condensed grotesk caps + mono data — rank by count, hairline ticks."
+      "Select rail as queue \u2014 position is physical, status is a mark not a hue.",
+      "Drenched accent \u2014 orange holds 33% via header + rail + progress + flags.",
+      "One ink, one flag, one window \u2014 #0A0A0D / #FF3B0A / #F5F1EB.",
+      "Perforated topology \u2014 rail fixed 44px, sections string along it; deferred hangs on pins.",
+      "Condensed grotesk caps + mono data \u2014 rank by count, hairline ticks."
     ],
     "rules": [
-      { "name": "The One Third Rule", "body": "Flag orange holds 33% — header + rail + progress + 3px stat flags. If heavier, remove orange.", "section": "colors" },
-      { "name": "The Mark Not Hue Rule", "body": "Status is a physical mark, not a new hue: grease cross, punched corner, tape band, folded flag, pin.", "section": "colors" },
-      { "name": "The One Size Rule", "body": "One size of condensed grotesk does labeling; rank is cell count not type size.", "section": "typography" },
-      { "name": "The No Glow Rule", "body": "No soft blur beyond single panel throw. Elevation is hard edge; glow is decoration.", "section": "elevation" }
+      {
+        "name": "The One Third Rule",
+        "body": "Flag orange holds 33% \u2014 header + rail + progress + 3px stat flags. If heavier, remove orange.",
+        "section": "colors"
+      },
+      {
+        "name": "The Mark Not Hue Rule",
+        "body": "Status is a physical mark, not a new hue: grease cross, punched corner, tape band, folded flag, pin.",
+        "section": "colors"
+      },
+      {
+        "name": "The One Size Rule",
+        "body": "One size of condensed grotesk does labeling; rank is cell count not type size.",
+        "section": "typography"
+      },
+      {
+        "name": "The No Glow Rule",
+        "body": "No soft blur beyond single panel throw. Elevation is hard edge; glow is decoration.",
+        "section": "elevation"
+      }
     ],
     "dos": [
-      "Do keep orange at 1/3 — header + rail + progress + flag.",
+      "Do keep orange at 1/3 \u2014 header + rail + progress + flag.",
       "Do use punched windows with rivets for every section.",
-      "Do keep caps and hairlines — Barlow caps, 1.5px #000 on orange, 1px #1A1D20 on white.",
+      "Do keep caps and hairlines \u2014 Barlow caps, 1.5px #000 on orange, 1px #1A1D20 on white.",
       "Do express state as a mark in the 7px box.",
       "Do keep radius 1px (panel 2px).",
       "Do preserve sprocket row at top:4px.",
       "Do use mono for data."
     ],
     "donts": [
-      "Don't revive the light Control Deck — #f7f9fc/#22a7f0 soft blur is anti-reference.",
+      "Don't revive the light Control Deck \u2014 #f7f9fc/#22a7f0 soft blur is anti-reference.",
       "Don't add gradients, glass, or 999px pills.",
       "Don't add a new hue alongside orange.",
       "Don't use Inter, Space Grotesk, IBM Plex, DM Sans as display.",

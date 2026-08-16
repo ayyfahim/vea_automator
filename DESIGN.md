@@ -2,22 +2,27 @@
 name: VideoExpress Library Manager
 description: Batch deck for image → video — a film cutting bench select rail translated to a fixed panel.
 colors:
-  cut-orange: "#FF3B0A"
-  cut-orange-deep: "#D12E04"
-  cut-black: "#0A0A0D"
-  cut-panel: "#0F1012"
-  cut-window: "#F5F1EB"
-  cut-window-warm: "#F7F3EC"
-  cut-line: "#1A1D20"
-  cut-line-soft: "#2A2E33"
-  cut-border-warm: "#D8D0C2"
-  cut-border-warm-2: "#E0D8CC"
-  cut-ink: "#1A1A18"
-  cut-muted: "#5A5752"
-  cut-muted-light: "#6B6760"
+  cut-orange: "#7C3AED"
+  cut-orange-deep: "#6D28D9"
+  cut-orange-soft: "#8B5CF6"
+  cut-black: "#111827"
+  cut-panel: "#F3F4F6"
+  cut-window: "#FFFFFF"
+  cut-window-warm: "#F9FAFB"
+  cut-line: "#E5E7EB"
+  cut-line-soft: "#D1D5DB"
+  cut-border-warm: "#E5E7EB"
+  cut-border-warm-2: "#E5E7EB"
+  cut-ink: "#111827"
+  cut-muted: "#6B7280"
+  cut-muted-light: "#9CA3AF"
   success: "#0EA768"
-  warn: "#FFC83D"
-  danger-ink: "#1A1A1E"
+  warn: "#F59E0B"
+  danger-ink: "#111827"
+  bench-orange: "#FF3B0A"
+  bench-black: "#0A0A0D"
+  teal-accent: "#0F766E"
+  amber-accent: "#D97706"
 typography:
   display:
     fontFamily: "'Barlow Condensed', 'Instrument Sans', system-ui, sans-serif"
@@ -129,8 +134,8 @@ The world holds orange at one third of the surface — header + rail + progress 
 
 **Key Characteristics:**
 - Select rail as queue — position is physical, status is a mark (grease cross, punched corner, tape band, folded flag, pin) not a hue.
-- Drenched accent done right — orange owns header and rail at 33% coverage; everything else is black or punched white.
-- One ink, one flag, one window — `#0A0A0D` / `#FF3B0A` / `#F5F1EB`; success `#0EA768` and warn `#FFC83D` only for semantic badges.
+- Site-matched default — VideoExpress violet `#7C3AED` on light `#F3F4F6`/`#FFFFFF` by default; bench red retained as opt-in, plus teal and amber dark variants via picker.
+- One ink, one flag, one window per palette — light or dark field with 33% accent; success `#0EA768` and warn `#F59E0B` only for semantic badges.
 - Perforated topology — rail fixed at 44px, sections string along it; deferred items hang on pins below.
 - Condensed grotesk caps + mono data — rank by count, ticks hairline, no marketing radius.
 
@@ -139,8 +144,8 @@ The world holds orange at one third of the surface — header + rail + progress 
 One ink, one flag, one window — the bench's material honesty. Orange is never scattered; it holds broad regions.
 
 ### Primary
-- **Flag Orange** (#FF3B0A): Header, rail, primary button, running badge, progress fill, folder active top rule. Coarse film grain on true black; holds 1/3 of any viewport. Deep variant #D12E04 for pressed, soft #FF4D1A for hover.
-- **Flag Orange Deep** (#D12E04): Pressed state for rail-adjacent controls.
+- **VideoExpress Violet** (#7C3AED): Default flag — header, rail, primary button, running badge, progress fill, folder active top rule. Holds 1/3 of light panel `#F3F4F6`/`#FFFFFF`. Deep #6D28D9 for pressed, soft #8B5CF6 for hover. **Bench Red #FF3B0A retained as `bench` palette** (see Palettes).
+- **Violet Deep** (#6D28D9): Pressed state for rail-adjacent controls (bench deep #D12E04).
 
 ### Secondary
 - **Success Green** (#0EA768): `completed` badge and success button only. White text, black border.
@@ -160,8 +165,17 @@ One ink, one flag, one window — the bench's material honesty. Orange is never 
 - **Placeholder** (#6B6760): Input placeholder — same as muted-light, passes contrast on #fff.
 
 ### Named Rules
-**The One Third Rule.** Flag orange holds 33% of the surface — header + rail + progress + 3px stat flags. If a screen feels orange-heavier, remove orange, don't add white.
-**The Mark Not Hue Rule.** Status is a physical mark, not a new color: grease cross `completed`, punched corner `failed`, tape band `submitted`, folded flag `running`, hung pin `deferred`. Never invent a new hue for state.
+**The One Third Rule.** Flag accent holds 33% — header + rail + progress + 3px stat flags. If heavier, remove accent.
+**The Mark Not Hue Rule.** Status is a physical mark, not a new color: grease cross `completed`, punched corner `failed`, tape band `submitted`, folded flag `running`, hung pin `deferred`.
+
+### Palettes (choosable via `#ve-theme-select`, persisted as `theme` in `videoexpress.manager.ui-state.v1`)
+Default is site-matched **VideoExpress** (`data-theme` absent) — `#7C3AED` header/rail on `#F3F4F6` panel / `#FFFFFF` windows. Retained **Bench Red** (`bench`) keeps original eye-soring `#FF3B0A` on `#0A0A0D` / `#F5F1EB` for users who prefer the cutting-bench contrast. Two additional dark variants:
+- **VideoExpress** (default): `--cut-orange #7C3AED`, `--cut-panel #F3F4F6`, `--cut-window #FFFFFF` / warm `#F9FAFB`, `--cut-line #E5E7EB`, `--cut-ink #111827` — light, violet, matches `app.videoexpress.ai` Save violet `#8B5CF6` / Export orange `#FF6B2B` and body `#D6DBE1`.
+- **Bench Red** (`bench`): `--cut-orange #FF3B0A` on `#0A0A0D` / `#F5F1EB` — original bench, dark grain, orange 1/3.
+- **Teal Dark** (`teal`): `--cut-orange #0F766E` on `#0B1A1F` / `#F0FDFA` — cool alt, same structure, teal flag on deep slate.
+- **Amber Warm** (`amber`): `--cut-orange #D97706` on `#292524` / `#FFFBEB` — warm alt, amber flag on warm charcoal.
+
+Picker is `Barlow Condensed 11px 700` in header (138px `ve-select`), `change` → `applyTheme()` → `root.setAttribute("data-theme",…)` or `removeAttribute` for default, persisted. All accent usages are `var(--cut-orange)` so theme swaps without re-render.
 
 ## Typography
 
