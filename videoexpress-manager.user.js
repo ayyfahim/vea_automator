@@ -1291,7 +1291,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
           </div>
           <div class="ve-context-right">
             <select id="ve-context-select" class="ve-context-select" title="Switch active folder"></select>
-            <button class="ve-button ghost small" id="ve-context-change-btn" type="button" style="padding:5px 7px; border:1px solid #fff; color:#fff; background:transparent;"><i class="bi bi-arrow-repeat"></i></button>
+            <button class="ve-button ghost small" id="ve-context-change-btn" type="button" style="padding:5px 7px; border:1px solid #E6E8EF; color:#111827; background:#fff;"><i class="bi bi-arrow-repeat"></i></button>
           </div>
         </div>
 
@@ -3860,6 +3860,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       config.timelineExportDefaults = { ...config.timelineExportDefaults, ...savedUi.timelineExportConfig };
     }
     if (typeof savedUi.timelineExportName === "string") state.timelineExport.projectName = savedUi.timelineExportName;
+    if (savedUi.onboardingDismissed && els.onboarding) els.onboarding.classList.add("ve-hidden");
     const todayStr = new Date().toISOString().slice(0, 10);
     state.videoFilters.dateFrom = todayStr;
     state.videoFilters.dateTo = todayStr;
