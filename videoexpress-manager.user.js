@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoExpress Library Manager
 // @namespace    https://app.videoexpress.ai/
-// @version      0.8.4
+// @version      0.9.0
 // @description  Manage folders, upload images, and batch convert images to videos inside VideoExpress AI.
 // @match        https://app.videoexpress.ai/*
 // @grant        none
@@ -53,10 +53,13 @@
       namePrefix: "timeline_",
       pollIntervalMs: 2000,
     },
+    autoExpireSessions: true,
+    sessionExpiryDays: 30,
   };
 
   const HISTORY_KEY = "videoexpress.manager.history.v1";
   const UI_STATE_KEY = "videoexpress.manager.ui-state.v1";
+  const SESSION_META_KEY = "videoexpress.manager.sessions.v1";
   let _queryUuidSupported = null; // cache probe for server-side uuid query support (I3)
 
   const state = {
@@ -215,6 +218,197 @@
     const next = { ...loadUiState(), ...patch };
     localStorage.setItem(UI_STATE_KEY, JSON.stringify(next, null, 2));
   }
+  // —— Sessions — unique naming + 30-day auto-expiry (only locally created) ——
+  function loadSessions() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(SESSION_META_KEY) || "{}");
+      if (raw && typeof raw === "object" && raw.sessions && typeof raw.sessions === "object") return raw;
+      if (Array.isArray(raw)) return { version: 1, sessions: {} };
+      return { version: 1, sessions: raw.sessions || {} };
+    } catch {
+      return { version: 1, sessions: {} };
+    }
+  }
+  function saveSessions(data) {
+    const toSave = data.sessions ? { version: 1, updatedAt: new Date().toISOString(), sessions: data.sessions } : { version: 1, updatedAt: new Date().toISOString(), sessions: data };
+    localStorage.setItem(SESSION_META_KEY, JSON.stringify(toSave, null, 2));
+  }
+  function isSessionFolder(folder) {
+    try {
+      const meta = loadSessions();
+      const id = String(folder && folder.id || "");
+      if (id && meta.sessions[id]) return true;
+      const name = String(folder && (folder.title || folder.name) || "").trim();
+      return Object.values(meta.sessions).some(s => s && String(s.folderName) === name);
+    } catch { return false; }
+  }
+  function sanitizeSessionBase(raw) {
+    let s = String(raw || "").trim();
+    if (!s) return "session";
+    s = s.replace(/\.[a-z0-9]+$/i, "");
+    s = s.replace(/[<>:"\/\\|?*\x00-\x1f]/g, " ");
+    s = s.replace(/\s+/g, " ").trim();
+    s = s.replace(/\s/g, "-").replace(/_+/g, "-").replace(/-+/g, "-");
+    s = s.replace(/^[-.]+|[-.]+$/g, "");
+    if (!s) s = "session";
+    if (s.length > 32) s = s.slice(0, 32).replace(/[-.]+$/g, "");
+    return s;
+  }
+  function generateSessionSuffix() {
+    const now = new Date();
+    const dd = String(now.getDate()).padStart(2, "0");
+    const mm = String(now.getMonth() + 1).padStart(2, "0");
+    const charset = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let uniq = "";
+    for (let i = 0; i < 4; i++) uniq += charset[Math.floor(Math.random() * charset.length)];
+    return `-${dd}${mm}-${uniq}`;
+  }
+  function isFolderNameTaken(name) {
+    const needle = String(name || "").trim().toLowerCase();
+    if (!needle) return false;
+    return (state.folders || []).some(f => {
+      const n = String(f.title || f.name || "").trim().toLowerCase();
+      return n === needle;
+    });
+  }
+  function buildSessionFolderName(rawBase) {
+    const base = sanitizeSessionBase(rawBase);
+    let suffix = generateSessionSuffix();
+    let candidate = `${base}${suffix}`;
+    let attempts = 0;
+    while (isFolderNameTaken(candidate) && attempts < 20) {
+      suffix = generateSessionSuffix();
+      candidate = `${base}${suffix}`;
+      attempts++;
+    }
+    if (isFolderNameTaken(candidate)) {
+      const ts = Date.now().toString(36).slice(-4).toUpperCase();
+      candidate = `${base}-${ts}`;
+      let t = 0;
+      while (isFolderNameTaken(candidate) && t < 10) {
+        candidate = `${base}-${ts}${t}`;
+        t++;
+      }
+    }
+    return candidate;
+  }
+  function isDuplicateFolderError(err) {
+    const msg = String(err && (err.bodyText || err.message) || "").toLowerCase();
+    return /duplicate|already exists|exists/.test(msg);
+  }
+  function updateSessionPreview() {
+    const input = document.getElementById("ve-session-name-input");
+    const out = document.getElementById("ve-session-preview-name");
+    if (!input || !out) return;
+    const raw = input.value.trim();
+    if (!raw) {
+      out.textContent = "\u2014";
+      out.style.color = "#9AA0B0";
+      return;
+    }
+    out.style.color = "var(--cut-orange)";
+    out.textContent = buildSessionFolderName(raw);
+  }
+  async function createSession(rawBase) {
+    const base = String(rawBase || "").trim();
+    if (!base) throw new Error("Session name is required.");
+    if (base.length < 2) throw new Error("Session name too short — use at least 2 characters.");
+    let folderName = buildSessionFolderName(base);
+    let lastErr = null;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        await api.createFolder(folderName);
+        lastErr = null;
+        break;
+      } catch (e) {
+        if (isDuplicateFolderError(e)) {
+          lastErr = e;
+          folderName = buildSessionFolderName(base);
+          logLine(`Name ${folderName} collided — shuffling unique suffix (attempt ${attempt + 2}/5)`);
+          continue;
+        }
+        throw e;
+      }
+    }
+    if (lastErr) throw lastErr;
+    await refreshFolders();
+    const created = state.folders.find(f => String(f.title || f.name) === folderName) || state.folders.find(f => String(f.name) === folderName);
+    const folderId = created ? String(created.id) : "";
+    if (created) {
+      state.selectedFolderId = created.id;
+      saveUiState({ selectedFolderId: created.id });
+      renderFolders();
+    }
+    try {
+      const meta = loadSessions();
+      const now = Date.now();
+      const expiresAt = now + Number(config.sessionExpiryDays || 30) * 24 * 60 * 60 * 1000;
+      const key = folderId || folderName;
+      meta.sessions[key] = {
+        folderId: folderId || null,
+        folderName,
+        baseName: sanitizeSessionBase(base),
+        createdAt: new Date(now).toISOString(),
+        expiresAt: new Date(expiresAt).toISOString(),
+        autoExpire: Boolean(config.autoExpireSessions),
+      };
+      saveSessions(meta);
+      if (config.autoExpireSessions) logLine(`Session "${folderName}" will auto-delete after ${config.sessionExpiryDays} days (only locally created)`);
+      else logLine(`Session "${folderName}" created — auto-delete is off`);
+    } catch (e) {
+      console.warn("[VE] session meta save failed", e);
+    }
+    return { folderName, folder: created };
+  }
+  async function checkExpiredSessions() {
+    if (!config.autoExpireSessions) return;
+    let meta;
+    try { meta = loadSessions(); } catch { return; }
+    const now = Date.now();
+    const entries = Object.entries(meta.sessions || {});
+    if (!entries.length) return;
+    let changed = false;
+    for (const [key, s] of entries) {
+      if (!s || !s.expiresAt || s.autoExpire === false) continue;
+      const exp = new Date(s.expiresAt).getTime();
+      if (!Number.isFinite(exp) || now < exp) continue;
+      const folderId = s.folderId ? String(s.folderId) : "";
+      const folderName = s.folderName || key;
+      let live = null;
+      if (folderId) live = (state.folders || []).find(f => String(f.id) === folderId);
+      if (!live) live = (state.folders || []).find(f => String(f.title || f.name) === folderName);
+      if (!live) {
+        delete meta.sessions[key];
+        changed = true;
+        logLine(`Cleaned expired session meta "${folderName}" — folder already gone`);
+        continue;
+      }
+      try {
+        logLine(`Auto-deleting expired session "${folderName}" (#${live.id}) + its assets after 30 days`);
+        await api.deleteFolder(live.id);
+        const prefix = `library:${config.libraryId}:folder:${live.id}:`;
+        Object.keys(state.history.records).forEach(k => { if (k.startsWith(prefix)) delete state.history.records[k]; });
+        saveHistory();
+        delete meta.sessions[key];
+        for (const k2 of Object.keys(meta.sessions)) {
+          const v2 = meta.sessions[k2];
+          if (v2 && String(v2.folderName) === folderName && k2 !== key) delete meta.sessions[k2];
+        }
+        changed = true;
+        await refreshFolders();
+        renderQueue();
+        logLine(`Expired session "${folderName}" deleted`);
+      } catch (e) {
+        logLine(`Auto-delete failed for "${folderName}": ${e.message}`);
+        s.expiresAt = new Date(now + 24*60*60*1000).toISOString();
+        changed = true;
+      }
+      await sleep(800);
+      if (changed) saveSessions(meta);
+    }
+    if (changed) saveSessions(meta);
+  }
+
 
   async function assertOk(response, label) {
     if (response.ok) return response;
@@ -1241,8 +1435,10 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
   .ve-progress { height: 6px; overflow: hidden; border-radius: 999px; background: #EFF0F3; border: 0; position: relative; }
   .ve-progress::before { display:none; }
   .ve-progress-bar { width: 0%; height: 100%; background: var(--cut-orange); transition: width 0.3s ease; position: relative; border-radius:999px; }
-  .ve-file-input { display: none; }
-  .ve-hidden { display: none !important; }
+   #ve-manager-root .ve-file-input, .ve-file-input { display: none !important; position: absolute !important; width: 1px !important; height: 1px !important; overflow: hidden !important; clip: rect(0,0,0,0) !important; clip-path: inset(50%) !important; white-space: nowrap !important; border: 0 !important; padding: 0 !important; margin: -1px !important; pointer-events: none !important; opacity: 0 !important; }
+   /* extra guard: any file input inside the panel that isn't styled as ve-file-input */
+   #ve-manager-root input[type="file"].ve-file-input { display: none !important; }
+   .ve-hidden { display: none !important; }
   #ve-manager-toggle { margin-top: 10px; margin-left: auto; display: block; width: 54px; height: 54px; border-radius: 2px; border: 1.5px solid #000; cursor: pointer; color: #fff; font-size: 18px; font-weight: 700; background: var(--cut-orange); box-shadow: 0 8px 22px rgba(0,0,0,0.45); font-family: 'Barlow Condensed', sans-serif; }
   #ve-manager-toggle:hover { filter: brightness(1.08); transform: translateY(-1px); }
   #ve-manager-toggle:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
@@ -1254,6 +1450,14 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
   .ve-collapsible { overflow:hidden; transition: max-height .2s ease; }
   .ve-collapsible.collapsed { max-height:0 !important; opacity:0; pointer-events:none; }
   .ve-collapsible.expanded { max-height:800px; opacity:1; }
+  /* Session creator — primary action, distilled */
+  #ve-session-section { border-color: var(--cut-line); }
+  #ve-session-preview { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+  #ve-session-preview-name { font-family:'JetBrains Mono',monospace; font-weight:700; color: var(--cut-orange); word-break:break-all; }
+  #ve-session-section .ve-field-label { color: var(--cut-ink); }
+  .ve-session-badge { display:inline-flex; align-items:center; gap:4px; font-family:'JetBrains Mono',monospace; font-size:8px; font-weight:700; letter-spacing:0.06em; text-transform:uppercase; background:#F3F0FF; color:var(--cut-orange); border:1px solid #E6E8EF; border-radius:4px; padding:2px 5px; }
+  .ve-folder-card.is-session { border-color: var(--cut-orange); }
+  .ve-folder-card.is-session::after { content:'SESSION'; position:absolute; top:6px; right:6px; font-family:'JetBrains Mono',monospace; font-size:7px; font-weight:700; letter-spacing:0.06em; color:#fff; background:var(--cut-orange); border:1px solid var(--cut-orange-deep); border-radius:4px; padding:1px 4px; line-height:1; }
   /* helper toolbar under context bar */
   .ve-toolbar { display:flex; gap:6px; margin-bottom:8px; }
   .ve-toolbar .ve-button{ flex:1; }
@@ -1315,31 +1519,58 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
 
         <!-- LIBRARY -->
         <div class="ve-tab-panel active" data-panel="library">
-          <div class="ve-section">
-            <div class="ve-section-title"><span><i class="bi bi-collection"></i> Folders <span class="ve-muted" style="font-family:'JetBrains Mono',monospace; font-size:9px; text-transform:none; letter-spacing:0;"><span id="ve-folder-count">5</span> in Library 4</span></span>
+          <!-- Session creator — primary -->
+          <div class="ve-section" id="ve-session-section">
+            <div class="ve-section-title"><span><i class="bi bi-lightning-charge"></i> New session</span><span class="ve-muted" style="font-family:'JetBrains Mono',monospace; font-size:9px;">auto-named · no duplicates</span></div>
+            <p class="ve-section-help">Name it once — we mint the folder with a date-stamped unique suffix so it never collides.</p>
+            <div class="ve-row" style="align-items:flex-end;">
+              <div style="flex:1; min-width:0;">
+                <label class="ve-field-label" for="ve-session-name-input">Session name</label>
+                <input class="ve-input" id="ve-session-name-input" placeholder="Session name" aria-label="Session name" autocomplete="off" />
+              </div>
+              <div style="flex:0 0 auto; display:flex; align-items:flex-end;">
+                <button class="ve-button primary" id="ve-create-session-btn" type="button"><i class="bi bi-plus-lg"></i> Create session</button>
+              </div>
+            </div>
+            <div class="ve-muted" id="ve-session-preview" style="margin-top:8px; background:#F9FAFB; border:1px solid #E6E8EF; border-radius:6px; padding:7px 9px; font-family:'JetBrains Mono',monospace; font-size:10.5px; line-height:1.4;">Will create: <strong id="ve-session-preview-name" style="color:var(--cut-orange); font-weight:700;">—</strong> <span style="color:#6B7280;">· preview updates as you type</span></div>
+            <label style="display:flex; align-items:center; gap:8px; cursor:pointer; background:#F9FAFB; border:1px solid #E6E8EF; border-radius:6px; padding:8px 9px; margin-top:8px; font-family:'Instrument Sans',sans-serif; font-size:11.5px; color:#111827;">
+              <input class="ve-checkbox" id="ve-auto-expire-toggle" type="checkbox" />
+              <span><b>Auto-delete after 30 days</b> <span style="color:#6B7280; font-weight:400;">— only for sessions you create here</span></span>
+            </label>
+            <p class="ve-field-hint" id="ve-session-hint" style="margin-top:6px;">Creates instantly, selects it, and queues it for expiry. Manage folders below.</p>
+          </div>
+
+          <!-- Library folders — accordion -->
+          <div class="ve-section" id="ve-folder-browser-section">
+            <div class="ve-section-title"><span><i class="bi bi-collection"></i> Library folders</span>
               <button class="ve-button ghost ve-icon-button" id="ve-refresh-btn" title="Refresh folders"><i class="bi bi-arrow-clockwise"></i></button>
             </div>
-            <p class="ve-section-help">Click a card to switch. New batch? Create a folder.</p>
-            <!-- hidden legacy selects kept for JS compatibility; visually hidden but present -->
-            <div class="ve-hidden">
-              <select class="ve-select" id="ve-folder-select"></select>
-              <select class="ve-select" id="ve-upload-folder-select"></select>
-              <select class="ve-select" id="ve-download-folder-select"></select>
-              <select class="ve-select" id="ve-timeline-folder-select"></select>
-            </div>
-            <div class="ve-folder-grid" id="ve-folder-grid"></div>
-            <div class="ve-row" style="margin-top:10px">
-              <div style="flex:1; min-width:0;">
-                <label class="ve-field-label" for="ve-new-folder-input">New folder name</label>
-                <input class="ve-input" id="ve-new-folder-input" placeholder="e.g. product-shots-04" aria-label="New folder name" />
+            <button class="ve-advanced-toggle" type="button" aria-expanded="false" id="ve-folder-browser-toggle"><span><i class="bi bi-folder2"></i> Browse & manage folders <span class="ve-muted" style="font-family:'JetBrains Mono',monospace; font-size:9px; text-transform:none; letter-spacing:0; margin-left:6px;"><span id="ve-folder-count">5</span> in Library 4</span></span><i class="bi bi-chevron-down"></i></button>
+            <div class="ve-collapsible collapsed" id="ve-folder-browser">
+              <div style="padding-top:10px">
+                <p class="ve-section-help" style="margin-bottom:8px;">Click a card to switch active folder. Sessions are marked <span style="font-family:'JetBrains Mono',monospace; font-size:9px; background:#F3F0FF; border:1px solid #E6E8EF; padding:1px 4px; border-radius:4px; color:var(--cut-orange);">SESSION</span></p>
+                <!-- hidden legacy selects kept for JS compatibility; visually hidden but present -->
+                <div class="ve-hidden">
+                  <select class="ve-select" id="ve-folder-select"></select>
+                  <select class="ve-select" id="ve-upload-folder-select"></select>
+                  <select class="ve-select" id="ve-download-folder-select"></select>
+                  <select class="ve-select" id="ve-timeline-folder-select"></select>
+                </div>
+                <div class="ve-folder-grid" id="ve-folder-grid"></div>
+                <div class="ve-row" style="margin-top:10px">
+                  <div style="flex:1; min-width:0;">
+                    <label class="ve-field-label" for="ve-new-folder-input">Manual folder name <span style="font-weight:400; text-transform:none; letter-spacing:0; color:#6B7280;">— advanced</span></label>
+                    <input class="ve-input" id="ve-new-folder-input" placeholder="e.g. product-shots-04" aria-label="New folder name" />
+                  </div>
+                  <div style="flex:0 0 auto; display:flex; align-items:flex-end; gap:6px;">
+                    <button class="ve-button ghost" id="ve-show-create-folder-btn" type="button" style="display:none;">focus</button>
+                    <button class="ve-button ghost" id="ve-create-folder-btn"><i class="bi bi-plus-lg"></i> Create folder</button>
+                  </div>
+                </div>
+                <div class="ve-row">
+                  <button class="ve-button danger" id="ve-delete-folder-btn" title="Delete the selected library folder — references only, not source files"><i class="bi bi-trash3"></i> Delete selected folder</button>
+                </div>
               </div>
-              <div style="flex:0 0 auto; display:flex; align-items:flex-end; gap:6px;">
-                <button class="ve-button ghost" id="ve-show-create-folder-btn" type="button" style="display:none;">focus</button>
-                <button class="ve-button success" id="ve-create-folder-btn"><i class="bi bi-plus-lg"></i> Create folder</button>
-              </div>
-            </div>
-            <div class="ve-row">
-              <button class="ve-button danger" id="ve-delete-folder-btn" title="Delete the selected library folder — references only, not source files"><i class="bi bi-trash3"></i> Delete selected folder</button>
             </div>
           </div>
 
@@ -1710,6 +1941,13 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     downloadFilters: root.querySelector("#ve-download-filters"),
     statusLine: root.querySelector("#ve-status-line"),
     filterCount: root.querySelector("#ve-filter-count"),
+    sessionNameInput: root.querySelector("#ve-session-name-input"),
+    createSessionBtn: root.querySelector("#ve-create-session-btn"),
+    sessionPreviewName: root.querySelector("#ve-session-preview-name"),
+    sessionPreview: root.querySelector("#ve-session-preview"),
+    autoExpireToggle: root.querySelector("#ve-auto-expire-toggle"),
+    folderBrowserToggle: root.querySelector("#ve-folder-browser-toggle"),
+    folderBrowser: root.querySelector("#ve-folder-browser"),
   };
 
   function logLine(message) {
@@ -1794,6 +2032,26 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       els.downloadFilters.classList.toggle("expanded", !exp);
     });
   }
+  if (els.folderBrowserToggle && els.folderBrowser) {
+    els.folderBrowserToggle.addEventListener("click", () => {
+      const exp = els.folderBrowserToggle.getAttribute("aria-expanded") === "true";
+      els.folderBrowserToggle.setAttribute("aria-expanded", String(!exp));
+      els.folderBrowser.classList.toggle("collapsed", exp);
+      els.folderBrowser.classList.toggle("expanded", !exp);
+      saveUiState({ folderBrowserOpen: !exp });
+    });
+  }
+  if (els.sessionNameInput) {
+    els.sessionNameInput.addEventListener("input", () => { updateSessionPreview(); updateButtonStates(); });
+    els.sessionNameInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); if (els.createSessionBtn && !els.createSessionBtn.disabled) els.createSessionBtn.click(); }});
+  }
+  if (els.autoExpireToggle) {
+    els.autoExpireToggle.addEventListener("change", () => {
+      config.autoExpireSessions = Boolean(els.autoExpireToggle.checked);
+      saveUiState({ autoExpireSessions: config.autoExpireSessions });
+      logLine(config.autoExpireSessions ? "Auto-delete after 30 days: ON (only locally created sessions)" : "Auto-delete after 30 days: OFF");
+    });
+  }
   if (els.fileDrop) {
     els.fileDrop.addEventListener("click", () => els.fileInput && els.fileInput.click());
     els.fileDrop.addEventListener("dragover", (e) => { e.preventDefault(); els.fileDrop.style.borderColor = "#6F5CCF"; });
@@ -1860,8 +2118,9 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
               String(folder.id) === String(state.selectedFolderId)
                 ? "active"
                 : "";
+            const sessionCls = isSessionFolder(folder) ? " is-session" : "";
             return `
-              <button class="ve-folder-card ${active}" data-folder-id="${folder.id}" type="button" title="${escapeHtml(folder.title || folder.name)}">
+              <button class="ve-folder-card ${active}${sessionCls}" data-folder-id="${folder.id}" type="button" title="${escapeHtml(folder.title || folder.name)}">
                 <i class="bi bi-folder2"></i>
                 <strong>${escapeHtml(folder.title || folder.name)}</strong>
                 <span class="ve-muted">${folder.id}</span>
@@ -3517,6 +3776,10 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     if (els.timelineClearBtn) els.timelineClearBtn.disabled = state.timelineExport.running || !hasVideos;
     els.masterPromptEnabled.disabled = state.running;
     els.promptListEnabled.disabled = state.running;
+    if (els.createSessionBtn) {
+      const raw = els.sessionNameInput ? els.sessionNameInput.value.trim() : "";
+      els.createSessionBtn.disabled = state.running || state.uploadInProgress || state.downloadInProgress || !raw || raw.length < 2;
+    }
     updateMasterPromptControls();
   }
 
@@ -3604,6 +3867,22 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     els.createFolderBtn.addEventListener("click", () =>
       handleAction(createFolder),
     );
+    if (els.createSessionBtn) {
+      els.createSessionBtn.addEventListener("click", () =>
+        handleAction(async () => {
+          const raw = els.sessionNameInput ? els.sessionNameInput.value : "";
+          const result = await createSession(raw);
+          if (result && els.sessionNameInput) {
+            els.sessionNameInput.value = "";
+            updateSessionPreview();
+            updateButtonStates();
+            logLine(`Session ready: "${result.folderName}" — upload images below`);
+            // gentle focus to upload drop
+            if (els.fileDrop) els.fileDrop.scrollIntoView({ behavior: "smooth", block: "center" });
+          }
+        }),
+      );
+    }
     els.deleteFolderBtn.addEventListener("click", () =>
       handleAction(deleteSelectedFolder),
     );
@@ -3860,6 +4139,8 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       config.timelineExportDefaults = { ...config.timelineExportDefaults, ...savedUi.timelineExportConfig };
     }
     if (typeof savedUi.timelineExportName === "string") state.timelineExport.projectName = savedUi.timelineExportName;
+    if (typeof savedUi.autoExpireSessions === "boolean") config.autoExpireSessions = savedUi.autoExpireSessions;
+    if (typeof savedUi.sessionExpiryDays === "number" && savedUi.sessionExpiryDays >= 1) config.sessionExpiryDays = Math.max(1, Math.min(90, Number(savedUi.sessionExpiryDays)));
     if (savedUi.onboardingDismissed && els.onboarding) els.onboarding.classList.add("ve-hidden");
     const todayStr = new Date().toISOString().slice(0, 10);
     state.videoFilters.dateFrom = todayStr;
@@ -3884,6 +4165,14 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     if (els.timelineAspect) els.timelineAspect.value = config.timelineExportDefaults.aspect;
     if (els.timelineQuality) els.timelineQuality.value = config.timelineExportDefaults.quality;
     renderTimelineExport();
+    if (els.autoExpireToggle) els.autoExpireToggle.checked = Boolean(config.autoExpireSessions);
+    if (els.folderBrowserToggle && els.folderBrowser) {
+      const open = Boolean(savedUi.folderBrowserOpen);
+      els.folderBrowserToggle.setAttribute("aria-expanded", String(open));
+      els.folderBrowser.classList.toggle("collapsed", !open);
+      els.folderBrowser.classList.toggle("expanded", open);
+    }
+    updateSessionPreview();
 
     [
       "aspect",
@@ -3924,7 +4213,14 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     updateButtonStates();
     await refreshFolders();
     renderQueue();
+    updateSessionPreview();
     await pollStatuses();
+    // auto-expiry: only locally created sessions, runs hourly + on visibility
+    try { await checkExpiredSessions(); } catch (e) { console.warn("[VE] expiry check failed", e); }
+    setInterval(() => {
+      checkExpiredSessions().catch(e => console.warn("[VE] expiry check failed", e));
+    }, 6 * 60 * 60 * 1000);
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) checkExpiredSessions().catch(()=>{}); });
     setInterval(() => {
       pollStatuses().catch((error) =>
         console.warn("Status poll failed", error),
