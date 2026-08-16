@@ -1072,10 +1072,10 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       }
       .ve-input:focus, .ve-select:focus, .ve-textarea:focus {
         border-color: #FF3B0A;
-        box-shadow: inset 0 1px 0 rgba(0,0,0,0.04), 0 0 0 2px rgba(255,59,10,0.18);
+        box-shadow: inset 0 1px 0 rgba(0,0,0,0.04), 0 0 0 2px rgba(255,59,10,0.28);
       }
       .ve-textarea { min-height: 74px; resize: vertical; font-family: 'JetBrains Mono', monospace; font-size: 11.5px; }
-      .ve-input::placeholder, .ve-textarea::placeholder { color: #9A968F; }
+      .ve-input::placeholder, .ve-textarea::placeholder { color: #6B6760; }
       .ve-button {
         cursor: pointer;
         font-family: 'Barlow Condensed', sans-serif;
@@ -1098,7 +1098,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       .ve-button.danger { background: #1A1A1E; color: #FF3B0A; border-color: #000; }
       .ve-button.ghost { background: #fff; color: #0A0A0D; border-color: #1A1D20; }
       .ve-icon-button { flex: 0 0 34px; width: 34px; min-width: 34px; padding: 7px 0; font-size: 13px; }
-      .ve-muted { color: #6B6760; font-size: 11.5px; font-family: 'Instrument Sans', sans-serif; }
+      .ve-muted { color: #5A5752; font-size: 11.5px; font-family: 'Instrument Sans', sans-serif; }
       .ve-stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; }
       .ve-stat {
         padding: 10px 8px 9px;
@@ -1163,6 +1163,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       .ve-hidden { display: none !important; }
       #ve-manager-toggle { margin-top: 10px; margin-left: auto; display: block; width: 54px; height: 54px; border-radius: 2px; border: 1.5px solid #000; cursor: pointer; color: #fff; font-size: 18px; font-weight: 700; background: #FF3B0A; box-shadow: 0 8px 22px rgba(0,0,0,0.45); font-family: 'Barlow Condensed', sans-serif; }
       #ve-manager-toggle:hover { background: #FF4D1A; transform: translateY(-1px); }
+      #ve-manager-toggle:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
       @media (max-width: 640px) {
         #ve-manager-root { top: 8px; right: 8px; left: 8px; }
         #ve-manager-panel { width: auto; max-height: calc(100vh - 16px); }
