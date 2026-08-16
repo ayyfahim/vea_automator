@@ -882,7 +882,7 @@ function extractVideoIdFromStatus(payload) {
   root.innerHTML = `
     <!--
 THESIS: The batch queue is a physical select rail of punched frames; queue position is frame position, status is a mark not a hue. Refuses same-size icon+heading cards and the hero-metric stat template.
-OWN-WORLD: True-black grain field (#0A0A0D) with flag-orange (#FF3B0A) holding 1/3 of chrome; running copy in punched white windows (#F5F1EB); hairline sprockets; one size condensed grotesk caps (Barlow Condensed 600/700) for labels, JetBrains Mono for data; rank is cell count not type size.
+OWN-WORLD: True-black grain field (#0A0A0D) with flag-orange (var(--cut-orange)) holding 1/3 of chrome; running copy in punched white windows (#F5F1EB); hairline sprockets; one size condensed grotesk caps (Barlow Condensed 600/700) for labels, JetBrains Mono for data; rank is cell count not type size.
 STORY: Operator sees every image as a frame on the rail, understands 5-parallel limit as bench capacity, believes hung trims stay reachable, and does load->run->download without hunting status color.
 FIRST VIEWPORT: Orange perforated rail fixed 44px high (8px sprocket row) with 6 frame-label tabs; below, folder grid as 3-col white windows with punch holes; stats as orange-flag tape band; primary sits on rail as grease cross.
 FORM: operate-a-cutting-bench-select-rail at 4/7 grounded, seed 2b9fb7b1 challengers fused; quality bar board https://impeccable.style/worlds/cards/operate-a-cutting-bench-select-rail + hero.
@@ -996,7 +996,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
         justify-content: space-between;
         gap: 12px;
         padding: 12px 14px 10px;
-        background: #FF3B0A;
+        background: var(--cut-orange);
         border-bottom: 1.5px solid #000;
         cursor: move;
         user-select: none;
@@ -1054,7 +1054,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
         gap: 1px;
         margin: -18px -14px 16px;
         padding: 9px 8px 10px;
-        background: #FF3B0A;
+        background: var(--cut-orange);
         border-bottom: 1.5px solid #000;
         box-shadow: 0 1px 0 #000;
       }
@@ -1085,7 +1085,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
         background: #F5F1EB;
         color: #0A0A0D;
         border-color: #000;
-        box-shadow: inset 0 -3px 0 #FF3B0A, 0 1px 0 rgba(0,0,0,0.4);
+        box-shadow: inset 0 -3px 0 var(--cut-orange), 0 1px 0 rgba(0,0,0,0.4);
       }
       .ve-tab-panel { display: none; animation: veIn 0.16s steps(2); }
       .ve-tab-panel.active { display: block; }
@@ -1125,7 +1125,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
         text-transform: uppercase;
         color: #1A1A18;
       }
-      .ve-section-title i { color: #FF3B0A; }
+      .ve-section-title i { color: var(--cut-orange); }
       .ve-row { display: flex; gap: 8px; margin-bottom: 8px; }
       .ve-row:last-child { margin-bottom: 0; }
       .ve-row > * { flex: 1; }
@@ -1141,7 +1141,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
         outline: none;
       }
       .ve-input:focus, .ve-select:focus, .ve-textarea:focus {
-        border-color: #FF3B0A;
+        border-color: var(--cut-orange);
         box-shadow: inset 0 1px 0 rgba(0,0,0,0.04), 0 0 0 2px rgba(255,59,10,0.28);
       }
       .ve-textarea { min-height: 74px; resize: vertical; font-family: 'JetBrains Mono', monospace; font-size: 11.5px; }
@@ -1162,10 +1162,10 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       .ve-button:hover:not(:disabled) { transform: translateY(-1px); filter: brightness(1.03); box-shadow: 0 3px 0 #000; }
       .ve-button:active:not(:disabled) { transform: translateY(0); box-shadow: 0 1px 0 #000; }
       .ve-button:disabled { opacity: 0.42; cursor: not-allowed; }
-      .ve-button.primary { background: #FF3B0A; color: #fff; border-color: #000; }
+      .ve-button.primary { background: var(--cut-orange); color: #fff; border-color: #000; }
       .ve-button.success { background: #0EA768; border-color: #000; color: #fff; }
       .ve-button.warn { background: #FFC83D; border-color: #000; color: #0A0A0D; }
-      .ve-button.danger { background: #1A1A1E; color: #FF3B0A; border-color: #000; }
+      .ve-button.danger { background: #1A1A1E; color: var(--cut-orange); border-color: #000; }
       .ve-button.ghost { background: #fff; color: #0A0A0D; border-color: #1A1D20; }
       .ve-icon-button { flex: 0 0 34px; width: 34px; min-width: 34px; padding: 7px 0; font-size: 13px; }
       .ve-muted { color: #5A5752; font-size: 11.5px; font-family: 'Instrument Sans', sans-serif; }
@@ -1177,12 +1177,12 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
         border: 1px solid #D8D0C2;
         position: relative; overflow: hidden;
       }
-      .ve-stat::after { content: ''; position: absolute; left: 0; right: 0; top: 0; height: 3px; background: #FF3B0A; }
+      .ve-stat::after { content: ''; position: absolute; left: 0; right: 0; top: 0; height: 3px; background: var(--cut-orange); }
       .ve-stat strong { display: block; font-family: 'Barlow Condensed', sans-serif; font-size: 22px; font-weight: 700; line-height: 1; color: #0A0A0D; }
       .ve-stat span { font-family: 'JetBrains Mono', monospace; font-size: 9.5px; letter-spacing: 0.08em; text-transform: uppercase; color: #6B6760; }
       .ve-stat.failures { background: #FFF1E6; border-color: #E8A08A; }
       .ve-stat.failures::after { background: #000; }
-      .ve-stat.failures strong { color: #FF3B0A; }
+      .ve-stat.failures strong { color: var(--cut-orange); }
       .ve-table { width: 100%; border-collapse: collapse; font-size: 11.5px; font-family: 'Instrument Sans', sans-serif; }
       .ve-table th, .ve-table td { border-bottom: 1px solid #E8E2D6; padding: 9px 6px; vertical-align: top; text-align: left; }
       .ve-table th { font-family: 'JetBrains Mono', monospace; font-size: 9.5px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #5A5752; background: #F7F3EC; border-bottom: 1px solid #D8D0C2; }
@@ -1199,39 +1199,39 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       }
       .ve-badge::before { content: ''; width: 7px; height: 7px; border: 1px solid currentColor; background: transparent; }
       .ve-badge.idle { background: #EDE8DF; color: #5A5752; }
-      .ve-badge.started, .ve-badge.submitted, .ve-badge.running { background: #FF3B0A; color: #fff; }
+      .ve-badge.started, .ve-badge.submitted, .ve-badge.running { background: var(--cut-orange); color: #fff; }
       .ve-badge.started::before, .ve-badge.submitted::before, .ve-badge.running::before { background: #fff; border-color: #fff; box-shadow: 0 0 0 1px #000; }
       .ve-badge.completed { background: #0EA768; color: #fff; }
       .ve-badge.completed::before { content: 'X'; font-size: 9px; border: 0; width: auto; height: auto; }
-      .ve-badge.failed { background: #0A0A0D; color: #FF3B0A; }
+      .ve-badge.failed { background: #0A0A0D; color: var(--cut-orange); }
       .ve-badge.parallel_limit { background: #FFC83D; color: #0A0A0D; }
       .ve-badge.skipped { background: #EDE8DF; color: #8A8680; border-style: dashed; }
       .ve-info { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; margin-left: 6px; border-radius: 50%; border: 1px solid #1A1D20; background: #fff; color: #1A1D20; font-family: 'JetBrains Mono', monospace; font-size: 8px; font-weight: 700; cursor: help; }
-      .ve-info:hover { background: #FF3B0A; color: #fff; border-color: #000; }
+      .ve-info:hover { background: var(--cut-orange); color: #fff; border-color: #000; }
       .ve-retry-btn { display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px; border-radius: 1px; border: 1.5px solid #000; background: #fff; color: #0A0A0D; font-family: 'Barlow Condensed', sans-serif; font-size: 10px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; cursor: pointer; }
-      .ve-retry-btn:hover { background: #FF3B0A; color: #fff; }
+      .ve-retry-btn:hover { background: var(--cut-orange); color: #fff; }
       .ve-folder-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
       .ve-folder-card { min-height: 78px; border: 1px solid #1A1D20; border-radius: 1px; background: #F5F1EB; color: #0A0A0D; cursor: pointer; padding: 10px 9px 8px; text-align: left; position: relative; box-shadow: 0 1px 0 #000; }
-      .ve-folder-card::before { content: ''; position: absolute; left: 0; right: 0; top: 0; height: 2px; background: #FF3B0A; opacity: 0; }
+      .ve-folder-card::before { content: ''; position: absolute; left: 0; right: 0; top: 0; height: 2px; background: var(--cut-orange); opacity: 0; }
       .ve-folder-card:hover { border-color: #000; background: #fff; }
       .ve-folder-card:hover::before { opacity: 1; }
       .ve-folder-card.active { border-color: #000; background: #fff; box-shadow: inset 0 0 0 1px #000, 0 2px 0 #000; }
       .ve-folder-card.active::before { opacity: 1; }
-      .ve-folder-card.active::after { content: '◆'; position: absolute; top: 6px; right: 7px; font-size: 7px; color: #FF3B0A; }
+      .ve-folder-card.active::after { content: '◆'; position: absolute; top: 6px; right: 7px; font-size: 7px; color: var(--cut-orange); }
       .ve-folder-card i { color: #000; font-size: 18px; }
-      .ve-folder-card.active i { color: #FF3B0A; }
+      .ve-folder-card.active i { color: var(--cut-orange); }
       .ve-folder-card strong { display: block; margin-top: 6px; font-family: 'Barlow Condensed', sans-serif; font-size: 12px; font-weight: 700; line-height: 1.15; letter-spacing: 0.02em; text-transform: uppercase; word-break: break-word; }
       .ve-folder-card .ve-muted { font-family: 'JetBrains Mono', monospace; font-size: 9px; }
       .ve-file-picker, .ve-download-controls { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
       .ve-download-controls { grid-template-columns: 1fr 1fr 1fr; }
       .ve-check-cell { width: 32px; text-align: center !important; }
-      .ve-checkbox { width: 15px; height: 15px; cursor: pointer; accent-color: #FF3B0A; }
+      .ve-checkbox { width: 15px; height: 15px; cursor: pointer; accent-color: var(--cut-orange); }
       .ve-progress { height: 10px; overflow: hidden; border-radius: 1px; background: #0A0A0D; border: 1px solid #000; position: relative; }
       .ve-progress::before { content: ''; position: absolute; inset: 0; background: repeating-linear-gradient(90deg, transparent 0 8px, rgba(255,255,255,0.06) 8px 9px); }
-      .ve-progress-bar { width: 0%; height: 100%; background: #FF3B0A; transition: width 0.2s steps(2); position: relative; border-right: 1px solid #fff; }
+      .ve-progress-bar { width: 0%; height: 100%; background: var(--cut-orange); transition: width 0.2s steps(2); position: relative; border-right: 1px solid #fff; }
       .ve-file-input { display: none; }
       .ve-hidden { display: none !important; }
-      #ve-manager-toggle { margin-top: 10px; margin-left: auto; display: block; width: 54px; height: 54px; border-radius: 2px; border: 1.5px solid #000; cursor: pointer; color: #fff; font-size: 18px; font-weight: 700; background: #FF3B0A; box-shadow: 0 8px 22px rgba(0,0,0,0.45); font-family: 'Barlow Condensed', sans-serif; }
+      #ve-manager-toggle { margin-top: 10px; margin-left: auto; display: block; width: 54px; height: 54px; border-radius: 2px; border: 1.5px solid #000; cursor: pointer; color: #fff; font-size: 18px; font-weight: 700; background: var(--cut-orange); box-shadow: 0 8px 22px rgba(0,0,0,0.45); font-family: 'Barlow Condensed', sans-serif; }
       #ve-manager-toggle:hover { background: #FF4D1A; transform: translateY(-1px); }
       #ve-manager-toggle:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
       @media (max-width: 640px) {
