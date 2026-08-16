@@ -101,6 +101,7 @@
       lastError: null,
       pollTimer: null,
     },
+    timelineVideos: [],
   };
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -2214,9 +2215,11 @@ function extractVideoIdFromStatus(payload) {
     state.queue = [];
     state.videos = [];
     state.selectedVideoIds = new Set();
+    state.timelineVideos = [];
     renderFolders();
     renderQueue();
     renderVideos();
+    renderTimelineExport();
   }
 
   async function loadFolderImages() {
@@ -2243,6 +2246,76 @@ function extractVideoIdFromStatus(payload) {
     renderVideos();
     updateButtonStates();
     logLine(`Loaded ${state.videos.length} videos from folder ${folder.id}.`);
+  }
+
+  async function loadTimelineVideos() {
+    const folder = getSelectedFolder();
+    if (!folder) throw new Error("Please select a folder first.");
+    logLine(`Loading timeline videos for "${folder.title || folder.name}"...`);
+    const payload = await api.getAllVideos(folder.id);
+    const videos = (payload.results || []).filter(v => (v.type === "video" || v.extension === "mp4" || v.fileName?.endsWith?.(".mp4")) );
+    videos.sort(compareMediaName);
+    state.timelineVideos = videos;
+    renderTimelineExport();
+    updateButtonStates();
+    logLine(`Timeline: ${videos.length} videos sorted by name (chronological).`);
+  }
+
+  // Task 6 hook — stubbed here, fully implemented in Task 6; Task 5's exportTimeline will call it if present
+  function startTimelineProgressPolling(projectName) {
+    logLine(`Timeline polling stub for "${projectName}" — Task 6 will implement polling.`);
+  }
+
+  async function exportTimeline() {
+    if (state.timelineExport.running) return;
+    if (!state.timelineVideos || !state.timelineVideos.length) throw new Error("Load videos first — no videos to export.");
+    const folder = getSelectedFolder();
+    if (!folder) throw new Error("No folder selected.");
+    updateTimelineExportConfigFromInputs();
+    const projectName = (state.timelineExport.projectName || `${config.timelineExportDefaults.namePrefix}${new Date().toISOString().slice(0,10)}`).trim();
+    state.timelineExport.projectName = projectName;
+    state.timelineExport.running = true;
+    state.timelineExport.percent = 0;
+    state.timelineExport.statusText = `Starting export "${projectName}" with ${state.timelineVideos.length} clips...`;
+    state.timelineExport.exportedVideo = null;
+    state.timelineExport.lastError = null;
+    saveUiState({ timelineExportName: projectName });
+    renderTimelineExport(); updateButtonStates();
+    try {
+      const bricks = buildTimelineBricks(state.timelineVideos, "30");
+      logLine(`Exporting timeline "${projectName}" — ${bricks.length} bricks, left total ${bricks.length ? (bricks[bricks.length-1].left + bricks[bricks.length-1].duration) : 0}ms`);
+      const options = {
+        name: projectName,
+        quality: config.timelineExportDefaults.quality,
+        size: config.timelineExportDefaults.size,
+        format: config.timelineExportDefaults.format,
+        aspect: config.timelineExportDefaults.aspect,
+      };
+      const res = await api.renderTimeline(bricks, options);
+      if (!res || res.success === false) throw new Error(`Render failed: ${JSON.stringify(res).slice(0,300)}`);
+      logLine(`Render queued: ${res.action || "pending"} queue_size=${res.queue_size ?? "?"}`);
+      state.timelineExport.statusText = `Queued — polling progress for "${projectName}"...`;
+      renderTimelineExport();
+      if (typeof startTimelineProgressPolling === "function") startTimelineProgressPolling(projectName);
+    } catch (e) {
+      state.timelineExport.running = false;
+      state.timelineExport.lastError = e.message || String(e);
+      state.timelineExport.statusText = `Export failed: ${state.timelineExport.lastError}`;
+      logLine(`Timeline export failed: ${state.timelineExport.lastError}`);
+      renderTimelineExport(); updateButtonStates();
+      throw e;
+    }
+  }
+  function stopTimelineExport() {
+    if (state.timelineExport.pollTimer) { clearInterval(state.timelineExport.pollTimer); state.timelineExport.pollTimer = null; }
+    state.timelineExport.running = false;
+    state.timelineExport.statusText = "Export stopped by user.";
+    state.timelineExport.lastError = "stopped";
+    logLine("Timeline export stopped.");
+    renderTimelineExport(); updateButtonStates();
+  }
+  if (typeof window !== "undefined") {
+    window.__ve_test = Object.assign(window.__ve_test || {}, { loadTimelineVideos, exportTimeline, stopTimelineExport, startTimelineProgressPolling });
   }
 
   async function createFolder() {
@@ -3305,6 +3378,19 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     if (els.retryAllFailedBtn) {
       els.retryAllFailedBtn.addEventListener("click", () => handleAction(retryAllFailed));
     }
+    if (els.timelineLoadBtn) els.timelineLoadBtn.addEventListener("click", () => handleAction(loadTimelineVideos));
+    if (els.timelineExportBtn) els.timelineExportBtn.addEventListener("click", () => handleAction(exportTimeline));
+    if (els.timelineStopBtn) els.timelineStopBtn.addEventListener("click", () => { stopTimelineExport(); });
+    if (els.timelineDownloadBtn) els.timelineDownloadBtn.addEventListener("click", () => handleAction(async () => {
+      const v = state.timelineExport.exportedVideo;
+      if (!v || !v.mediaPath) throw new Error("No exported video ready.");
+      const fileName = sanitizeFileName(v.title || v.filename || state.timelineExport.projectName || "timeline") + ".mp4";
+      const fake = { id: v.id, name: v.title || v.filename, fileName: v.filename };
+      await fetchAndDownloadWithRetry(fake, fileName);
+      logLine(`Timeline download triggered: ${fileName}`);
+    }));
+    if (els.timelineFolderSelect) els.timelineFolderSelect.addEventListener("change", () => { selectFolder(els.timelineFolderSelect.value); });
+    [els.timelineName, els.timelineAspect, els.timelineQuality].forEach(el=>{ if(!el) return; el.addEventListener("change", updateTimelineExportConfigFromInputs); el.addEventListener("input", updateTimelineExportConfigFromInputs); });
   }
 
   async function bootstrap() {
@@ -3378,6 +3464,10 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     updateMasterPromptControls();
     state.selectedFolderId = savedUi.selectedFolderId || null;
     applyVideoFiltersToInputs();
+    if (els.timelineName) els.timelineName.value = state.timelineExport.projectName || "";
+    if (els.timelineAspect) els.timelineAspect.value = config.timelineExportDefaults.aspect;
+    if (els.timelineQuality) els.timelineQuality.value = config.timelineExportDefaults.quality;
+    renderTimelineExport();
 
     [
       "aspect",

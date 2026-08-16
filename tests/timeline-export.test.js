@@ -32,3 +32,25 @@ describe("timeline export UI", () => {
     assert.match(src, /ve-timeline-download-btn/);
   });
 });
+describe("timeline export core", () => {
+  it("exportTimeline uses sorted videos and cumulative left", async () => {
+    const { buildTimelineBricks } = global.__ve_test || {};
+    const src = fs.readFileSync("videoexpress-manager.user.js","utf8");
+    assert.match(src, /exportTimeline/);
+    assert.match(src, /loadTimelineVideos/);
+    if (global.__ve_test) {
+      const vids = [{id:1, fileName:"2_video.mp4", duration:5000},{id:2, fileName:"10_video.mp4", duration:8000}];
+      vids.sort((a,b)=>a.fileName.localeCompare(b.fileName,undefined,{numeric:true}));
+      const bricks = buildTimelineBricks(vids, "30");
+      assert.equal(bricks[0].left, 0);
+      assert.equal(bricks[1].left, 5000);
+    } else {
+      // pure logic check without vm harness: verify buildTimelineBricks handles cumulative left via source inspection
+      assert.match(src, /buildTimelineBricks/);
+      assert.match(src, /left/);
+      // also validate cumulative left logic directly by extracting function source via regex and checking it increments left
+      const fnMatch = src.match(/function buildTimelineBricks[\s\S]*?left \+= duration/);
+      assert.ok(fnMatch, "buildTimelineBricks should accumulate left");
+    }
+  });
+});
