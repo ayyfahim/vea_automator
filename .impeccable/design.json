@@ -1,0 +1,163 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-05-13T00:00:00.000Z",
+  "title": "Design System: VideoExpress Library Manager",
+  "extensions": {
+    "colorMeta": {
+      "cut-orange": { "role": "primary", "displayName": "Flag Orange", "canonical": "#FF3B0A", "tonalRamp": ["#571505", "#8d2207", "#c32f0a", "#f34014", "#f56c4a", "#f89880", "#fbc4b6", "#feefec"] },
+      "cut-orange-deep": { "role": "primary", "displayName": "Flag Deep", "canonical": "#D12E04", "tonalRamp": ["#4a1203", "#7a1e04", "#ab2a06", "#dc3608", "#e85a37", "#f07e6b", "#f7a99b", "#fdeae6"] },
+      "cut-black": { "role": "neutral", "displayName": "True Black", "canonical": "#0A0A0D", "tonalRamp": ["#292933", "#424253", "#5b5b73", "#757592", "#9494ab", "#b4b4c4", "#d4d4dd", "#f4f4f6"] },
+      "cut-panel": { "role": "neutral", "displayName": "Panel", "canonical": "#0F1012", "tonalRamp": ["#2b2b30", "#464650", "#626270", "#7e7e8e", "#9b9ba7", "#b8b8c1", "#d6d6db", "#f4f4f5"] },
+      "cut-window": { "role": "neutral", "displayName": "Window", "canonical": "#F5F1EB", "tonalRamp": ["#3c3120", "#614f34", "#866d48", "#a88b5e", "#bca583", "#d0c0a8", "#e4dbcd", "#f8f5f2"] },
+      "cut-window-warm": { "role": "neutral", "displayName": "Window Warm", "canonical": "#F7F3EC", "tonalRamp": ["#3f321d", "#66522f", "#8c7141", "#b19056", "#c3a97d", "#d5c3a3", "#e7dcca", "#f9f6f1"] },
+      "cut-line": { "role": "neutral", "displayName": "Line", "canonical": "#1A1D20", "tonalRamp": ["#2a2e32", "#434a51", "#5d6770", "#78838f", "#97a0a8", "#b6bcc2", "#d5d8dc", "#f4f5f6"] },
+      "cut-line-soft": { "role": "neutral", "displayName": "Line Soft", "canonical": "#2A2E33", "tonalRamp": ["#2a2d32", "#444a51", "#5e6670", "#78828e", "#979fa8", "#b6bbc2", "#d5d8dc", "#f4f5f6"] },
+      "cut-border-warm": { "role": "neutral", "displayName": "Border Warm", "canonical": "#D8D0C2", "tonalRamp": ["#373025", "#594e3c", "#7b6c52", "#9c8a6b", "#b2a58d", "#c9c0af", "#e0dad1", "#f7f5f3"] },
+      "cut-border-warm-2": { "role": "neutral", "displayName": "Border Warm 2", "canonical": "#E0D8CC", "tonalRamp": ["#3a3328", "#5d523f", "#817158", "#a49072", "#b7ac93", "#cac7b4", "#dcd9d0", "#f0ede8"] },
+      "cut-ink": { "role": "neutral", "displayName": "Ink", "canonical": "#1A1A18", "tonalRamp": ["#2e2e2c", "#4b4b47", "#686862", "#85857e", "#a1a19b", "#bdbdb7", "#dadad7", "#f6f6f4"] },
+      "cut-muted": { "role": "neutral", "displayName": "Muted", "canonical": "#5A5752", "tonalRamp": ["#2c2b29", "#474642", "#63625c", "#7f7d78", "#9c9b97", "#b9b8b5", "#d6d5d3", "#f3f2f1"] },
+      "cut-muted-light": { "role": "neutral", "displayName": "Muted Light", "canonical": "#6B6760", "tonalRamp": ["#2e2d2b", "#4a4946", "#666561", "#83827f", "#a1a09d", "#bebdbc", "#dbdbda", "#f7f6f5"] },
+      "success": { "role": "success", "displayName": "Success", "canonical": "#0EA768", "tonalRamp": ["#0b5134", "#128354", "#19b575", "#25e194", "#57e8ac", "#89efc5", "#bbf6de", "#edfdf6"] },
+      "warn": { "role": "warn", "displayName": "Warn", "canonical": "#FFC83D", "tonalRamp": ["#574005", "#8d6707", "#c38f0a", "#f3b314", "#f5c54a", "#f8d680", "#fbe7b6", "#fef9ec"] },
+      "danger-ink": { "role": "danger", "displayName": "Danger Ink", "canonical": "#1A1A1E", "tonalRamp": ["#2a2a2e", "#44444c", "#5f5f6a", "#7a7a8a", "#9797a3", "#b4b4bc", "#d2d2d6", "#f0f0f1"] }
+    },
+    "typographyMeta": {
+      "display": { "displayName": "Display", "purpose": "Panel title on orange — Barlow Condensed 17px 700 caps." },
+      "headline": { "displayName": "Headline", "purpose": "Section titles on windows — Barlow 12px 700 caps with warm divider." },
+      "title": { "displayName": "Title", "purpose": "Rail tabs and table heads — Barlow 11px caps, mono 9.5 for th." },
+      "body": { "displayName": "Body", "purpose": "Inputs and title-lines — Instrument Sans 12.5px on white." },
+      "label": { "displayName": "Label", "purpose": "Badges and stats mono caps — JetBrains 10px." },
+      "mono": { "displayName": "Mono", "purpose": "Log and textarea — JetBrains 11px on black." }
+    },
+    "shadows": [
+      { "name": "panel-throw", "value": "0 22px 70px rgba(0,0,0,0.72)", "purpose": "Single throw for panel — bench onto host, no card blur." },
+      { "name": "hard-edge", "value": "0 1px 0 #000", "purpose": "Window hairline edge — pin, not glow." },
+      { "name": "hard-edge-2", "value": "0 2px 0 #000", "purpose": "Active folder pin." }
+    ],
+    "motion": [
+      { "name": "step-in", "value": "0.16s steps(2)", "purpose": "Panel and tab in — bench hinge, no easing." },
+      { "name": "rail-lift", "value": "transform 0.06s steps(2)", "purpose": "Button lift on orange." },
+      { "name": "progress-step", "value": "width 0.2s steps(2)", "purpose": "Progress fill stepped." }
+    ],
+    "breakpoints": [
+      { "name": "rail-wrap", "value": "700px" },
+      { "name": "mobile", "value": "640px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Flag orange on black — Run / Download.",
+      "html": "<button class=\"ds-btn-primary\">RUN QUEUE</button>",
+      "css": ".ds-btn-primary { background: #FF3B0A; color: #fff; border: 1.5px solid #000; border-radius: 1px; padding: 9px 10px; font-family: 'Barlow Condensed', sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; } .ds-btn-primary:hover { background: #FF4D1A; transform: translateY(-1px); box-shadow: 0 3px 0 #000; }"
+    },
+    {
+      "name": "Success Button",
+      "kind": "button",
+      "refersTo": "button-success",
+      "description": "Completed green.",
+      "html": "<button class=\"ds-btn-success\">DOWNLOAD COMPLETED</button>",
+      "css": ".ds-btn-success { background: #0EA768; color: #fff; border: 1.5px solid #000; border-radius: 1px; padding: 9px 10px; font-family: 'Barlow Condensed', sans-serif; font-weight: 700; }"
+    },
+    {
+      "name": "Ghost Button",
+      "kind": "button",
+      "refersTo": "button-ghost",
+      "description": "Quiet white window button.",
+      "html": "<button class=\"ds-btn-ghost\">CANCEL</button>",
+      "css": ".ds-btn-ghost { background: #fff; color: #0A0A0D; border: 1px solid #1A1D20; border-radius: 1px; padding: 9px 10px; font-family: 'Barlow Condensed', sans-serif; }"
+    },
+    {
+      "name": "Text Input",
+      "kind": "input",
+      "refersTo": "input-default",
+      "description": "White window field with orange focus.",
+      "html": "<input class=\"ds-input\" placeholder=\"New folder name\" />",
+      "css": ".ds-input { width: 100%; background: #fff; color: #0A0A0D; border: 1.5px solid #1A1D20; border-radius: 1px; padding: 9px 10px; font-family: 'Instrument Sans', sans-serif; font-size: 12.5px; } .ds-input:focus { border-color: #FF3B0A; box-shadow: 0 0 0 2px rgba(255,59,10,0.28); } .ds-input::placeholder { color: #6B6760; }"
+    },
+    {
+      "name": "Running Badge",
+      "kind": "chip",
+      "refersTo": "badge-running",
+      "description": "Orange flag — running state mark.",
+      "html": "<span class=\"ds-badge-running\">RUNNING</span>",
+      "css": ".ds-badge-running { display: inline-flex; align-items: center; gap: 5px; padding: 3px 6px; background: #FF3B0A; color: #fff; border: 1px solid #000; border-radius: 1px; font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; text-transform: uppercase; }"
+    },
+    {
+      "name": "Completed Badge",
+      "kind": "chip",
+      "refersTo": "badge-completed",
+      "description": "Green grease cross.",
+      "html": "<span class=\"ds-badge-completed\">COMPLETED</span>",
+      "css": ".ds-badge-completed { display: inline-flex; align-items: center; gap: 5px; padding: 3px 6px; background: #0EA768; color: #fff; border: 1px solid #000; border-radius: 1px; font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; }"
+    },
+    {
+      "name": "Window Card",
+      "kind": "card",
+      "refersTo": "card-window",
+      "description": "Punched white window with rivets.",
+      "html": "<div class=\"ds-window\"><div class=\"ds-window-title\">MEDIA FOLDERS</div><div class=\"ds-window-body\">Content in window</div></div>",
+      "css": ".ds-window { background: #F5F1EB; border: 1px solid #1A1D20; border-radius: 1px; padding: 12px; position: relative; box-shadow: 0 1px 0 #000; } .ds-window::before, .ds-window::after { content: ''; position: absolute; top: 6px; width: 7px; height: 7px; background: #0A0A0D; border-radius: 50%; } .ds-window::before { left: 6px; } .ds-window::after { right: 6px; } .ds-window-title { font-family: 'Barlow Condensed', sans-serif; font-size: 12px; font-weight: 700; letter-spacing: 0.09em; text-transform: uppercase; border-bottom: 1px solid #E0D8CC; padding-bottom: 8px; margin-bottom: 12px; }"
+    },
+    {
+      "name": "Folder Frame",
+      "kind": "card",
+      "refersTo": "card-window",
+      "description": "Frame cell on rail.",
+      "html": "<button class=\"ds-folder\">1<br><small>607180</small></button>",
+      "css": ".ds-folder { min-height: 78px; background: #F5F1EB; border: 1px solid #1A1D20; border-radius: 1px; padding: 10px 9px; text-align: left; font-family: 'Barlow Condensed', sans-serif; font-weight: 700; text-transform: uppercase; } .ds-folder.active { background: #fff; border-color: #000; box-shadow: inset 0 0 0 1px #000, 0 2px 0 #000; }"
+    },
+    {
+      "name": "Stat Flag",
+      "kind": "card",
+      "refersTo": "card-window",
+      "description": "Metric with orange flag top.",
+      "html": "<div class=\"ds-stat\"><span>IMAGES</span><strong>24</strong></div>",
+      "css": ".ds-stat { background: #fff; border: 1px solid #D8D0C2; border-radius: 1px; padding: 10px 8px; position: relative; } .ds-stat::after { content: ''; position: absolute; left: 0; right: 0; top: 0; height: 3px; background: #FF3B0A; } .ds-stat strong { font-family: 'Barlow Condensed', sans-serif; font-size: 22px; font-weight: 700; } .ds-stat span { font-family: 'JetBrains Mono', monospace; font-size: 9.5px; letter-spacing: 0.08em; text-transform: uppercase; color: #6B6760; }"
+    },
+    {
+      "name": "Progress",
+      "kind": "custom",
+      "refersTo": "progress-track",
+      "description": "Black track with orange fill.",
+      "html": "<div class=\"ds-progress\"><div class=\"ds-progress-bar\" style=\"width:62%\"></div></div>",
+      "css": ".ds-progress { height: 10px; background: #0A0A0D; border: 1px solid #000; border-radius: 1px; } .ds-progress-bar { height: 100%; background: #FF3B0A; border-right: 1px solid #fff; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Cutting Bench Select Rail",
+    "overview": "The bench, not a card deck. True-black field (#0A0A0D) crossed by a flag-orange perforated rail. The rail is the primary device: a 44px orange bar with an 8px sprocket row, holding six frame-label tabs. Below, every section is a punched white window (#F5F1EB with 7px black rivets) and every folder is a frame cell. The bench lamp is orange; the work is white on black. Motion is stepped (90ms steps(2)), scrub snaps to perforation pitch.",
+    "keyCharacteristics": [
+      "Select rail as queue — position is physical, status is a mark not a hue.",
+      "Drenched accent — orange holds 33% via header + rail + progress + flags.",
+      "One ink, one flag, one window — #0A0A0D / #FF3B0A / #F5F1EB.",
+      "Perforated topology — rail fixed 44px, sections string along it; deferred hangs on pins.",
+      "Condensed grotesk caps + mono data — rank by count, hairline ticks."
+    ],
+    "rules": [
+      { "name": "The One Third Rule", "body": "Flag orange holds 33% — header + rail + progress + 3px stat flags. If heavier, remove orange.", "section": "colors" },
+      { "name": "The Mark Not Hue Rule", "body": "Status is a physical mark, not a new hue: grease cross, punched corner, tape band, folded flag, pin.", "section": "colors" },
+      { "name": "The One Size Rule", "body": "One size of condensed grotesk does labeling; rank is cell count not type size.", "section": "typography" },
+      { "name": "The No Glow Rule", "body": "No soft blur beyond single panel throw. Elevation is hard edge; glow is decoration.", "section": "elevation" }
+    ],
+    "dos": [
+      "Do keep orange at 1/3 — header + rail + progress + flag.",
+      "Do use punched windows with rivets for every section.",
+      "Do keep caps and hairlines — Barlow caps, 1.5px #000 on orange, 1px #1A1D20 on white.",
+      "Do express state as a mark in the 7px box.",
+      "Do keep radius 1px (panel 2px).",
+      "Do preserve sprocket row at top:4px.",
+      "Do use mono for data."
+    ],
+    "donts": [
+      "Don't revive the light Control Deck — #f7f9fc/#22a7f0 soft blur is anti-reference.",
+      "Don't add gradients, glass, or 999px pills.",
+      "Don't add a new hue alongside orange.",
+      "Don't use Inter, Space Grotesk, IBM Plex, DM Sans as display.",
+      "Don't soften hard 0 1px 0 #000 with blur.",
+      "Don't place body below 11px or above 13px inside windows."
+    ]
+  }
+}
