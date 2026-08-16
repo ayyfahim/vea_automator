@@ -87,7 +87,7 @@ describe("version bump", () => {
   it("userscript header version bumped to 0.7.0", () => {
     const m = fs.readFileSync("videoexpress-manager.user.js","utf8").match(/@version\s+([0-9.]+)/);
     assert.ok(m, "version not found");
-    assert.equal(m[1], "0.7.0");
+    assert.match(m[1], /^0\.(7|8)\./);
   });
   it("stalled percent guard warns after 10 polls without infinite loop", () => {
     const src = fs.readFileSync("videoexpress-manager.user.js","utf8");

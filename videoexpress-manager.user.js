@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoExpress Library Manager
 // @namespace    https://app.videoexpress.ai/
-// @version      0.8.3
+// @version      0.9.1
 // @description  Manage folders, upload images, and batch convert images to videos inside VideoExpress AI.
 // @match        https://app.videoexpress.ai/*
 // @grant        none
@@ -53,10 +53,13 @@
       namePrefix: "timeline_",
       pollIntervalMs: 2000,
     },
+    autoExpireSessions: true,
+    sessionExpiryDays: 30,
   };
 
   const HISTORY_KEY = "videoexpress.manager.history.v1";
   const UI_STATE_KEY = "videoexpress.manager.ui-state.v1";
+  const SESSION_META_KEY = "videoexpress.manager.sessions.v1";
   let _queryUuidSupported = null; // cache probe for server-side uuid query support (I3)
 
   const state = {
@@ -215,6 +218,197 @@
     const next = { ...loadUiState(), ...patch };
     localStorage.setItem(UI_STATE_KEY, JSON.stringify(next, null, 2));
   }
+  // —— Sessions — unique naming + 30-day auto-expiry (only locally created) ——
+  function loadSessions() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(SESSION_META_KEY) || "{}");
+      if (raw && typeof raw === "object" && raw.sessions && typeof raw.sessions === "object") return raw;
+      if (Array.isArray(raw)) return { version: 1, sessions: {} };
+      return { version: 1, sessions: raw.sessions || {} };
+    } catch {
+      return { version: 1, sessions: {} };
+    }
+  }
+  function saveSessions(data) {
+    const toSave = data.sessions ? { version: 1, updatedAt: new Date().toISOString(), sessions: data.sessions } : { version: 1, updatedAt: new Date().toISOString(), sessions: data };
+    localStorage.setItem(SESSION_META_KEY, JSON.stringify(toSave, null, 2));
+  }
+  function isSessionFolder(folder) {
+    try {
+      const meta = loadSessions();
+      const id = String(folder && folder.id || "");
+      if (id && meta.sessions[id]) return true;
+      const name = String(folder && (folder.title || folder.name) || "").trim();
+      return Object.values(meta.sessions).some(s => s && String(s.folderName) === name);
+    } catch { return false; }
+  }
+  function sanitizeSessionBase(raw) {
+    let s = String(raw || "").trim();
+    if (!s) return "session";
+    s = s.replace(/\.[a-z0-9]+$/i, "");
+    s = s.replace(/[<>:"\/\\|?*\x00-\x1f]/g, " ");
+    s = s.replace(/\s+/g, " ").trim();
+    s = s.replace(/\s/g, "-").replace(/_+/g, "-").replace(/-+/g, "-");
+    s = s.replace(/^[-.]+|[-.]+$/g, "");
+    if (!s) s = "session";
+    if (s.length > 32) s = s.slice(0, 32).replace(/[-.]+$/g, "");
+    return s;
+  }
+  function generateSessionSuffix() {
+    const now = new Date();
+    const dd = String(now.getDate()).padStart(2, "0");
+    const mm = String(now.getMonth() + 1).padStart(2, "0");
+    const charset = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let uniq = "";
+    for (let i = 0; i < 4; i++) uniq += charset[Math.floor(Math.random() * charset.length)];
+    return `-${dd}${mm}-${uniq}`;
+  }
+  function isFolderNameTaken(name) {
+    const needle = String(name || "").trim().toLowerCase();
+    if (!needle) return false;
+    return (state.folders || []).some(f => {
+      const n = String(f.title || f.name || "").trim().toLowerCase();
+      return n === needle;
+    });
+  }
+  function buildSessionFolderName(rawBase) {
+    const base = sanitizeSessionBase(rawBase);
+    let suffix = generateSessionSuffix();
+    let candidate = `${base}${suffix}`;
+    let attempts = 0;
+    while (isFolderNameTaken(candidate) && attempts < 20) {
+      suffix = generateSessionSuffix();
+      candidate = `${base}${suffix}`;
+      attempts++;
+    }
+    if (isFolderNameTaken(candidate)) {
+      const ts = Date.now().toString(36).slice(-4).toUpperCase();
+      candidate = `${base}-${ts}`;
+      let t = 0;
+      while (isFolderNameTaken(candidate) && t < 10) {
+        candidate = `${base}-${ts}${t}`;
+        t++;
+      }
+    }
+    return candidate;
+  }
+  function isDuplicateFolderError(err) {
+    const msg = String(err && (err.bodyText || err.message) || "").toLowerCase();
+    return /duplicate|already exists|exists/.test(msg);
+  }
+  function updateSessionPreview() {
+    const input = document.getElementById("ve-session-name-input");
+    const out = document.getElementById("ve-session-preview-name");
+    if (!input || !out) return;
+    const raw = input.value.trim();
+    if (!raw) {
+      out.textContent = "\u2014";
+      out.style.color = "#9AA0B0";
+      return;
+    }
+    out.style.color = "var(--cut-orange)";
+    out.textContent = buildSessionFolderName(raw);
+  }
+  async function createSession(rawBase) {
+    const base = String(rawBase || "").trim();
+    if (!base) throw new Error("Session name is required.");
+    if (base.length < 2) throw new Error("Session name too short — use at least 2 characters.");
+    let folderName = buildSessionFolderName(base);
+    let lastErr = null;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        await api.createFolder(folderName);
+        lastErr = null;
+        break;
+      } catch (e) {
+        if (isDuplicateFolderError(e)) {
+          lastErr = e;
+          folderName = buildSessionFolderName(base);
+          logLine(`Name ${folderName} collided — shuffling unique suffix (attempt ${attempt + 2}/5)`);
+          continue;
+        }
+        throw e;
+      }
+    }
+    if (lastErr) throw lastErr;
+    await refreshFolders();
+    const created = state.folders.find(f => String(f.title || f.name) === folderName) || state.folders.find(f => String(f.name) === folderName);
+    const folderId = created ? String(created.id) : "";
+    if (created) {
+      state.selectedFolderId = created.id;
+      saveUiState({ selectedFolderId: created.id });
+      renderFolders();
+    }
+    try {
+      const meta = loadSessions();
+      const now = Date.now();
+      const expiresAt = now + Number(config.sessionExpiryDays || 30) * 24 * 60 * 60 * 1000;
+      const key = folderId || folderName;
+      meta.sessions[key] = {
+        folderId: folderId || null,
+        folderName,
+        baseName: sanitizeSessionBase(base),
+        createdAt: new Date(now).toISOString(),
+        expiresAt: new Date(expiresAt).toISOString(),
+        autoExpire: Boolean(config.autoExpireSessions),
+      };
+      saveSessions(meta);
+      if (config.autoExpireSessions) logLine(`Session "${folderName}" will auto-delete after ${config.sessionExpiryDays} days (only locally created)`);
+      else logLine(`Session "${folderName}" created — auto-delete is off`);
+    } catch (e) {
+      console.warn("[VE] session meta save failed", e);
+    }
+    return { folderName, folder: created };
+  }
+  async function checkExpiredSessions() {
+    if (!config.autoExpireSessions) return;
+    let meta;
+    try { meta = loadSessions(); } catch { return; }
+    const now = Date.now();
+    const entries = Object.entries(meta.sessions || {});
+    if (!entries.length) return;
+    let changed = false;
+    for (const [key, s] of entries) {
+      if (!s || !s.expiresAt || s.autoExpire === false) continue;
+      const exp = new Date(s.expiresAt).getTime();
+      if (!Number.isFinite(exp) || now < exp) continue;
+      const folderId = s.folderId ? String(s.folderId) : "";
+      const folderName = s.folderName || key;
+      let live = null;
+      if (folderId) live = (state.folders || []).find(f => String(f.id) === folderId);
+      if (!live) live = (state.folders || []).find(f => String(f.title || f.name) === folderName);
+      if (!live) {
+        delete meta.sessions[key];
+        changed = true;
+        logLine(`Cleaned expired session meta "${folderName}" — folder already gone`);
+        continue;
+      }
+      try {
+        logLine(`Auto-deleting expired session "${folderName}" (#${live.id}) + its assets after 30 days`);
+        await api.deleteFolder(live.id);
+        const prefix = `library:${config.libraryId}:folder:${live.id}:`;
+        Object.keys(state.history.records).forEach(k => { if (k.startsWith(prefix)) delete state.history.records[k]; });
+        saveHistory();
+        delete meta.sessions[key];
+        for (const k2 of Object.keys(meta.sessions)) {
+          const v2 = meta.sessions[k2];
+          if (v2 && String(v2.folderName) === folderName && k2 !== key) delete meta.sessions[k2];
+        }
+        changed = true;
+        await refreshFolders();
+        renderQueue();
+        logLine(`Expired session "${folderName}" deleted`);
+      } catch (e) {
+        logLine(`Auto-delete failed for "${folderName}": ${e.message}`);
+        s.expiresAt = new Date(now + 24*60*60*1000).toISOString();
+        changed = true;
+      }
+      await sleep(800);
+      if (changed) saveSessions(meta);
+    }
+    if (changed) saveSessions(meta);
+  }
+
 
   async function assertOk(response, label) {
     if (response.ok) return response;
@@ -889,613 +1083,766 @@ FORM: operate-a-cutting-bench-select-rail at 4/7 grounded, seed 2b9fb7b1 challen
 FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, and DESIGN.md
 -->
     <style>
-      @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=JetBrains+Mono:wght@400;600&family=Instrument+Sans:wght@400;600&display=swap');
-      #ve-manager-root {
-        position: fixed;
-        top: 72px;
-        right: 16px;
-        z-index: 2147483647;
-        font-family: 'Instrument Sans', 'Barlow Condensed', system-ui, sans-serif;
-        color: #111827;
-        /* VideoExpress (default) — site theme: violet #7C3AED on light */
-        --cut-orange: #7C3AED;
-        --cut-orange-deep: #6D28D9;
-        --cut-orange-soft: #8B5CF6;
-        --cut-black: #111827;
-        --cut-panel: #F3F4F6;
-        --cut-window: #FFFFFF;
-        --cut-window-warm: #F9FAFB;
-        --cut-ink: #111827;
-        --cut-line: #E5E7EB;
-        --cut-line-soft: #D1D5DB;
-        --cut-border-warm: #E5E7EB;
-        --cut-border-warm-2: #E5E7EB;
-        --cut-muted: #6B7280;
-        --cut-muted-light: #9CA3AF;
-        --cut-success: #0EA768;
-        --cut-warn: #F59E0B;
-        --cut-danger-ink: #111827;
-      }
-      /* Bench Red — original eye-soring but retained */
-      #ve-manager-root[data-theme="bench"] {
-        --cut-orange: #FF3B0A;
-        --cut-orange-deep: #D12E04;
-        --cut-orange-soft: #FF6B35;
-        --cut-black: #0A0A0D;
-        --cut-panel: #0F1012;
-        --cut-window: #F5F1EB;
-        --cut-window-warm: #F7F3EC;
-        --cut-ink: #1A1A18;
-        --cut-line: #1A1D20;
-        --cut-line-soft: #2A2E33;
-        --cut-border-warm: #D8D0C2;
-        --cut-border-warm-2: #E0D8CC;
-        --cut-muted: #5A5752;
-        --cut-muted-light: #6B6760;
-        --cut-success: #0EA768;
-        --cut-warn: #FFC83D;
-        --cut-danger-ink: #1A1A1E;
-      }
-      #ve-manager-root[data-theme="bench"] #ve-manager-panel { background: #0A0A0D; }
-      #ve-manager-root[data-theme="bench"] #ve-manager-body { background: #0A0A0D; }
-      /* Teal Dark */
-      #ve-manager-root[data-theme="teal"] {
-        --cut-orange: #0F766E;
-        --cut-orange-deep: #115E59;
-        --cut-orange-soft: #14B8A6;
-        --cut-black: #042F2E;
-        --cut-panel: #0B1A1F;
-        --cut-window: #F0FDFA;
-        --cut-window-warm: #CCFBF1;
-        --cut-ink: #042F2E;
-        --cut-line: #134E4A;
-        --cut-line-soft: #1F5F57;
-        --cut-border-warm: #99F6E4;
-        --cut-border-warm-2: #5EEAD4;
-        --cut-muted: #5F6B6A;
-        --cut-muted-light: #7A8A89;
-        --cut-success: #0EA768;
-        --cut-warn: #F59E0B;
-        --cut-danger-ink: #042F2E;
-      }
-      /* Amber Warm */
-      #ve-manager-root[data-theme="amber"] {
-        --cut-orange: #D97706;
-        --cut-orange-deep: #B45309;
-        --cut-orange-soft: #F59E0B;
-        --cut-black: #1C1917;
-        --cut-panel: #292524;
-        --cut-window: #FFFBEB;
-        --cut-window-warm: #FEF3C7;
-        --cut-ink: #1C1917;
-        --cut-line: #44403C;
-        --cut-line-soft: #57534E;
-        --cut-border-warm: #FDE68A;
-        --cut-border-warm-2: #FCD34D;
-        --cut-muted: #78716C;
-        --cut-muted-light: #A8A29E;
-        --cut-success: #0EA768;
-        --cut-warn: #F59E0B;
-        --cut-danger-ink: #1C1917;
-      }
-      #ve-manager-root * { scrollbar-width: thin; scrollbar-color: var(--cut-line-soft) transparent; }
-      #ve-manager-panel {
-        width: min(620px, calc(100vw - 24px));
-        max-height: calc(100vh - 88px);
-        overflow: hidden;
-        background: var(--cut-panel);
-        border: 1.5px solid #000;
-        border-radius: 2px;
-        box-shadow: 0 22px 70px rgba(0,0,0,0.72), 0 2px 0 #000 inset;
-        display: flex;
-        flex-direction: column;
-      }
-      #ve-manager-header {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 12px;
-        padding: 12px 14px 10px;
-        background: var(--cut-orange);
-        border-bottom: 1.5px solid #000;
-        cursor: move;
-        user-select: none;
-        position: relative;
-      }
-      #ve-manager-header::after {
-        content: '';
-        position: absolute;
-        left: 0; right: 0; bottom: -9px; height: 8px;
-        background: repeating-linear-gradient(90deg, #000 0 10px, transparent 10px 18px);
-        opacity: 0.95;
-      }
-      #ve-manager-title {
-        font-family: 'Barlow Condensed', sans-serif;
-        font-size: 17px;
-        font-weight: 700;
-        letter-spacing: 0.04em;
-        text-transform: uppercase;
-        color: #fff;
-        line-height: 1;
-        text-shadow: 0 1px 0 rgba(0,0,0,0.35);
-      }
-      #ve-manager-header .ve-muted {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 10px;
-        letter-spacing: 0.06em;
-        text-transform: uppercase;
-        color: rgba(255,255,255,0.88);
-        margin-top: 3px;
-      }
-      #ve-manager-header button {
-        cursor: pointer;
-        border: 1.5px solid #000;
-        background: #fff;
-        color: #0A0A0D;
-        border-radius: 1px;
-        width: 30px; height: 30px;
-        display: grid; place-items: center;
-      }
-      #ve-manager-body {
-        padding: 18px 14px 14px;
-        overflow: auto;
-        max-height: calc(100vh - 150px);
-        background: var(--cut-panel);
-      }
-      #ve-manager-body::-webkit-scrollbar { width: 10px; height: 10px; }
-      #ve-manager-body::-webkit-scrollbar-thumb { background: #2A2E33; border: 1px solid #000; border-radius: 0; }
-      #ve-manager-body::-webkit-scrollbar-track { background: #0A0A0D; }
-      .ve-tabs {
-        position: sticky;
-        top: -18px;
-        z-index: 5;
-        display: grid;
-        grid-template-columns: repeat(6, minmax(0, 1fr));
-        gap: 1px;
-        margin: -18px -14px 16px;
-        padding: 9px 8px 10px;
-        background: var(--cut-orange);
-        border-bottom: 1.5px solid #000;
-        box-shadow: 0 1px 0 #000;
-      }
-      .ve-tabs::before {
-        content: '';
-        position: absolute;
-        left: 8px; right: 8px; top: 4px; height: 5px;
-        background: repeating-linear-gradient(90deg, #000 0 6px, transparent 6px 16px);
-        opacity: 0.9;
-      }
-      @media (max-width:700px){ .ve-tabs{ grid-template-columns: repeat(3, minmax(0,1fr)); } }
-      .ve-tab {
-        height: 42px;
-        border: 1.5px solid #000;
-        background: rgba(255,255,255,0.12);
-        color: #fff;
-        cursor: pointer;
-        font-family: 'Barlow Condensed', sans-serif;
-        font-size: 11px;
-        font-weight: 700;
-        letter-spacing: 0.08em;
-        text-transform: uppercase;
-        border-radius: 1px;
-      }
-      .ve-tab i { margin-right: 5px; font-size: 11px; }
-      .ve-tab:hover { background: rgba(255,255,255,0.2); }
-      .ve-tab.active {
-        background: #F5F1EB;
-        color: #0A0A0D;
-        border-color: #000;
-        box-shadow: inset 0 -3px 0 var(--cut-orange), 0 1px 0 rgba(0,0,0,0.4);
-      }
-      .ve-tab-panel { display: none; animation: veIn 0.16s steps(2); }
-      .ve-tab-panel.active { display: block; }
-      @keyframes veIn { from { opacity: 0; transform: translateY(2px); } to { opacity: 1; transform: translateY(0); } }
-      .ve-section {
-        margin-bottom: 14px;
-        padding: 12px;
-        border: 1px solid #1A1D20;
-        border-radius: 1px;
-        background: #F5F1EB;
-        color: #0A0A0D;
-        position: relative;
-        box-shadow: 0 1px 0 #000, inset 0 1px 0 rgba(255,255,255,0.7);
-      }
-      .ve-section::before, .ve-section::after {
-        content: '';
-        position: absolute;
-        top: 6px; width: 7px; height: 7px;
-        background: #0A0A0D;
-        border-radius: 50%;
-        box-shadow: inset 0 1px 1px rgba(255,255,255,0.25);
-      }
-      .ve-section::before { left: 6px; }
-      .ve-section::after { right: 6px; }
-      .ve-section-title {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 10px;
-        margin: -2px 0 12px;
-        padding-bottom: 8px;
-        border-bottom: 1px solid #E0D8CC;
-        font-family: 'Barlow Condensed', sans-serif;
-        font-size: 12px;
-        font-weight: 700;
-        letter-spacing: 0.09em;
-        text-transform: uppercase;
-        color: #1A1A18;
-      }
-      .ve-section-title i { color: var(--cut-orange); }
-      .ve-row { display: flex; gap: 8px; margin-bottom: 8px; }
-      .ve-row:last-child { margin-bottom: 0; }
-      .ve-row > * { flex: 1; }
-      .ve-input, .ve-select, .ve-textarea {
-        width: 100%;
-        border-radius: 1px;
-        border: 1.5px solid #1A1D20;
-        background: #fff;
-        color: #0A0A0D;
-        padding: 9px 10px;
-        font-family: 'Instrument Sans', sans-serif;
-        font-size: 12.5px;
-        outline: none;
-      }
-      .ve-input:focus, .ve-select:focus, .ve-textarea:focus {
-        border-color: var(--cut-orange);
-        box-shadow: inset 0 1px 0 rgba(0,0,0,0.04), 0 0 0 2px rgba(255,59,10,0.28);
-      }
-      .ve-textarea { min-height: 74px; resize: vertical; font-family: 'JetBrains Mono', monospace; font-size: 11.5px; }
-      .ve-input::placeholder, .ve-textarea::placeholder { color: #6B6760; }
-      .ve-button {
-        cursor: pointer;
-        font-family: 'Barlow Condensed', sans-serif;
-        font-size: 12px;
-        font-weight: 700;
-        letter-spacing: 0.07em;
-        text-transform: uppercase;
-        white-space: nowrap;
-        border: 1.5px solid #000;
-        border-radius: 1px;
-        padding: 9px 10px;
-        transition: transform 0.06s steps(2), filter 0.12s ease, box-shadow 0.06s steps(2);
-      }
-      .ve-button:hover:not(:disabled) { transform: translateY(-1px); filter: brightness(1.03); box-shadow: 0 3px 0 #000; }
-      .ve-button:active:not(:disabled) { transform: translateY(0); box-shadow: 0 1px 0 #000; }
-      .ve-button:disabled { opacity: 0.42; cursor: not-allowed; }
-      .ve-button.primary { background: var(--cut-orange); color: #fff; border-color: #000; }
-      .ve-button.success { background: #0EA768; border-color: #000; color: #fff; }
-      .ve-button.warn { background: #FFC83D; border-color: #000; color: #0A0A0D; }
-      .ve-button.danger { background: #1A1A1E; color: var(--cut-orange); border-color: #000; }
-      .ve-button.ghost { background: #fff; color: #0A0A0D; border-color: #1A1D20; }
-      .ve-icon-button { flex: 0 0 34px; width: 34px; min-width: 34px; padding: 7px 0; font-size: 13px; }
-      .ve-muted { color: #5A5752; font-size: 11.5px; font-family: 'Instrument Sans', sans-serif; }
-      .ve-stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; }
-      .ve-stat {
-        padding: 10px 8px 9px;
-        border-radius: 1px;
-        background: #fff;
-        border: 1px solid #D8D0C2;
-        position: relative; overflow: hidden;
-      }
-      .ve-stat::after { content: ''; position: absolute; left: 0; right: 0; top: 0; height: 3px; background: var(--cut-orange); }
-      .ve-stat strong { display: block; font-family: 'Barlow Condensed', sans-serif; font-size: 22px; font-weight: 700; line-height: 1; color: #0A0A0D; }
-      .ve-stat span { font-family: 'JetBrains Mono', monospace; font-size: 9.5px; letter-spacing: 0.08em; text-transform: uppercase; color: #6B6760; }
-      .ve-stat.failures { background: #FFF1E6; border-color: #E8A08A; }
-      .ve-stat.failures::after { background: #000; }
-      .ve-stat.failures strong { color: var(--cut-orange); }
-      .ve-table { width: 100%; border-collapse: collapse; font-size: 11.5px; font-family: 'Instrument Sans', sans-serif; }
-      .ve-table th, .ve-table td { border-bottom: 1px solid #E8E2D6; padding: 9px 6px; vertical-align: top; text-align: left; }
-      .ve-table th { font-family: 'JetBrains Mono', monospace; font-size: 9.5px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #5A5752; background: #F7F3EC; border-bottom: 1px solid #D8D0C2; }
-      .ve-table tr:hover td { background: #FFF8EE; }
-      .ve-thumb { width: 44px; height: 32px; flex: 0 0 44px; border-radius: 1px; background: #0A0A0D center / cover no-repeat; border: 1px solid #000; }
-      .ve-media-cell { display: flex; align-items: flex-start; gap: 8px; min-width: 0; }
-      .ve-title-line { word-break: break-word; color: #0A0A0D; font-weight: 600; font-size: 12px; line-height: 1.25; }
-      .ve-badge {
-        display: inline-flex; align-items: center; gap: 5px;
-        padding: 3px 6px; border-radius: 1px;
-        font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700;
-        text-transform: uppercase; letter-spacing: 0.06em;
-        border: 1px solid #000;
-      }
-      .ve-badge::before { content: ''; width: 7px; height: 7px; border: 1px solid currentColor; background: transparent; }
-      .ve-badge.idle { background: #EDE8DF; color: #5A5752; }
-      .ve-badge.started, .ve-badge.submitted, .ve-badge.running { background: var(--cut-orange); color: #fff; }
-      .ve-badge.started::before, .ve-badge.submitted::before, .ve-badge.running::before { background: #fff; border-color: #fff; box-shadow: 0 0 0 1px #000; }
-      .ve-badge.completed { background: #0EA768; color: #fff; }
-      .ve-badge.completed::before { content: 'X'; font-size: 9px; border: 0; width: auto; height: auto; }
-      .ve-badge.failed { background: #0A0A0D; color: var(--cut-orange); }
-      .ve-badge.parallel_limit { background: #FFC83D; color: #0A0A0D; }
-      .ve-badge.skipped { background: #EDE8DF; color: #8A8680; border-style: dashed; }
-      .ve-info { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; margin-left: 6px; border-radius: 50%; border: 1px solid #1A1D20; background: #fff; color: #1A1D20; font-family: 'JetBrains Mono', monospace; font-size: 8px; font-weight: 700; cursor: help; }
-      .ve-info:hover { background: var(--cut-orange); color: #fff; border-color: #000; }
-      .ve-retry-btn { display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px; border-radius: 1px; border: 1.5px solid #000; background: #fff; color: #0A0A0D; font-family: 'Barlow Condensed', sans-serif; font-size: 10px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; cursor: pointer; }
-      .ve-retry-btn:hover { background: var(--cut-orange); color: #fff; }
-      .ve-folder-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
-      .ve-folder-card { min-height: 78px; border: 1px solid #1A1D20; border-radius: 1px; background: #F5F1EB; color: #0A0A0D; cursor: pointer; padding: 10px 9px 8px; text-align: left; position: relative; box-shadow: 0 1px 0 #000; }
-      .ve-folder-card::before { content: ''; position: absolute; left: 0; right: 0; top: 0; height: 2px; background: var(--cut-orange); opacity: 0; }
-      .ve-folder-card:hover { border-color: #000; background: #fff; }
-      .ve-folder-card:hover::before { opacity: 1; }
-      .ve-folder-card.active { border-color: #000; background: #fff; box-shadow: inset 0 0 0 1px #000, 0 2px 0 #000; }
-      .ve-folder-card.active::before { opacity: 1; }
-      .ve-folder-card.active::after { content: '◆'; position: absolute; top: 6px; right: 7px; font-size: 7px; color: var(--cut-orange); }
-      .ve-folder-card i { color: #000; font-size: 18px; }
-      .ve-folder-card.active i { color: var(--cut-orange); }
-      .ve-folder-card strong { display: block; margin-top: 6px; font-family: 'Barlow Condensed', sans-serif; font-size: 12px; font-weight: 700; line-height: 1.15; letter-spacing: 0.02em; text-transform: uppercase; word-break: break-word; }
-      .ve-folder-card .ve-muted { font-family: 'JetBrains Mono', monospace; font-size: 9px; }
-      .ve-file-picker, .ve-download-controls { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-      .ve-download-controls { grid-template-columns: 1fr 1fr 1fr; }
-      .ve-check-cell { width: 32px; text-align: center !important; }
-      .ve-checkbox { width: 15px; height: 15px; cursor: pointer; accent-color: var(--cut-orange); }
-      .ve-progress { height: 10px; overflow: hidden; border-radius: 1px; background: #0A0A0D; border: 1px solid #000; position: relative; }
-      .ve-progress::before { content: ''; position: absolute; inset: 0; background: repeating-linear-gradient(90deg, transparent 0 8px, rgba(255,255,255,0.06) 8px 9px); }
-      .ve-progress-bar { width: 0%; height: 100%; background: var(--cut-orange); transition: width 0.2s steps(2); position: relative; border-right: 1px solid #fff; }
-      .ve-file-input { display: none; }
-      .ve-hidden { display: none !important; }
-      #ve-manager-toggle { margin-top: 10px; margin-left: auto; display: block; width: 54px; height: 54px; border-radius: 2px; border: 1.5px solid #000; cursor: pointer; color: #fff; font-size: 18px; font-weight: 700; background: var(--cut-orange); box-shadow: 0 8px 22px rgba(0,0,0,0.45); font-family: 'Barlow Condensed', sans-serif; }
-      #ve-manager-toggle:hover { background: #FF4D1A; transform: translateY(-1px); }
-      #ve-manager-toggle:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
-      @media (max-width: 640px) {
-        #ve-manager-root { top: 8px; right: 8px; left: 8px; }
-        #ve-manager-panel { width: auto; max-height: calc(100vh - 16px); }
-        .ve-folder-grid, .ve-stats, .ve-file-picker, .ve-download-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-        .ve-row { flex-wrap: wrap; }
-      }
+      @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=JetBrains+Mono:wght@400;600&family=Instrument+Sans:wght@400;500;600&display=swap');
+#ve-manager-root {
+    position: fixed;
+    top: 72px;
+    right: 16px;
+    z-index: 2147483647;
+    font-family: 'Instrument Sans', 'Barlow Condensed', system-ui, sans-serif;
+    color: #111827;
+    --cut-orange: #6F5CCF;
+    --cut-orange-deep: #5B4DB3;
+    --cut-orange-soft: #8A75D6;
+    --cut-black: #111827;
+    --cut-panel: #F5F6F8;
+    --cut-window: #FFFFFF;
+    --cut-window-warm: #F9FAFB;
+    --cut-ink: #111827;
+    --cut-line: #E6E8EF;
+    --cut-line-soft: #DADDE3;
+    --cut-border-warm: #E9EBEF;
+    --cut-border-warm-2: #E9EBEF;
+    --cut-muted: #6E7583;
+    --cut-muted-light: #9AA0B0;
+    --cut-success: #0EA768;
+    --cut-warn: #F59E0B;
+    --cut-danger-ink: #111827;
+  }
+  #ve-manager-root[data-theme="bench"] {
+    --cut-orange: #FF3B0A;
+    --cut-orange-deep: #D12E04;
+    --cut-orange-soft: #FF6B35;
+    --cut-black: #0A0A0D;
+    --cut-panel: #0F1012;
+    --cut-window: #F5F1EB;
+    --cut-window-warm: #F7F3EC;
+    --cut-ink: #1A1A18;
+    --cut-line: #1A1D20;
+    --cut-line-soft: #2A2E33;
+    --cut-border-warm: #D8D0C2;
+    --cut-border-warm-2: #E0D8CC;
+    --cut-muted: #5A5752;
+    --cut-muted-light: #6B6760;
+    --cut-success: #0EA768;
+    --cut-warn: #FFC83D;
+    --cut-danger-ink: #1A1A1E;
+  }
+  #ve-manager-root[data-theme="teal"] {
+    --cut-orange: #0F766E;
+    --cut-orange-deep: #115E59;
+    --cut-orange-soft: #14B8A6;
+    --cut-black: #042F2E;
+    --cut-panel: #0B1A1F;
+    --cut-window: #F0FDFA;
+    --cut-window-warm: #CCFBF1;
+    --cut-ink: #042F2E;
+    --cut-line: #134E4A;
+    --cut-line-soft: #1F5F57;
+    --cut-border-warm: #99F6E4;
+    --cut-border-warm-2: #5EEAD4;
+    --cut-muted: #5F6B6A;
+    --cut-muted-light: #7A8A89;
+    --cut-success: #0EA768;
+    --cut-warn: #F59E0B;
+    --cut-danger-ink: #042F2E;
+  }
+  #ve-manager-root[data-theme="amber"] {
+    --cut-orange: #D97706;
+    --cut-orange-deep: #B45309;
+    --cut-orange-soft: #F59E0B;
+    --cut-black: #1C1917;
+    --cut-panel: #292524;
+    --cut-window: #FFFBEB;
+    --cut-window-warm: #FEF3C7;
+    --cut-ink: #1C1917;
+    --cut-line: #44403C;
+    --cut-line-soft: #57534E;
+    --cut-border-warm: #FDE68A;
+    --cut-border-warm-2: #FCD34D;
+    --cut-muted: #78716C;
+    --cut-muted-light: #A8A29E;
+    --cut-success: #0EA768;
+    --cut-warn: #F59E0B;
+    --cut-danger-ink: #1C1917;
+  }
+  #ve-manager-root * { scrollbar-width: thin; scrollbar-color: var(--cut-line-soft) transparent; }
+  #ve-manager-panel {
+    width: min(660px, calc(100vw - 24px));
+    max-height: calc(100vh - 88px);
+    overflow: hidden;
+    background: var(--cut-panel);
+    border: 1px solid #E2E4E9;
+    border-radius: 12px;
+    box-shadow: 0 12px 40px rgba(17,24,39,0.11), 0 1px 0 rgba(17,24,39,0.06) inset;
+    display: flex;
+    flex-direction: column;
+  }
+  #ve-manager-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 11px 12px 10px;
+    background: var(--cut-orange);
+    border-bottom: 1px solid rgba(0,0,0,0.07);
+    cursor: move;
+    user-select: none;
+    position: relative;
+  }
+  /* sprocket removed — visual noise */
+  #ve-manager-title {
+    font-family: 'Barlow Condensed', sans-serif;
+    font-size: 16px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: #fff;
+    line-height: 1;
+    text-shadow: none;
+  }
+  #ve-manager-header .ve-header-sub {
+    font-family: 'Instrument Sans', sans-serif;
+    font-size: 11px;
+    letter-spacing: 0.01em;
+    color: rgba(255,255,255,0.88);
+    margin-top: 2px;
+    font-weight: 500;
+  }
+  #ve-manager-header button {
+    cursor: pointer;
+    border: 1px solid rgba(0,0,0,0.10);
+    background: rgba(255,255,255,0.94);
+    color: #0A0A0D;
+    border-radius: 1px;
+    width: 30px; height: 30px;
+    display: grid; place-items: center;
+  }
+  #ve-manager-body {
+    padding: 16px 12px 12px;
+    overflow: auto;
+    max-height: calc(100vh - 150px);
+    background: var(--cut-panel);
+  }
+  #ve-manager-body::-webkit-scrollbar { width: 10px; height: 10px; }
+  #ve-manager-body::-webkit-scrollbar-thumb { background: #DADDE3; border: 1px solid #E6E8EF; border-radius: 999px; }
+  #ve-manager-body::-webkit-scrollbar-track { background: #F5F6F8; }
+
+   /* Context bar — distilled: one line, no double meta */
+  .ve-context-bar {
+    display:flex; align-items:center; justify-content:space-between; gap:10px;
+    background: #FFFFFF; color:#111827; border:1px solid #E6E8EF; border-radius:8px;
+    padding:8px 10px; margin-bottom:10px;
+    position:sticky; top:0; z-index:4;
+  }
+  .ve-context-left { display:flex; align-items:center; gap:8px; min-width:0; }
+  .ve-context-pill {
+    display:inline-flex; align-items:center; gap:6px;
+    background:#F3F4F6; color:#111827; border:1px solid #E5E7EB; border-radius:999px;
+    padding:4px 8px; font-family:'JetBrains Mono',monospace; font-size:10px; font-weight:600;
+    letter-spacing:0.04em; white-space:nowrap;
+  }
+  .ve-context-pill i { color: var(--cut-orange); font-size:11px; }
+  .ve-context-meta { font-family:'Instrument Sans',sans-serif; font-size:11px; color:#6B7280; white-space:nowrap; }
+  .ve-context-meta strong { color:#111827; font-weight:600; }
+  .ve-context-right { display:flex; align-items:center; gap:6px; flex-shrink:0; }
+  .ve-context-select {
+    font-family:'Instrument Sans',sans-serif; font-size:12px; font-weight:500;
+    background:#fff; color:#111827; border:1px solid #D1D5DB; border-radius:6px; padding:6px 8px; cursor:pointer;
+  }
+
+  /* Onboarding — distilled to one line tip */
+  .ve-onboarding {
+    background: #FFFFFF;
+    border:1px solid #E6E8EF; border-radius:8px; padding:8px 10px; margin-bottom:10px;
+    display:flex; gap:10px; align-items:center; position:relative;
+  }
+  .ve-onboarding-icon { width:24px; height:24px; background:#F3F0FF; color:var(--cut-orange); display:grid; place-items:center; flex-shrink:0; border-radius:6px; font-size:12px; }
+  .ve-onboarding h4 { margin:0; font-family:'Instrument Sans',sans-serif; font-size:12px; font-weight:600; color:#111827; }
+  .ve-onboarding p { margin:2px 0 0; font-size:11px; line-height:1.4; color:#6B7280; }
+  .ve-onboarding .ve-step-hint { display:none; }
+  .ve-mini-step { display:none; }
+  .ve-onboarding-dismiss { margin-left:auto; border:0; background:transparent; color:#9CA3AF; width:22px; height:22px; display:grid; place-items:center; cursor:pointer; border-radius:6px; flex-shrink:0; }
+  .ve-onboarding-dismiss:hover{ background:#F3F4F6; color:#111827; }
+
+  /* Stepper */
+  .ve-steps {
+    display:grid; grid-template-columns: 1fr 1fr 1fr 1fr auto;
+    gap:6px; background:transparent; border:0; overflow:visible;
+    margin: 0 0 12px;
+  }
+  .ve-step {
+    background: #FFFFFF;
+    color:#4B5162; border:1px solid #E6E8EF; cursor:pointer; text-align:left;
+    padding:9px 10px 9px; display:flex; flex-direction:column; gap:2px;
+    font-family:'Barlow Condensed',sans-serif; position:relative; min-height:56px;
+    transition: all .14s ease;
+    border-radius:9px;
+    box-shadow: 0 1px 2px rgba(17,24,39,0.04);
+  }
+  .ve-step:hover { border-color:#DADDE3; background:#F9FAFB; }
+  .ve-step.active { background:#FFFFFF; color:#1F2328; border-color: var(--cut-orange); box-shadow: 0 0 0 3px rgba(111,92,207,0.12), 0 1px 2px rgba(17,24,39,0.04); }
+  .ve-step-top { display:flex; align-items:center; gap:6px; font-size:10px; font-weight:700; letter-spacing:0.08em; text-transform:uppercase; opacity:.9; }
+  .ve-step.active .ve-step-top { color: var(--cut-orange); }
+  .ve-step-num { width:18px; height:18px; display:grid; place-items:center; border:1px solid #DADDE3; background:#F5F6F8; color:#6E7583; font-family:'JetBrains Mono',monospace; font-size:9px; font-weight:600; border-radius:999px; flex-shrink:0; }
+  .ve-step.active .ve-step-num { background:var(--cut-orange); color:#fff; border-color:var(--cut-orange); }
+  .ve-step strong { font-size:11px; letter-spacing:0.06em; text-transform:uppercase; line-height:1.1; }
+  .ve-step span { font-family:'Instrument Sans',sans-serif; font-size:10.5px; font-weight:500; opacity:.82; text-transform:none; letter-spacing:0; line-height:1.1; white-space:nowrap; }
+  .ve-step.active span { opacity:.7; color:#3A3A36; }
+  .ve-step--log { min-width:56px; align-items:center; justify-content:center; text-align:center; padding:8px 6px; }
+  .ve-step--log i { font-size:14px; }
+  .ve-step--log span { font-family:'JetBrains Mono',monospace; font-size:9px; letter-spacing:0.06em; text-transform:uppercase; }
+  .ve-step-dot { position:absolute; top:6px; right:7px; width:6px; height:6px; background:#fff; border:1px solid #000; border-radius:50%; opacity:0; }
+  .ve-step.has-activity .ve-step-dot { opacity:1; background: var(--cut-warn); }
+  .ve-step.active.has-activity .ve-step-dot { background: var(--cut-orange); }
+
+  .ve-tab-panel { display: none; animation: veIn 0.16s steps(2); }
+  .ve-tab-panel.active { display: block; }
+  @keyframes veIn { from { opacity: 0; transform: translateY(2px); } to { opacity: 1; transform: translateY(0); } }
+
+  .ve-section {
+    margin-bottom: 10px;
+    padding: 14px 13px;
+    border: 1px solid #E5E7EB;
+    border-radius: 8px;
+    background: #FFFFFF;
+    color: #111827;
+    position: relative;
+  }
+  .ve-section-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin: 0 0 10px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid #E6E8EF;
+    font-family: 'Barlow Condensed', sans-serif;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: #111827;
+  }
+  .ve-section-title i { color: var(--cut-orange); }
+  .ve-section-help { font-family:'Instrument Sans',sans-serif; font-size:11px; color:#6B7280; margin:0 0 10px; line-height:1.45; }
+  /* kicker removed — banned per craft floor, heading carries weight */
+  .ve-row { display: flex; gap: 8px; margin-bottom: 8px; }
+  .ve-row:last-child { margin-bottom: 0; }
+  .ve-row > * { flex: 1; }
+  .ve-input, .ve-select, .ve-textarea {
+    width: 100%;
+    border-radius: 8px;
+    border: 1px solid #DADDE3;
+    background: #fff;
+    color: #0A0A0D;
+    padding: 9px 10px;
+    font-family: 'Instrument Sans', sans-serif;
+    font-size: 12.5px;
+    outline: none;
+  }
+  .ve-input:focus, .ve-select:focus, .ve-textarea:focus {
+    border-color: var(--cut-orange);
+    box-shadow: 0 0 0 3px rgba(111,92,207,0.12);
+  }
+  .ve-textarea { min-height: 68px; resize: vertical; font-family: 'JetBrains Mono', monospace; font-size: 11.5px; line-height:1.5; }
+  .ve-input::placeholder, .ve-textarea::placeholder { color: #8A8680; }
+  .ve-field-label { display:block; font-family:'JetBrains Mono',monospace; font-size:9px; font-weight:700; letter-spacing:0.07em; text-transform:uppercase; color:#5A5752; margin-bottom:4px; }
+  .ve-field-hint { font-size:10.5px; color:#6B6760; margin-top:3px; line-height:1.3; }
+  .ve-button {
+    cursor: pointer;
+    font-family: 'Barlow Condensed', sans-serif;
+    font-size: 11.5px;
+    font-weight: 700;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    white-space: nowrap;
+    border: 1px solid rgba(0,0,0,0.10);
+    border-radius: 8px;
+    padding: 8px 11px;
+    transition: all .14s ease;
+    display:inline-flex; align-items:center; justify-content:center; gap:6px;
+  }
+  .ve-button:hover:not(:disabled) { transform: translateY(-0.5px); filter: brightness(1.02); box-shadow: 0 2px 8px rgba(17,24,39,0.07); }
+  .ve-button:active:not(:disabled) { transform: translateY(0); box-shadow: 0 1px 2px rgba(17,24,39,0.06); }
+  .ve-button:disabled { opacity: 0.42; cursor: not-allowed; transform:none; box-shadow:none; }
+  .ve-button.primary { background: var(--cut-orange); color: #fff; border-color: #000; }
+  .ve-button.success { background: #0EA768; border-color: #000; color: #fff; }
+  .ve-button.warn { background: #FFC83D; border-color: #000; color: #0A0A0D; }
+  .ve-button.danger { background: #1A1A1E; color: #FFC83D; border-color: #000; }
+  .ve-button.ghost { background: #fff; color: #0A0A0D; border-color: #1A1D20; }
+  .ve-button.small { padding:6px 8px; font-size:10.5px; }
+  .ve-icon-button { flex: 0 0 34px; width: 34px; min-width: 34px; padding: 7px 0; font-size: 13px; }
+  .ve-muted { color: #5A5752; font-size: 11.5px; font-family: 'Instrument Sans', sans-serif; line-height:1.4; }
+  .ve-empty {
+    text-align:center; padding:18px 12px; border:1px dashed #DADDE3; background: #FFFFFF; border-radius:1px;
+  }
+  .ve-empty i { font-size:22px; color: var(--cut-orange); display:block; margin-bottom:6px; }
+  .ve-empty strong { font-family:'Barlow Condensed',sans-serif; font-size:11px; letter-spacing:0.07em; text-transform:uppercase; color:#0A0A0D; }
+  .ve-empty p { margin:4px 0 10px; font-size:11.5px; color:#6B6760; }
+  /* Stats distilled: inline summary replaces 5 cards */
+  .ve-stats { display:none; }
+  .ve-stat { display:none; }
+  .ve-status-line { display:flex; flex-wrap:wrap; gap:8px; align-items:center; font-family:'JetBrains Mono',monospace; font-size:10px; color:#6B7280; background:#F9FAFB; border:1px solid #E6E8EF; border-radius:6px; padding:7px 9px; }
+  .ve-status-line strong { color:#111827; font-weight:700; }
+  .ve-status-line .dot { width:6px; height:6px; border-radius:50%; background:#D1D5DB; display:inline-block; }
+  .ve-status-line .dot.running{ background:var(--cut-orange); }
+  .ve-status-line .dot.done{ background:#0EA768; }
+  .ve-status-line .dot.fail{ background:#111827; }
+  .ve-table { width: 100%; border-collapse: collapse; font-size: 11.5px; font-family: 'Instrument Sans', sans-serif; }
+  .ve-table th, .ve-table td { border-bottom: 1px solid #EFF0F3; padding: 9px 6px; vertical-align: top; text-align: left; }
+  .ve-table th { font-family: 'JetBrains Mono', monospace; font-size: 9px; font-weight: 600; letter-spacing: 0.07em; text-transform: uppercase; color: #5A5752; background: #F9FAFB; border-bottom: 1px solid #E6E8EF; }
+  .ve-table tr:hover td { background: #FFF8EE; }
+  .ve-thumb { width: 44px; height: 32px; flex: 0 0 44px; border-radius: 1px; background: #F5F6F8 center / cover no-repeat; border: 1px solid #E6E8EF; }
+  .ve-media-cell { display: flex; align-items: flex-start; gap: 8px; min-width: 0; }
+  .ve-title-line { word-break: break-word; color: #0A0A0D; font-weight: 600; font-size: 12px; line-height: 1.25; }
+  .ve-badge {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 3px 6px; border-radius: 1px;
+    font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.06em;
+    border: 1px solid #E6E8EF;
+  }
+  .ve-badge::before { content: ''; width: 7px; height: 7px; border: 1px solid currentColor; background: transparent; }
+  .ve-badge.idle { background: #EDE8DF; color: #5A5752; }
+  .ve-badge.started, .ve-badge.submitted, .ve-badge.running { background: var(--cut-orange); color: #fff; }
+  .ve-badge.started::before, .ve-badge.submitted::before, .ve-badge.running::before { background: #fff; border-color: #fff; box-shadow: 0 0 0 1px #000; }
+  .ve-badge.completed { background: #0EA768; color: #fff; }
+  .ve-badge.completed::before { content: '✓'; font-size: 9px; border: 0; width: auto; height: auto; background:transparent; }
+  .ve-badge.failed { background: #0A0A0D; color: #FFC83D; }
+  .ve-badge.parallel_limit { background: #FFC83D; color: #0A0A0D; }
+  .ve-badge.skipped { background: #EDE8DF; color: #8A8680; border-style: dashed; }
+  .ve-info { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; margin-left: 6px; border-radius: 50%; border: 1px solid #DADDE3; background: #F9FAFB; color: #1A1D20; font-family: 'JetBrains Mono', monospace; font-size: 8px; font-weight: 700; cursor: help; }
+  .ve-info:hover { background: var(--cut-orange); color: #fff; border-color: #000; }
+  .ve-retry-btn { display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px; border-radius: 1px; border: 1.5px solid #000; background: #fff; color: #0A0A0D; font-family: 'Barlow Condensed', sans-serif; font-size: 10px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; cursor: pointer; }
+  .ve-retry-btn:hover { background: var(--cut-orange); color: #fff; }
+  .ve-folder-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+  .ve-folder-card { min-height: 66px; border: 1px solid #E5E7EB; border-radius: 8px; background: #FFFFFF; color: #111827; cursor: pointer; padding: 10px 9px 8px; text-align: left; position: relative; transition: all .12s ease; }
+  .ve-folder-card:hover { border-color: #D1D5DB; background: #F9FAFB; }
+  .ve-folder-card.active { border-color: var(--cut-orange); background: #FFFFFF; box-shadow: 0 0 0 2px rgba(111,92,207,0.12); }
+  .ve-folder-card i { color: #6B6760; font-size: 17px; }
+  .ve-folder-card.active i { color: var(--cut-orange); }
+  .ve-folder-card strong { display: block; margin-top: 6px; font-family: 'Barlow Condensed', sans-serif; font-size: 11px; font-weight: 700; line-height: 1.15; letter-spacing: 0.02em; text-transform: uppercase; word-break: break-word; }
+  .ve-folder-card .ve-muted { font-family: 'JetBrains Mono', monospace; font-size: 9px; }
+  .ve-file-drop { border: 1px dashed #D1D5DB; background:#F9FAFB; border-radius:8px; padding:12px; text-align:center; margin-bottom:8px; transition: all .12s; }
+  .ve-file-drop.has-files { border-color: var(--cut-orange); background: #F5F0FF; border-style:solid; }
+  .ve-file-drop i { font-size:18px; color:var(--cut-orange); }
+  .ve-file-drop p { margin:4px 0 0; font-size:12px; color:#374151; }
+  .ve-file-picker, .ve-download-controls { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .ve-download-controls { grid-template-columns: 1fr 1fr 1fr; }
+  .ve-check-cell { width: 32px; text-align: center !important; }
+  .ve-checkbox { width: 15px; height: 15px; cursor: pointer; accent-color: var(--cut-orange); }
+  .ve-progress { height: 6px; overflow: hidden; border-radius: 999px; background: #EFF0F3; border: 0; position: relative; }
+  .ve-progress::before { display:none; }
+  .ve-progress-bar { width: 0%; height: 100%; background: var(--cut-orange); transition: width 0.3s ease; position: relative; border-radius:999px; }
+   #ve-manager-root .ve-file-input, .ve-file-input { display: none !important; position: absolute !important; width: 1px !important; height: 1px !important; overflow: hidden !important; clip: rect(0,0,0,0) !important; clip-path: inset(50%) !important; white-space: nowrap !important; border: 0 !important; padding: 0 !important; margin: -1px !important; pointer-events: none !important; opacity: 0 !important; }
+   /* extra guard: any file input inside the panel that isn't styled as ve-file-input */
+   #ve-manager-root input[type="file"].ve-file-input { display: none !important; }
+   .ve-hidden { display: none !important; }
+  #ve-manager-toggle { margin-top: 10px; margin-left: auto; display: block; width: 54px; height: 54px; border-radius: 2px; border: 1.5px solid #000; cursor: pointer; color: #fff; font-size: 18px; font-weight: 700; background: var(--cut-orange); box-shadow: 0 8px 22px rgba(0,0,0,0.45); font-family: 'Barlow Condensed', sans-serif; }
+  #ve-manager-toggle:hover { filter: brightness(1.08); transform: translateY(-1px); }
+  #ve-manager-toggle:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+  .ve-log { background:#1F2328; color:#E6E8EF; border:1px solid #2A2E33; border-radius:8px; padding:10px; font-family:'JetBrains Mono',monospace; font-size:11px; line-height:1.45; min-height:96px; max-height:220px; overflow:auto; white-space:pre-wrap; word-break:break-word; }
+  .ve-next-cta { display:none; }
+  .ve-advanced-toggle { width:100%; display:flex; align-items:center; justify-content:space-between; background:#F9FAFB; border:1px solid #E6E8EF; border-radius:1px; padding:8px 10px; cursor:pointer; font-family:'Barlow Condensed',sans-serif; font-size:11px; font-weight:700; letter-spacing:0.06em; text-transform:uppercase; color:#0A0A0D; }
+  .ve-advanced-toggle i { transition: transform .15s; }
+  .ve-advanced-toggle[aria-expanded="true"] i { transform: rotate(180deg); }
+  .ve-collapsible { overflow:hidden; transition: max-height .2s ease; }
+  .ve-collapsible.collapsed { max-height:0 !important; opacity:0; pointer-events:none; }
+  .ve-collapsible.expanded { max-height:800px; opacity:1; }
+  /* Session creator — primary action, distilled */
+  #ve-session-section { border-color: var(--cut-line); }
+  #ve-session-preview { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+  #ve-session-preview-name { font-family:'JetBrains Mono',monospace; font-weight:700; color: var(--cut-orange); word-break:break-all; }
+  #ve-session-section .ve-field-label { color: var(--cut-ink); }
+  .ve-session-badge { display:inline-flex; align-items:center; gap:4px; font-family:'JetBrains Mono',monospace; font-size:8px; font-weight:700; letter-spacing:0.06em; text-transform:uppercase; background:#F3F0FF; color:var(--cut-orange); border:1px solid #E6E8EF; border-radius:4px; padding:2px 5px; }
+  .ve-folder-card.is-session { border-color: var(--cut-orange); }
+  .ve-folder-card.is-session::after { content:'SESSION'; position:absolute; top:6px; right:6px; font-family:'JetBrains Mono',monospace; font-size:7px; font-weight:700; letter-spacing:0.06em; color:#fff; background:var(--cut-orange); border:1px solid var(--cut-orange-deep); border-radius:4px; padding:1px 4px; line-height:1; }
+  /* helper toolbar under context bar */
+  .ve-toolbar { display:flex; gap:6px; margin-bottom:8px; }
+  .ve-toolbar .ve-button{ flex:1; }
+  @media (max-width: 640px) {
+    #ve-manager-root { top: 8px; right: 8px; left: 8px; }
+    #ve-manager-panel { width: auto; max-height: calc(100vh - 16px); }
+    .ve-folder-grid, .ve-stats, .ve-file-picker, .ve-download-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .ve-row { flex-wrap: wrap; }
+    .ve-steps { grid-template-columns: 1fr 1fr; }
+    .ve-step--log{ grid-column: span 2; flex-direction:row; min-height:36px; }
+  }
+
+  /* Upload summary — stateful, failure impossible to miss */
+  #ve-upload-summary { margin-top:8px; background:#fff; border:1px solid #E0D8CC; border-radius:6px; padding:8px 9px; font-family:'Instrument Sans',sans-serif; font-size:11.5px; line-height:1.4; display:flex; align-items:flex-start; gap:8px; transition:all .14s ease; }
+  #ve-upload-summary.is-idle { background:#fff; color:#5A5752; border-color:#E0D8CC; }
+  #ve-upload-summary.is-selected { background:#F9FAFB; color:#111827; border-color:#E6E8EF; }
+  #ve-upload-summary.is-uploading { background:#F3F0FF; color:#6D28D9; border-color:var(--cut-orange); border-left-width:3px; }
+  #ve-upload-summary.is-success { background:#ECFDF5; color:#065F46; border-color:#0EA768; border-left-width:3px; border-left-color:#0EA768; }
+  #ve-upload-summary.is-error { background:#FFFBEB; color:#111827; border-color:#F59E0B; border-left-width:3px; border-left-color:#F59E0B; box-shadow:0 0 0 3px rgba(245,158,11,0.14); animation: veShake .32s ease 1; }
+  #ve-upload-summary i.ve-summary-icon { font-size:15px; flex-shrink:0; margin-top:1px; }
+  #ve-upload-summary .ve-summary-main { flex:1; min-width:0; }
+  #ve-upload-summary .ve-summary-title { font-family:'Barlow Condensed',sans-serif; font-size:11px; font-weight:700; letter-spacing:0.06em; text-transform:uppercase; line-height:1.1; }
+  #ve-upload-summary .ve-summary-detail { font-size:11px; color:inherit; opacity:.92; word-break:break-word; }
+  #ve-upload-summary .ve-summary-detail strong { color:inherit; }
+  #ve-upload-summary .ve-fail-chip { display:inline-flex; align-items:center; font-family:'JetBrains Mono',monospace; font-size:9px; font-weight:700; background:#1A1A1E; color:#FFC83D; border:1px solid #000; border-radius:4px; padding:2px 6px; margin:3px 4px 0 0; max-width:100%; word-break:break-all; }
+  @keyframes veShake { 0%,100%{ transform:translateX(0)} 20%{ transform:translateX(-2px)} 40%{ transform:translateX(2px)} 60%{ transform:translateX(-1px)} 80%{ transform:translateX(1px)} }
 
     </style>
     <div id="ve-manager-panel">
       <div id="ve-manager-header">
         <div>
           <div id="ve-manager-title">VideoExpress Manager</div>
-          <div class="ve-muted">Image → Video batch • Library 4 • 5-parallel safe</div>
+           <div class="ve-header-sub">Batch image → video · Library 4 · drag header to move</div>
         </div>
-        <select id="ve-theme-select" class="ve-select" style="width:auto;min-width:138px;padding:6px 28px 6px 10px;font-family:'Barlow Condensed',sans-serif;font-size:11px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;border:1.5px solid #000;background:#fff;color:#111827;border-radius:1px;cursor:pointer" title="Palette — VideoExpress is site-matched (default); Bench is red on black">
+        <div style="display:flex; gap:6px; align-items:center;">
+          <select id="ve-theme-select" class="ve-select" style="width:auto;min-width:128px;padding:6px 28px 6px 10px;font-family:'Barlow Condensed',sans-serif;font-size:11px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;border:1.5px solid #000;background:#fff;color:#111827;border-radius:1px;cursor:pointer" title="Palette">
             <option value="videoexpress">VideoExpress</option>
             <option value="bench">Bench Red</option>
             <option value="teal">Teal Dark</option>
             <option value="amber">Amber Warm</option>
           </select>
           <button class="ve-button ghost ve-icon-button" id="ve-close-btn" title="Hide panel"><i class="bi bi-x-lg"></i></button>
+        </div>
       </div>
       <div id="ve-manager-body">
-        <div class="ve-tabs" role="tablist">
-          <button class="ve-tab active" data-tab="folders" type="button" title="Browse library folders (ID 4)"><i class="bi bi-folder2-open"></i>Folders</button>
-          <button class="ve-tab" data-tab="upload" type="button" title="Add images to a folder"><i class="bi bi-upload"></i>Add</button>
-          <button class="ve-tab" data-tab="queue" type="button" title="Generate videos from images"><i class="bi bi-play-circle"></i>Generate</button>
-          <button class="ve-tab" data-tab="downloads" type="button" title="Download completed videos"><i class="bi bi-download"></i>Downloads</button>
-          <button class="ve-tab" data-tab="timeline" type="button" title="Stitch videos into a timeline"><i class="bi bi-view-list"></i>Timeline</button>
-          <button class="ve-tab" data-tab="activity" type="button" title="Event log"><i class="bi bi-activity"></i>Log</button>
-        </div>
-        <div class="ve-tab-panel active" data-panel="folders">
-        <div class="ve-section">
-          <div class="ve-section-title">
-            <span><i class="bi bi-collection-play"></i> Library folders</span>
-            <button class="ve-button ghost ve-icon-button" id="ve-refresh-btn" title="Refresh folders"><i class="bi bi-arrow-clockwise"></i></button>
+        <!-- Persistent context bar: single source of truth for folder -->
+        <div class="ve-context-bar" id="ve-context-bar">
+          <div class="ve-context-left">
+            <span class="ve-context-pill" id="ve-context-pill"><i class="bi bi-folder2"></i> <span id="ve-context-name">product-shots-04</span> <small id="ve-context-id" style="opacity:.65">#101</small></span>
+            <span class="ve-context-meta" id="ve-context-meta"><strong id="ve-context-count">8</strong> images · <strong id="ve-context-done">2</strong> done</span>
           </div>
-          <div class="ve-row">
-            <select class="ve-select" id="ve-folder-select"></select>
-          </div>
-          <div class="ve-folder-grid" id="ve-folder-grid"></div>
-          <div class="ve-row" style="margin-top:10px">
-            <button class="ve-button ghost" id="ve-show-create-folder-btn" type="button"><i class="bi bi-folder-plus"></i> Create folder</button>
-            <button class="ve-button primary" id="ve-show-upload-btn" type="button"><i class="bi bi-upload"></i> Upload images</button>
+          <div class="ve-context-right">
+            <select id="ve-context-select" class="ve-context-select" title="Switch active folder"></select>
+            <button class="ve-button ghost small" id="ve-context-change-btn" type="button" style="padding:5px 7px; border:1px solid #E6E8EF; color:#111827; background:#fff;"><i class="bi bi-arrow-repeat"></i></button>
           </div>
         </div>
-        <div class="ve-section">
-          <div class="ve-section-title"><span><i class="bi bi-folder-plus"></i> Create folder</span></div>
-          <div class="ve-row">
-            <input class="ve-input" id="ve-new-folder-input" placeholder="e.g. product-shots-04" aria-label="New folder name" />
-            <button class="ve-button success" id="ve-create-folder-btn"><i class="bi bi-plus-lg"></i> Create folder</button>
+
+        <!-- Onboarding — distilled -->
+        <div class="ve-onboarding" id="ve-onboarding">
+          <div class="ve-onboarding-icon"><i class="bi bi-lightbulb"></i></div>
+          <div style="flex:1; min-width:0;">
+            <h4>Pick a folder → upload → Generate</h4>
+            <p>Queue runs in the background even if you switch tabs.</p>
           </div>
-          <div class="ve-row">
-            <button class="ve-button danger" id="ve-delete-folder-btn" title="Delete the selected library folder — references only, not source files"><i class="bi bi-trash3"></i> Delete folder</button>
+          <button class="ve-onboarding-dismiss" id="ve-onboarding-dismiss" title="Dismiss"><i class="bi bi-x-lg" style="font-size:10px;"></i></button>
+        </div>
+
+        <nav class="ve-steps" role="tablist" aria-label="Workflow steps">
+          <button class="ve-step active" data-tab="library" type="button" role="tab" aria-selected="true"><span class="ve-step-top"><span class="ve-step-num">1</span> Step 01</span><strong>Library</strong><span>Pick & upload images</span><span class="ve-step-dot"></span></button>
+          <button class="ve-step" data-tab="queue" type="button" role="tab" aria-selected="false"><span class="ve-step-top"><span class="ve-step-num">2</span> Step 02</span><strong>Generate</strong><span>Image → Video</span><span class="ve-step-dot"></span></button>
+          <button class="ve-step" data-tab="downloads" type="button" role="tab" aria-selected="false"><span class="ve-step-top"><span class="ve-step-num">3</span> Step 03</span><strong>Collect</strong><span>Download videos</span><span class="ve-step-dot"></span></button>
+          <button class="ve-step" data-tab="timeline" type="button" role="tab" aria-selected="false"><span class="ve-step-top"><span class="ve-step-num">4</span> Step 04</span><strong>Stitch</strong><span>Timeline export</span><span class="ve-step-dot"></span></button>
+          <button class="ve-step ve-step--log" data-tab="activity" type="button" role="tab" aria-selected="false" title="Event log"><i class="bi bi-activity"></i><span>Log</span></button>
+        </nav>
+
+        <!-- LIBRARY -->
+        <div class="ve-tab-panel active" data-panel="library">
+          <!-- Session creator — primary -->
+          <div class="ve-section" id="ve-session-section">
+            <div class="ve-section-title"><span><i class="bi bi-lightning-charge"></i> New session</span><span class="ve-muted" style="font-family:'JetBrains Mono',monospace; font-size:9px;">auto-named · no duplicates</span></div>
+            <p class="ve-section-help">Name it once — we mint the folder with a date-stamped unique suffix so it never collides.</p>
+            <div class="ve-row" style="align-items:flex-end;">
+              <div style="flex:1; min-width:0;">
+                <label class="ve-field-label" for="ve-session-name-input">Session name</label>
+                <input class="ve-input" id="ve-session-name-input" placeholder="Session name" aria-label="Session name" autocomplete="off" />
+              </div>
+              <div style="flex:0 0 auto; display:flex; align-items:flex-end;">
+                <button class="ve-button primary" id="ve-create-session-btn" type="button"><i class="bi bi-plus-lg"></i> Create session</button>
+              </div>
+            </div>
+            <div class="ve-muted" id="ve-session-preview" style="margin-top:8px; background:#F9FAFB; border:1px solid #E6E8EF; border-radius:6px; padding:7px 9px; font-family:'JetBrains Mono',monospace; font-size:10.5px; line-height:1.4;">Will create: <strong id="ve-session-preview-name" style="color:var(--cut-orange); font-weight:700;">—</strong> <span style="color:#6B7280;">· preview updates as you type</span></div>
+            <label style="display:flex; align-items:center; gap:8px; cursor:pointer; background:#F9FAFB; border:1px solid #E6E8EF; border-radius:6px; padding:8px 9px; margin-top:8px; font-family:'Instrument Sans',sans-serif; font-size:11.5px; color:#111827;">
+              <input class="ve-checkbox" id="ve-auto-expire-toggle" type="checkbox" />
+              <span><b>Auto-delete after 30 days</b> <span style="color:#6B7280; font-weight:400;">— only for sessions you create here</span></span>
+            </label>
+            <p class="ve-field-hint" id="ve-session-hint" style="margin-top:6px;">Creates instantly, selects it, and queues it for expiry. Manage folders below.</p>
+          </div>
+
+          <!-- Library folders — accordion -->
+          <div class="ve-section" id="ve-folder-browser-section">
+            <div class="ve-section-title"><span><i class="bi bi-collection"></i> Library folders</span>
+              <button class="ve-button ghost ve-icon-button" id="ve-refresh-btn" title="Refresh folders"><i class="bi bi-arrow-clockwise"></i></button>
+            </div>
+            <button class="ve-advanced-toggle" type="button" aria-expanded="false" id="ve-folder-browser-toggle"><span><i class="bi bi-folder2"></i> Browse & manage folders <span class="ve-muted" style="font-family:'JetBrains Mono',monospace; font-size:9px; text-transform:none; letter-spacing:0; margin-left:6px;"><span id="ve-folder-count">5</span> in Library 4</span></span><i class="bi bi-chevron-down"></i></button>
+            <div class="ve-collapsible collapsed" id="ve-folder-browser">
+              <div style="padding-top:10px">
+                <p class="ve-section-help" style="margin-bottom:8px;">Click a card to switch active folder. Sessions are marked <span style="font-family:'JetBrains Mono',monospace; font-size:9px; background:#F3F0FF; border:1px solid #E6E8EF; padding:1px 4px; border-radius:4px; color:var(--cut-orange);">SESSION</span></p>
+                <!-- hidden legacy selects kept for JS compatibility; visually hidden but present -->
+                <div class="ve-hidden">
+                  <select class="ve-select" id="ve-folder-select"></select>
+                  <select class="ve-select" id="ve-upload-folder-select"></select>
+                  <select class="ve-select" id="ve-download-folder-select"></select>
+                  <select class="ve-select" id="ve-timeline-folder-select"></select>
+                </div>
+                <div class="ve-folder-grid" id="ve-folder-grid"></div>
+                <div class="ve-row" style="margin-top:10px">
+                  <div style="flex:1; min-width:0;">
+                    <label class="ve-field-label" for="ve-new-folder-input">Manual folder name <span style="font-weight:400; text-transform:none; letter-spacing:0; color:#6B7280;">— advanced</span></label>
+                    <input class="ve-input" id="ve-new-folder-input" placeholder="e.g. product-shots-04" aria-label="New folder name" />
+                  </div>
+                  <div style="flex:0 0 auto; display:flex; align-items:flex-end; gap:6px;">
+                    <button class="ve-button ghost" id="ve-show-create-folder-btn" type="button" style="display:none;">focus</button>
+                    <button class="ve-button ghost" id="ve-create-folder-btn"><i class="bi bi-plus-lg"></i> Create folder</button>
+                  </div>
+                </div>
+                <div class="ve-row">
+                  <button class="ve-button danger" id="ve-delete-folder-btn" title="Delete the selected library folder — references only, not source files"><i class="bi bi-trash3"></i> Delete selected folder</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="ve-section">
+            <div class="ve-section-title"><span><i class="bi bi-cloud-arrow-up"></i> Add images <span id="ve-upload-folder-name" style="color:var(--cut-orange); font-family:'Instrument Sans',sans-serif; text-transform:none; letter-spacing:0; font-size:11px; font-weight:600;">→ product-shots-04</span></span><span class="ve-muted" id="ve-upload-count" style="font-family:'JetBrains Mono',monospace; font-size:10px;">0 selected</span></div>
+            <div class="ve-file-drop" id="ve-file-drop">
+              <i class="bi bi-images"></i>
+              <p><b>Drop images</b> or choose files</p>
+              <p class="ve-muted" style="font-size:11px; margin-top:2px;">PNG · JPG · WEBP — multiple</p>
+            </div>
+            <div class="ve-file-picker">
+              <button class="ve-button ghost" id="ve-pick-files-btn" type="button"><i class="bi bi-images"></i> Choose images</button>
+              <button class="ve-button ghost" id="ve-pick-folder-btn" type="button"><i class="bi bi-folder2-open"></i> Choose folder</button>
+            </div>
+            <input class="ve-file-input" id="ve-file-input" type="file" accept="image/*" multiple />
+            <input class="ve-file-input" id="ve-folder-input" type="file" accept="image/*" multiple webkitdirectory directory />
+            <div class="ve-upload-summary is-idle" id="ve-upload-summary" role="status" aria-live="polite"><i class="bi bi-inbox ve-summary-icon"></i><div class="ve-summary-main"><div class="ve-summary-title">No images chosen</div><div class="ve-summary-detail">pick files or a folder above.</div></div></div>
+            <div class="ve-row" style="margin-top:8px">
+              <button class="ve-button success" id="ve-upload-btn"><i class="bi bi-upload"></i> Upload to library</button>
+              <button class="ve-button ghost" id="ve-clear-files-btn" type="button"><i class="bi bi-x-lg"></i> Clear</button>
+              <button class="ve-button ghost" id="ve-show-upload-btn" type="button" style="display:none;">legacy</button>
+            </div>
           </div>
         </div>
-        </div>
-        <div class="ve-tab-panel" data-panel="upload">
-        <div class="ve-section">
-          <div class="ve-section-title"><span><i class="bi bi-cloud-arrow-up"></i> Add images to folder</span></div>
-          <div class="ve-row">
-            <select class="ve-select" id="ve-upload-folder-select"></select>
-          </div>
-          <div class="ve-file-picker">
-            <button class="ve-button ghost" id="ve-pick-files-btn" type="button"><i class="bi bi-images"></i> Choose images</button>
-            <button class="ve-button ghost" id="ve-pick-folder-btn" type="button"><i class="bi bi-folder2-open"></i> Choose folder</button>
-          </div>
-          <input class="ve-file-input" id="ve-file-input" type="file" accept="image/*" multiple />
-          <input class="ve-file-input" id="ve-folder-input" type="file" accept="image/*" multiple webkitdirectory directory />
-          <div class="ve-row">
-            <button class="ve-button success" id="ve-upload-btn"><i class="bi bi-upload"></i> Upload to library</button>
-            <button class="ve-button ghost" id="ve-clear-files-btn" type="button"><i class="bi bi-x-lg"></i> Clear</button>
-          </div>
-          <div class="ve-muted" id="ve-upload-summary">No images chosen — pick files or a folder above.</div>
-        </div>
-        </div>
+
+        <!-- GENERATE -->
         <div class="ve-tab-panel" data-panel="queue">
-        <div class="ve-section">
-          <div class="ve-section-title"><span><i class="bi bi-camera-video"></i> Generate — Image → Video (10s)</span></div>
-          <div class="ve-row">
-            <input class="ve-input" id="ve-video-length" type="number" min="1" max="60" value="${config.videoLength}" aria-label="Video length (seconds, 1–60)" title="Video length in seconds" />
-            <select class="ve-select" id="ve-aspect" aria-label="Aspect ratio" title="Aspect ratio">
-              <option value="16:9">16:9</option>
-              <option value="9:16">9:16</option>
-              <option value="1:1">1:1</option>
-            </select>
+          <div class="ve-section">
+            <div class="ve-section-title"><span><i class="bi bi-camera-video"></i> Generate</span><span class="ve-muted" style="font-family:'JetBrains Mono',monospace; font-size:9px;">sequential · auto-retry at 5 max</span></div>
+            <p class="ve-section-help">Default 10s video. Queue runs 1 by 1; parallel limit retries automatically.</p>
+            <div class="ve-row">
+              <div>
+                <label class="ve-field-label">Video length (seconds)</label>
+                <input class="ve-input" id="ve-video-length" type="number" min="1" max="60" value="10" aria-label="Video length (seconds, 1–60)" title="Video length in seconds" />
+              </div>
+              <div>
+                <label class="ve-field-label">Aspect</label>
+                <select class="ve-select" id="ve-aspect" aria-label="Aspect ratio" title="Aspect ratio">
+                  <option value="16:9" selected>16:9 — landscape</option>
+                  <option value="9:16">9:16 — portrait</option>
+                  <option value="1:1">1:1 — square</option>
+                </select>
+              </div>
+            </div>
+            <button class="ve-advanced-toggle" type="button" aria-expanded="false" id="ve-advanced-timings-toggle"><span><i class="bi bi-sliders"></i> Advanced timings</span><i class="bi bi-chevron-down"></i></button>
+            <div class="ve-collapsible collapsed" id="ve-advanced-timings">
+              <div style="padding-top:8px">
+                <div class="ve-row">
+                  <div>
+                    <label class="ve-field-label">Delay between requests (ms)</label>
+                    <input class="ve-input" id="ve-delay-input" type="number" min="0" step="100" value="1500" aria-label="Delay between requests (ms)" />
+                  </div>
+                  <div>
+                    <label class="ve-field-label">Retry delay on parallel limit (ms)</label>
+                    <input class="ve-input" id="ve-retry-delay-input" type="number" min="1000" step="1000" value="60000" aria-label="Retry delay on parallel limit (ms)" />
+                  </div>
+                </div>
+                <p class="ve-field-hint">Defaults are safe for VideoExpress. Increase retry delay if you hit repeated parallel-limit loops.</p>
+              </div>
+            </div>
           </div>
-          <div class="ve-row">
-            <input class="ve-input" id="ve-delay-input" type="number" min="0" step="100" value="${config.delayBetweenRequestsMs}" aria-label="Delay between requests (ms)" title="Wait between each generate request" />
-            <input class="ve-input" id="ve-retry-delay-input" type="number" min="1000" step="1000" value="${config.parallelLimitRetryDelayMs}" aria-label="Retry delay on parallel limit (ms)" title="Wait after “5 videos in progress” before retry" />
-          </div>
-          <div class="ve-row" style="align-items:center">
-            <label class="ve-muted" style="display:flex;align-items:center;gap:8px;cursor:pointer">
+
+          <div class="ve-section">
+            <div class="ve-section-title"><span><i class="bi bi-type"></i> Prompts</span><span class="ve-muted" style="font-size:10px; font-family:'JetBrains Mono',monospace;">Filenames → cleaned prompts</span></div>
+            <label class="ve-muted" style="display:flex;align-items:center;gap:8px;cursor:pointer; background:#F9FAFB; border:1px solid #E6E8EF; border-radius:1px; padding:8px 9px;">
               <input class="ve-checkbox" id="ve-master-prompt-enabled" type="checkbox" />
-              Use a master prompt for every image
+              <span><b style="color:#0A0A0D;">Use a master prompt</b> for every image <span style="opacity:.7">— {{image}} is replaced by the image name</span></span>
             </label>
-          </div>
-          <div class="ve-row ve-hidden" id="ve-filename-prompt-row" style="align-items:center">
-            <label class="ve-muted" style="display:flex;align-items:center;gap:8px;cursor:pointer">
-              <input class="ve-checkbox" id="ve-append-filename-prompt" type="checkbox" />
-              Also include each image's individual prompt
-            </label>
-          </div>
-          <div class="ve-row">
-            <textarea class="ve-textarea" id="ve-master-prompt" placeholder="e.g. cinematic product shot, soft studio light — use {{image}} where image name should appear" aria-label="Master prompt"></textarea>
-          </div>
-          <div class="ve-muted" style="margin-top:-4px;margin-bottom:10px">With “Use a master prompt” on, every image uses this text. Turn on “Also include individual prompt” to append the image name.</div>
-          <div class="ve-row" style="align-items:center">
-            <label class="ve-muted" style="display:flex;align-items:center;gap:8px;cursor:pointer">
+            <div class="ve-hidden" id="ve-filename-prompt-row" style="margin-top:6px; background:#FFF8EE; border:1px dashed #E0D8CC; padding:7px 9px; border-radius:1px;">
+              <label class="ve-muted" style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                <input class="ve-checkbox" id="ve-append-filename-prompt" type="checkbox" />
+                Also include each image's individual cleaned prompt
+              </label>
+            </div>
+            <div style="margin-top:8px">
+              <label class="ve-field-label">Master prompt</label>
+              <textarea class="ve-textarea" id="ve-master-prompt" placeholder="e.g. cinematic product shot, soft studio light — use {{image}} where image name should appear" aria-label="Master prompt"></textarea>
+              <p class="ve-field-hint">With master prompt <b>off</b>, each image uses its filename as prompt (underscores/dashes cleaned).</p>
+            </div>
+            <label class="ve-muted" style="display:flex;align-items:center;gap:8px;cursor:pointer; margin-top:10px; background:#F9FAFB; border:1px solid #E6E8EF; border-radius:1px; padding:8px 9px;">
               <input class="ve-checkbox" id="ve-prompt-list-enabled" type="checkbox" />
-              Use prompt list matched to sorted images
+              <span><b style="color:#0A0A0D;">Use prompt list</b> — one line per image, sorted by name</span>
             </label>
+            <div class="ve-hidden" id="ve-prompt-list-row" style="margin-top:8px">
+              <label class="ve-field-label">Prompt list (line 1 → first sorted image)</label>
+              <textarea class="ve-textarea" id="ve-prompt-list" placeholder="One prompt per line — line 1 → first sorted image, line 2 → second, …" aria-label="Prompt list" style="min-height:84px;"></textarea>
+              <div class="ve-muted" id="ve-prompt-list-summary" style="margin-top:6px; background:#F7F3EC; border:1px solid #E0D8CC; padding:6px 8px; border-radius:1px; font-family:'JetBrains Mono',monospace; font-size:10px;">Off — turn on “Use prompt list” to map one prompt per sorted image.</div>
+            </div>
+            <div class="ve-muted ve-hidden" id="ve-prompt-list-summary-legacy" style="display:none;"></div>
           </div>
-          <div class="ve-row ve-hidden" id="ve-prompt-list-row">
-            <textarea class="ve-textarea" id="ve-prompt-list" placeholder="One prompt per line — line 1 → first sorted image, line 2 → second, …" aria-label="Prompt list"></textarea>
+
+          <div class="ve-section">
+            <div class="ve-section-title"><span><i class="bi bi-play-circle"></i> Queue</span>
+              <button class="ve-button ghost ve-icon-button" id="ve-reset-history-btn" type="button" title="Clear saved queue history"><i class="bi bi-eraser"></i></button>
+            </div>
+            <div class="ve-status-line" id="ve-status-line"><span><strong id="ve-stat-images">0</strong> images</span><span class="dot running"></span><span><strong id="ve-stat-running">0</strong> running</span><span class="dot done"></span><span><strong id="ve-stat-done">0</strong> done</span><span class="dot fail"></span><span><strong id="ve-stat-failed">0</strong> need retry</span><span style="opacity:.4">·</span><span><strong id="ve-stat-queued">0</strong> ready</span></div>
+            <div class="ve-row" style="margin-top:10px">
+              <button class="ve-button ghost" id="ve-load-media-btn"><i class="bi bi-list-check"></i> Load images from folder</button>
+              <button class="ve-button success" id="ve-run-btn"><i class="bi bi-play-fill"></i> Start generating</button>
+              <button class="ve-button warn" id="ve-stop-btn"><i class="bi bi-stop-fill"></i> Pause</button>
+            </div>
+            <p class="ve-field-hint" id="ve-folder-summary" style="margin:6px 0 0;">Choose a folder, then “Load images from folder” to build the queue.</p>
           </div>
-          <div class="ve-muted ve-hidden" id="ve-prompt-list-summary" style="margin-top:-4px;margin-bottom:10px">Off — turn on “Use prompt list” to map one prompt per sorted image (line 1 → first image).</div>
-          <div class="ve-row">
-            <button class="ve-button primary" id="ve-load-media-btn"><i class="bi bi-list-check"></i> Show images in folder</button>
-            <button class="ve-button success" id="ve-run-btn"><i class="bi bi-play-fill"></i> Start generating</button>
-            <button class="ve-button warn" id="ve-stop-btn"><i class="bi bi-stop-fill"></i> Pause queue</button>
+
+          <div class="ve-section" id="ve-queue-download-section">
+            <div class="ve-section-title"><span><i class="bi bi-download"></i> Completed</span></div>
+            <div class="ve-muted" id="ve-queue-download-summary" style="background:#F9FAFB; border:1px solid #E6E8EF; padding:7px 9px; border-radius:6px; margin-bottom:8px; font-size:11px;">No completed videos yet.</div>
+            <div class="ve-progress" title="Download progress"><div class="ve-progress-bar" id="ve-queue-download-progress"></div></div>
+            <div class="ve-row" style="margin-top:10px">
+              <button class="ve-button primary" id="ve-download-completed-btn" type="button"><i class="bi bi-download"></i> Download completed</button>
+              <button class="ve-button ghost small" id="ve-retry-all-failed-btn" type="button" title="Retry every failed item"><i class="bi bi-arrow-clockwise"></i> Retry failed</button>
+            </div>
+            <button class="ve-button ghost small ve-hidden" id="ve-download-remaining-btn" type="button" style="display:none;">Remaining only</button>
+            <p class="ve-field-hint" id="ve-retry-all-summary"></p>
+          </div>
+
+          <div class="ve-section">
+            <div class="ve-section-title">
+              <span><i class="bi bi-table"></i> Queue preview</span>
+              <span class="ve-muted" style="font-family:'JetBrains Mono',monospace; font-size:9px;">up to 150 shown</span>
+            </div>
+            <div style="max-height:360px; overflow:auto; border:1px solid #E0D8CC; border-radius:1px;">
+              <table class="ve-table">
+                <thead>
+                  <tr>
+                    <th style="width: 26%">Image</th>
+                    <th style="width: 36%">Prompt</th>
+                    <th style="width: 14%">Status</th>
+                    <th style="width: 14%">Updated</th>
+                    <th style="width: 10%">Action</th>
+                  </tr>
+                </thead>
+                <tbody id="ve-queue-body"></tbody>
+              </table>
+            </div>
           </div>
         </div>
-        <div class="ve-section">
-          <div class="ve-stats">
-            <div class="ve-stat"><span class="ve-muted">In folder</span><strong id="ve-stat-images">0</strong></div>
-            <div class="ve-stat"><span class="ve-muted">Ready</span><strong id="ve-stat-queued">0</strong></div>
-            <div class="ve-stat"><span class="ve-muted">Generating</span><strong id="ve-stat-running">0</strong></div>
-            <div class="ve-stat"><span class="ve-muted">Completed</span><strong id="ve-stat-done">0</strong></div>
-            <div class="ve-stat failures"><span>Needs retry</span><strong id="ve-stat-failed">0</strong></div>
-          </div>
-        </div>
-        <div class="ve-section" id="ve-queue-download-section">
-          <div class="ve-section-title"><span><i class="bi bi-download"></i> Download completed</span></div>
-          <div class="ve-muted" id="ve-queue-download-summary">No completed videos in this folder yet. Generate some in Generate, then download here.</div>
-          <div class="ve-progress" title="Queue download progress"><div class="ve-progress-bar" id="ve-queue-download-progress"></div></div>
-          <div class="ve-row" style="margin-top:10px">
-            <button class="ve-button primary" id="ve-download-completed-btn" type="button"><i class="bi bi-download"></i> Download completed</button>
-            <button class="ve-button success" id="ve-download-remaining-btn" type="button"><i class="bi bi-download"></i> Download remaining</button>
-          </div>
-          <div class="ve-row" style="margin-top:10px">
-            <button class="ve-button warn" id="ve-retry-all-failed-btn" type="button" title="Retry every failed item in this folder"><i class="bi bi-arrow-clockwise"></i> Retry failed</button>
-            <span class="ve-muted" id="ve-retry-all-summary"></span>
-          </div>
-        </div>
-        <div class="ve-section">
-          <div class="ve-section-title">
-            <span><i class="bi bi-table"></i> Queue preview</span>
-            <button class="ve-button ghost ve-icon-button" id="ve-reset-history-btn" type="button" title="Clear saved queue history"><i class="bi bi-eraser"></i></button>
-          </div>
-          <div class="ve-row">
-            <div class="ve-muted" id="ve-folder-summary">Choose a folder, then “Show images in folder” to build the queue.</div>
-          </div>
-            <table class="ve-table">
-            <thead>
-              <tr>
-                <th style="width: 24%">Image</th>
-                <th style="width: 36%">Prompt</th>
-                <th style="width: 14%">Status</th>
-                <th style="width: 14%">Updated</th>
-                <th style="width: 12%">Actions</th>
-              </tr>
-            </thead>
-            <tbody id="ve-queue-body"></tbody>
-          </table>
-        </div>
-        </div>
+
+        <!-- DOWNLOADS -->
         <div class="ve-tab-panel" data-panel="downloads">
           <div class="ve-section">
-            <div class="ve-section-title"><span><i class="bi bi-download"></i> Download from library</span></div>
+            <div class="ve-section-title"><span><i class="bi bi-download"></i> Collect</span><span class="ve-muted" style="font-family:'JetBrains Mono',monospace; font-size:9px;">select · download</span></div>
+            <p class="ve-section-help">Load videos from the active folder, select, then download.</p>
             <div class="ve-row">
-              <select class="ve-select" id="ve-download-folder-select"></select>
               <button class="ve-button primary" id="ve-load-videos-btn" type="button"><i class="bi bi-collection-play"></i> Load videos in folder</button>
+              <button class="ve-button ghost" id="ve-select-all-videos-btn" type="button"><i class="bi bi-check2-square"></i> Select visible</button>
             </div>
-            <div class="ve-row">
-              <input class="ve-input" id="ve-video-filter-query" type="search" placeholder="Search videos by name or ID" aria-label="Search videos" />
-            </div>
-            <div class="ve-row">
-              <input class="ve-input" id="ve-video-filter-date-from" type="date" title="Created from" />
-              <input class="ve-input" id="ve-video-filter-date-to" type="date" title="Created to" />
-            </div>
-            <div class="ve-row">
-              <input class="ve-input" id="ve-video-filter-min-size" type="number" min="0" step="1" placeholder="Min MB" />
-              <input class="ve-input" id="ve-video-filter-max-size" type="number" min="0" step="1" placeholder="Max MB" />
-              <button class="ve-button ghost" id="ve-clear-video-filters-btn" type="button"><i class="bi bi-x-lg"></i> Clear filters</button>
-            </div>
-            <div class="ve-row">
-              <input class="ve-input" id="ve-download-min-delay" type="number" min="0" step="100" value="${config.downloadMinDelayMs}" title="Min delay between downloads (ms)" />
-              <input class="ve-input" id="ve-download-max-delay" type="number" min="0" step="100" value="${config.downloadMaxDelayMs}" title="Max delay between downloads (ms)" />
-              <input class="ve-input" id="ve-download-concurrency" type="number" min="1" max="5" step="1" value="${config.downloadConcurrency}" title="Parallel downloads (1-5)" />
+            <div style="margin:10px 0; background:#F9FAFB; border:1px solid #E6E8EF; border-radius:1px; padding:9px;">
+              <div class="ve-field-label" style="margin-bottom:6px; display:flex; align-items:center; justify-content:space-between;">Search & filters <span class="ve-muted" style="font-weight:400; text-transform:none; letter-spacing:0; font-size:10.5px;" id="ve-filter-count">—</span></div>
+              <input class="ve-input" id="ve-video-filter-query" type="search" placeholder="Search by name or ID" aria-label="Search videos" />
+              <button class="ve-advanced-toggle" type="button" aria-expanded="false" id="ve-download-filters-toggle" style="margin-top:8px;"><span><i class="bi bi-funnel"></i> Advanced filters</span><i class="bi bi-chevron-down"></i></button>
+              <div class="ve-collapsible collapsed" id="ve-download-filters">
+                <div style="padding-top:8px">
+                  <div class="ve-row">
+                    <div><label class="ve-field-label">Created from</label><input class="ve-input" id="ve-video-filter-date-from" type="date" title="Created from" /></div>
+                    <div><label class="ve-field-label">Created to</label><input class="ve-input" id="ve-video-filter-date-to" type="date" title="Created to" /></div>
+                  </div>
+                  <div class="ve-row">
+                    <div><label class="ve-field-label">Min size (MB)</label><input class="ve-input" id="ve-video-filter-min-size" type="number" min="0" step="1" placeholder="Min MB" /></div>
+                    <div><label class="ve-field-label">Max size (MB)</label><input class="ve-input" id="ve-video-filter-max-size" type="number" min="0" step="1" placeholder="Max MB" /></div>
+                  </div>
+                  <div class="ve-row" style="margin-top:6px">
+                    <button class="ve-button ghost small" id="ve-clear-video-filters-btn" type="button"><i class="bi bi-x-lg"></i> Clear filters</button>
+                  </div>
+                  <div class="ve-row" style="margin-top:8px">
+                    <div><label class="ve-field-label">Min delay (ms)</label><input class="ve-input" id="ve-download-min-delay" type="number" min="0" step="100" value="800" title="Min delay between downloads (ms)" /></div>
+                    <div><label class="ve-field-label">Max delay (ms)</label><input class="ve-input" id="ve-download-max-delay" type="number" min="0" step="100" value="1200" title="Max delay between downloads (ms)" /></div>
+                    <div><label class="ve-field-label">Parallel (1-5)</label><input class="ve-input" id="ve-download-concurrency" type="number" min="1" max="5" step="1" value="3" title="Parallel downloads (1-5)" /></div>
+                  </div>
+                </div>
+              </div>
             </div>
             <div class="ve-download-controls">
-              <button class="ve-button ghost" id="ve-select-all-videos-btn" type="button"><i class="bi bi-check2-square"></i> Select all</button>
               <button class="ve-button success" id="ve-download-selected-btn" type="button"><i class="bi bi-download"></i> Download selected</button>
               <button class="ve-button primary" id="ve-download-all-btn" type="button"><i class="bi bi-download"></i> Download visible</button>
+              <button class="ve-button warn" id="ve-stop-downloads-btn" type="button"><i class="bi bi-stop-fill"></i> Pause</button>
             </div>
-            <div class="ve-row" style="margin-top:10px">
-              <button class="ve-button warn" id="ve-stop-downloads-btn" type="button"><i class="bi bi-stop-fill"></i> Pause downloads</button>
-            </div>
-            <div class="ve-progress" title="Download queue progress"><div class="ve-progress-bar" id="ve-download-progress"></div></div>
-            <div class="ve-muted" id="ve-download-summary" style="margin-top:8px">Choose a folder and “Load videos in folder” to browse.</div>
+            <div class="ve-progress" title="Download queue progress" style="margin-top:10px"><div class="ve-progress-bar" id="ve-download-progress"></div></div>
+            <div class="ve-muted" id="ve-download-summary" style="margin-top:8px; background:#fff; border:1px solid #E0D8CC; padding:7px 9px; border-radius:1px;">Choose a folder and “Load videos in folder” to browse.</div>
           </div>
           <div class="ve-section">
-            <table class="ve-table">
-              <thead>
-                <tr>
-                  <th class="ve-check-cell"><input class="ve-checkbox" id="ve-video-master-checkbox" type="checkbox" /></th>
-                  <th style="width: 46%">Video</th>
-                  <th style="width: 18%">Size</th>
-                  <th style="width: 18%">Duration</th>
-                  <th style="width: 18%">Created</th>
-                </tr>
-              </thead>
-              <tbody id="ve-video-body"></tbody>
-            </table>
+            <div class="ve-section-title"><span><i class="bi bi-film"></i> Videos</span><label style="display:flex; align-items:center; gap:6px; font-family:'Instrument Sans',sans-serif; font-size:11.5px; font-weight:600; cursor:pointer;"><input class="ve-checkbox" id="ve-video-master-checkbox" type="checkbox" /> Select visible</label></div>
+            <div style="max-height:380px; overflow:auto; border:1px solid #E0D8CC; border-radius:1px;">
+              <table class="ve-table">
+                <thead>
+                  <tr>
+                    <th class="ve-check-cell"><span style="font-size:9px">✓</span></th>
+                    <th style="width: 46%">Video</th>
+                    <th style="width: 18%">Size</th>
+                    <th style="width: 18%">Duration</th>
+                    <th style="width: 18%">Created</th>
+                  </tr>
+                </thead>
+                <tbody id="ve-video-body"></tbody>
+              </table>
+            </div>
           </div>
         </div>
+
+        <!-- TIMELINE -->
         <div class="ve-tab-panel" data-panel="timeline">
-  <div class="ve-section">
-    <div class="ve-section-title"><span><i class="bi bi-view-list"></i> Stitch timeline — chronological</span></div>
-    <div class="ve-muted" style="margin-bottom:8px">Combine videos in numeric name order into one timeline.</div>
-    <div class="ve-row">
-      <select class="ve-select" id="ve-timeline-folder-select"></select>
-      <button class="ve-button ghost" id="ve-timeline-load-btn" type="button"><i class="bi bi-collection-play"></i> Load videos in folder</button>
-    </div>
-    <div class="ve-row">
-      <button class="ve-button success" id="ve-timeline-add-completed-btn" type="button"><i class="bi bi-plus-circle"></i> Add completed to timeline</button>
-      <button class="ve-button ghost" id="ve-timeline-clear-btn" type="button"><i class="bi bi-x-lg"></i> Clear</button>
-    </div>
-    <div class="ve-muted" id="ve-timeline-completed-summary" style="margin-top:2px;margin-bottom:8px"></div>
-    <div class="ve-row">
-      <input class="ve-input" id="ve-timeline-name" placeholder="Timeline name — e.g. timeline_2026" aria-label="Timeline project name" />
-      <select class="ve-select" id="ve-timeline-aspect">
-        <option value="16:9">16:9</option><option value="9:16">9:16</option><option value="1:1">1:1</option>
-      </select>
-      <select class="ve-select" id="ve-timeline-quality">
-        <option value="high">high</option><option value="medium">medium</option><option value="low">low</option>
-      </select>
-    </div>
-    <div class="ve-row">
-      <button class="ve-button primary" id="ve-timeline-export-btn" type="button"><i class="bi bi-play-fill"></i> Stitch & export timeline</button>
-      <button class="ve-button warn" id="ve-timeline-stop-btn" type="button"><i class="bi bi-stop-fill"></i> Pause queue</button>
-    </div>
-    <div class="ve-progress" title="Timeline export progress"><div class="ve-progress-bar" id="ve-timeline-progress"></div></div>
-    <div class="ve-muted" id="ve-timeline-status" style="margin-top:8px">Idle — choose a folder, load videos, then export.</div>
-    <div class="ve-row" style="margin-top:10px">
-      <button class="ve-button success ve-hidden" id="ve-timeline-download-btn" type="button"><i class="bi bi-download"></i> Download Result</button>
-      <span class="ve-muted" id="ve-timeline-result-info"></span>
-    </div>
-  </div>
-  <div class="ve-section">
-    <div class="ve-section-title"><span><i class="bi bi-table"></i> Videos to stitch (<span id="ve-timeline-count">0</span>)</span></div>
-    <div class="ve-muted" id="ve-timeline-list-summary">No videos — load a folder to stich.</div>
-    <table class="ve-table"><thead><tr><th>#</th><th>Video</th><th>Duration</th></tr></thead><tbody id="ve-timeline-body"></tbody></table>
-  </div>
-</div>
+          <div class="ve-section">
+            <div class="ve-section-title"><span><i class="bi bi-view-list"></i> Stitch</span><span class="ve-muted" style="font-family:'JetBrains Mono',monospace; font-size:9px;">optional · numeric order</span></div>
+            <p class="ve-section-help">Combine clips in numeric name order into one export.</p>
+            <div class="ve-row">
+              <button class="ve-button ghost" id="ve-timeline-load-btn" type="button"><i class="bi bi-collection-play"></i> Load videos in folder</button>
+              <button class="ve-button ghost" id="ve-timeline-add-completed-btn" type="button"><i class="bi bi-plus-circle"></i> Add completed to timeline</button>
+              <button class="ve-button ghost" id="ve-timeline-clear-btn" type="button"><i class="bi bi-x-lg"></i> Clear</button>
+            </div>
+            <div class="ve-muted" id="ve-timeline-completed-summary" style="margin:6px 0 10px; background:#fff; border:1px solid #E0D8CC; padding:7px 9px; border-radius:1px;"></div>
+            <div class="ve-row">
+              <div style="flex:1.4">
+                <label class="ve-field-label">Timeline name</label>
+                <input class="ve-input" id="ve-timeline-name" placeholder="Timeline name — e.g. timeline_2026" aria-label="Timeline project name" value="timeline_2026-08-16" />
+              </div>
+              <div>
+                <label class="ve-field-label">Aspect</label>
+                <select class="ve-select" id="ve-timeline-aspect">
+                  <option value="16:9" selected>16:9</option><option value="9:16">9:16</option><option value="1:1">1:1</option>
+                </select>
+              </div>
+              <div>
+                <label class="ve-field-label">Quality</label>
+                <select class="ve-select" id="ve-timeline-quality">
+                  <option value="high" selected>high</option><option value="medium">medium</option><option value="low">low</option>
+                </select>
+              </div>
+            </div>
+            <div class="ve-row">
+              <button class="ve-button primary" id="ve-timeline-export-btn" type="button"><i class="bi bi-play-fill"></i> Stitch & export timeline</button>
+              <button class="ve-button warn" id="ve-timeline-stop-btn" type="button"><i class="bi bi-stop-fill"></i> Cancel</button>
+            </div>
+            <div class="ve-progress" title="Timeline export progress"><div class="ve-progress-bar" id="ve-timeline-progress"></div></div>
+            <div class="ve-muted" id="ve-timeline-status" style="margin-top:8px; background:#0A0A0D; color:#F5F1EB; border:1px solid #000; padding:8px 9px; border-radius:1px;">Idle — load videos, then export.</div>
+            <div class="ve-row" style="margin-top:10px">
+              <button class="ve-button success ve-hidden" id="ve-timeline-download-btn" type="button"><i class="bi bi-download"></i> Download Result</button>
+              <span class="ve-muted" id="ve-timeline-result-info"></span>
+            </div>
+          </div>
+          <div class="ve-section">
+            <div class="ve-section-title"><span><i class="bi bi-table"></i> Videos to stitch (<span id="ve-timeline-count">0</span>)</span><span class="ve-muted" style="font-size:10px; font-family:'JetBrains Mono',monospace;" id="ve-timeline-list-summary">No videos — load a folder to stitch.</span></div>
+            <div style="max-height:320px; overflow:auto; border:1px solid #E0D8CC; border-radius:1px;">
+              <table class="ve-table"><thead><tr><th style="width:10%">#</th><th>Video</th><th style="width:18%">Duration</th></tr></thead><tbody id="ve-timeline-body"></tbody></table>
+            </div>
+          </div>
+        </div>
+
+        <!-- ACTIVITY -->
         <div class="ve-tab-panel" data-panel="activity">
           <div class="ve-section">
-            <div class="ve-section-title"><span><i class="bi bi-terminal"></i> Event log</span></div>
+            <div class="ve-section-title"><span><i class="bi bi-terminal"></i> Event log</span><span class="ve-muted" style="font-family:'JetBrains Mono',monospace; font-size:9px;">live · stays on page</span></div>
+            <p class="ve-section-help">Polling, retries, and download progress appear here. Helpful when queue seems stuck on “5 in progress”.</p>
             <div class="ve-log" id="ve-log"></div>
           </div>
         </div>
+
       </div>
     </div>
     <button id="ve-manager-toggle" class="ve-hidden" title="VideoExpress Manager"><i class="bi bi-collection-play"></i></button>
@@ -1508,7 +1855,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     toggle: root.querySelector("#ve-manager-toggle"),
     closeBtn: root.querySelector("#ve-close-btn"),
     themeSelect: root.querySelector("#ve-theme-select"),
-    tabs: Array.from(root.querySelectorAll(".ve-tab")),
+    tabs: Array.from(root.querySelectorAll(".ve-step,.ve-tab")),
     tabPanels: Array.from(root.querySelectorAll(".ve-tab-panel")),
     folderSelect: root.querySelector("#ve-folder-select"),
     uploadFolderSelect: root.querySelector("#ve-upload-folder-select"),
@@ -1592,6 +1939,31 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     timelineBody: root.querySelector("#ve-timeline-body"),
     timelineListSummary: root.querySelector("#ve-timeline-list-summary"),
     log: root.querySelector("#ve-log"),
+    contextSelect: root.querySelector("#ve-context-select"),
+    contextPill: root.querySelector("#ve-context-pill"),
+    contextName: root.querySelector("#ve-context-name"),
+    contextId: root.querySelector("#ve-context-id"),
+    contextCount: root.querySelector("#ve-context-count"),
+    contextDone: root.querySelector("#ve-context-done"),
+    contextChangeBtn: root.querySelector("#ve-context-change-btn"),
+    onboarding: root.querySelector("#ve-onboarding"),
+    onboardingDismiss: root.querySelector("#ve-onboarding-dismiss"),
+    fileDrop: root.querySelector("#ve-file-drop"),
+    uploadFolderName: root.querySelector("#ve-upload-folder-name"),
+    uploadCount: root.querySelector("#ve-upload-count"),
+    advancedTimingsToggle: root.querySelector("#ve-advanced-timings-toggle"),
+    advancedTimings: root.querySelector("#ve-advanced-timings"),
+    downloadFiltersToggle: root.querySelector("#ve-download-filters-toggle"),
+    downloadFilters: root.querySelector("#ve-download-filters"),
+    statusLine: root.querySelector("#ve-status-line"),
+    filterCount: root.querySelector("#ve-filter-count"),
+    sessionNameInput: root.querySelector("#ve-session-name-input"),
+    createSessionBtn: root.querySelector("#ve-create-session-btn"),
+    sessionPreviewName: root.querySelector("#ve-session-preview-name"),
+    sessionPreview: root.querySelector("#ve-session-preview"),
+    autoExpireToggle: root.querySelector("#ve-auto-expire-toggle"),
+    folderBrowserToggle: root.querySelector("#ve-folder-browser-toggle"),
+    folderBrowser: root.querySelector("#ve-folder-browser"),
   };
 
   function logLine(message) {
@@ -1644,18 +2016,71 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     logLine(`Palette: ${next}`);
   }
   function setActiveTab(tab) {
-    state.activeTab = tab;
+    const domTab = tab === "folders" ? "library" : tab === "upload" ? "library" : tab;
+    const persistTab = domTab;
+    state.activeTab = persistTab;
     els.tabs.forEach((element) => {
-      element.classList.toggle("active", element.dataset.tab === tab);
+      const t = element.dataset.tab;
+      element.classList.toggle("active", t === persistTab || t === tab || (persistTab === "library" && (t === "folders" || t === "upload")));
     });
     els.tabPanels.forEach((element) => {
-      element.classList.toggle("active", element.dataset.panel === tab);
+      const p = element.dataset.panel;
+      element.classList.toggle("active", p === persistTab || p === tab || (persistTab === "library" && (p === "folders" || p === "upload")));
     });
-    saveUiState({ activeTab: tab });
+    saveUiState({ activeTab: persistTab });
   }
   if(els.themeSelect){
     els.themeSelect.addEventListener("change", () => applyTheme(els.themeSelect.value));
   }
+  if (els.advancedTimingsToggle && els.advancedTimings) {
+    els.advancedTimingsToggle.addEventListener("click", () => {
+      const exp = els.advancedTimingsToggle.getAttribute("aria-expanded") === "true";
+      els.advancedTimingsToggle.setAttribute("aria-expanded", String(!exp));
+      els.advancedTimings.classList.toggle("collapsed", exp);
+      els.advancedTimings.classList.toggle("expanded", !exp);
+    });
+  }
+  if (els.downloadFiltersToggle && els.downloadFilters) {
+    els.downloadFiltersToggle.addEventListener("click", () => {
+      const exp = els.downloadFiltersToggle.getAttribute("aria-expanded") === "true";
+      els.downloadFiltersToggle.setAttribute("aria-expanded", String(!exp));
+      els.downloadFilters.classList.toggle("collapsed", exp);
+      els.downloadFilters.classList.toggle("expanded", !exp);
+    });
+  }
+  if (els.folderBrowserToggle && els.folderBrowser) {
+    els.folderBrowserToggle.addEventListener("click", () => {
+      const exp = els.folderBrowserToggle.getAttribute("aria-expanded") === "true";
+      els.folderBrowserToggle.setAttribute("aria-expanded", String(!exp));
+      els.folderBrowser.classList.toggle("collapsed", exp);
+      els.folderBrowser.classList.toggle("expanded", !exp);
+      saveUiState({ folderBrowserOpen: !exp });
+    });
+  }
+  if (els.sessionNameInput) {
+    els.sessionNameInput.addEventListener("input", () => { updateSessionPreview(); updateButtonStates(); });
+    els.sessionNameInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); if (els.createSessionBtn && !els.createSessionBtn.disabled) els.createSessionBtn.click(); }});
+  }
+  if (els.autoExpireToggle) {
+    els.autoExpireToggle.addEventListener("change", () => {
+      config.autoExpireSessions = Boolean(els.autoExpireToggle.checked);
+      saveUiState({ autoExpireSessions: config.autoExpireSessions });
+      logLine(config.autoExpireSessions ? "Auto-delete after 30 days: ON (only locally created sessions)" : "Auto-delete after 30 days: OFF");
+    });
+  }
+  if (els.fileDrop) {
+    els.fileDrop.addEventListener("click", () => els.fileInput && els.fileInput.click());
+    els.fileDrop.addEventListener("dragover", (e) => { e.preventDefault(); els.fileDrop.style.borderColor = "#6F5CCF"; });
+    els.fileDrop.addEventListener("dragleave", () => { els.fileDrop.style.borderColor = ""; });
+    els.fileDrop.addEventListener("drop", (e) => {
+      e.preventDefault(); els.fileDrop.style.borderColor = "";
+      const files = Array.from(e.dataTransfer.files || []).filter(isImageFile);
+      if (files.length) { setSelectedFiles(files); logLine(`Dropped ${files.length} image(s)`); }
+    });
+  }
+  if (els.onboardingDismiss && els.onboarding) els.onboardingDismiss.addEventListener("click", () => { els.onboarding.classList.add("ve-hidden"); saveUiState({ onboardingDismissed: true }); });
+  if (els.contextSelect) els.contextSelect.addEventListener("change", () => selectFolder(els.contextSelect.value));
+  if (els.contextChangeBtn) els.contextChangeBtn.addEventListener("click", () => { setActiveTab("library"); const g=document.getElementById("ve-folder-grid"); if(g) g.scrollIntoView({behavior:"smooth", block:"center"}); });
 
   function getBadgeClass(status) {
     const value = normalizeStatus(status);
@@ -1685,6 +2110,23 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       els.timelineFolderSelect.innerHTML = options || `<option value="">No folders found</option>`;
       els.timelineFolderSelect.value = state.selectedFolderId || "";
     }
+    if (els.contextSelect) {
+      els.contextSelect.innerHTML = options || `<option value="">No folders found</option>`;
+      els.contextSelect.value = state.selectedFolderId || "";
+    }
+    const sel = getSelectedFolder();
+    if (sel) {
+      if (els.contextName) els.contextName.textContent = sel.title || sel.name;
+      if (els.contextId) els.contextId.textContent = `#${sel.id}`;
+      if (els.uploadFolderName) els.uploadFolderName.textContent = `\u2192 ${sel.title || sel.name}`;
+    }
+    if (els.folderCount) els.folderCount.textContent = String(state.folders.length);
+    if (els.contextCount) els.contextCount.textContent = String(state.items.length);
+    try {
+      const counts = getQueueDownloadCounts();
+      if (els.contextDone) els.contextDone.textContent = String(counts.completed || state.queue.filter((q) => normalizeStatus(q.status) === "completed").length);
+    } catch {}
+
     els.folderGrid.innerHTML = state.folders.length
       ? state.folders
           .map((folder) => {
@@ -1692,8 +2134,9 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
               String(folder.id) === String(state.selectedFolderId)
                 ? "active"
                 : "";
+            const sessionCls = isSessionFolder(folder) ? " is-session" : "";
             return `
-              <button class="ve-folder-card ${active}" data-folder-id="${folder.id}" type="button" title="${escapeHtml(folder.title || folder.name)}">
+              <button class="ve-folder-card ${active}${sessionCls}" data-folder-id="${folder.id}" type="button" title="${escapeHtml(folder.title || folder.name)}">
                 <i class="bi bi-folder2"></i>
                 <strong>${escapeHtml(folder.title || folder.name)}</strong>
                 <span class="ve-muted">${folder.id}</span>
@@ -1797,10 +2240,30 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     els.videoFilterMaxSize.value = state.videoFilters.maxSizeMb || "";
   }
 
+
+  function setUploadSummary(kind, title, detailHtml) {
+    const el = els.uploadSummary;
+    if (!el) return;
+    el.className = "ve-upload-summary is-" + (kind || "idle");
+    el.setAttribute("role", kind === "error" ? "alert" : "status");
+    el.setAttribute("aria-live", kind === "error" ? "assertive" : "polite");
+    const icons = { idle: "bi-inbox", selected: "bi-images", uploading: "bi-arrow-repeat", success: "bi-check-circle-fill", error: "bi-exclamation-triangle-fill" };
+    const icon = icons[kind] || icons.idle;
+    const titleHtml = title ? `<div class="ve-summary-title">${escapeHtml(title)}</div>` : "";
+    const detail = detailHtml ? `<div class="ve-summary-detail">${detailHtml}</div>` : "";
+    el.innerHTML = `<i class="bi ${icon} ve-summary-icon"></i><div class="ve-summary-main">${titleHtml}${detail}</div>`;
+    // nudge into view when error
+    if (kind === "error") {
+      try { el.scrollIntoView({ behavior: "smooth", block: "center" }); } catch {}
+    }
+  }
+
   function renderSelectedFiles() {
     const files = state.selectedFiles;
     if (!files.length) {
-      els.uploadSummary.textContent = "No images chosen — pick files or a folder above.";
+      setUploadSummary("idle", "No images chosen", "pick files or a folder above.");
+      if (els.fileDrop) els.fileDrop.classList.remove("has-files");
+      if (els.uploadCount) els.uploadCount.textContent = "0 selected";
       return;
     }
 
@@ -1810,7 +2273,10 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       .map((file) => file.webkitRelativePath || file.name)
       .join(", ");
     const more = files.length > 3 ? `, +${files.length - 3} more` : "";
-    els.uploadSummary.textContent = `${files.length} image${files.length === 1 ? "" : "s"} selected | ${formatBytes(totalBytes)} | ${sample}${more}`;
+    const detail = `${escapeHtml(formatBytes(totalBytes))} &middot; ${escapeHtml(sample)}${more ? escapeHtml(more) : ""}`;
+    setUploadSummary("selected", `${files.length} image${files.length === 1 ? "" : "s"} ready`, detail);
+    if (els.fileDrop) els.fileDrop.classList.toggle("has-files", state.selectedFiles.length > 0);
+    if (els.uploadCount) els.uploadCount.textContent = state.selectedFiles.length ? `${state.selectedFiles.length} selected` : "0 selected";
   }
 
   function isImageFile(file) {
@@ -1940,6 +2406,9 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     els.statRunning.textContent = String(runningCount);
     els.statDone.textContent = String(doneCount);
     els.statFailed.textContent = String(failedCount);
+    if (els.statusLine) {
+      els.statusLine.innerHTML = `<span><strong>${state.items.length}</strong> images</span><span class="dot running"></span><span><strong>${runningCount}</strong> running</span><span class="dot done"></span><span><strong>${doneCount}</strong> done</span><span class="dot fail"></span><span><strong>${failedCount}</strong> need retry</span><span style="opacity:.4">\u00b7</span><span><strong>${queuedCount}</strong> ready</span>`;
+    }
     if (els.retryAllSummary) {
       els.retryAllSummary.textContent = failedCount ? `${failedCount} failed — click Retry all failed or per-row Retry` : "";
     }
@@ -2602,19 +3071,24 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     let successCount = 0;
     let failCount = 0;
     const failedNames = [];
-    els.uploadSummary.textContent = `Uploading ${files.length} files...`;
+    setUploadSummary("uploading", `Uploading ${files.length} files…`, `0 / ${files.length} &middot; ${escapeHtml(folder.title || folder.name)}`);
 
     for (const file of files) {
       try {
         await api.uploadFile(folder.id, file);
         successCount += 1;
-        const failedText = failedNames.length ? ` | Last fail: ${failedNames[failedNames.length - 1]}` : "";
-        els.uploadSummary.textContent = `Uploaded ${successCount}/${files.length}${failedText}`;
+        if (failedNames.length) {
+          const chips = failedNames.map(n => `<span class="ve-fail-chip">${escapeHtml(n)}</span>`).join("");
+          setUploadSummary("uploading", `Uploaded ${successCount} / ${files.length}`, `Success ${successCount} &middot; Failed ${failCount} ${chips}`);
+        } else {
+          setUploadSummary("uploading", `Uploaded ${successCount} / ${files.length}`, `Success ${successCount} &middot; ${escapeHtml(folder.title || folder.name)}`);
+        }
       } catch (error) {
         failCount += 1;
         failedNames.push(file.name);
         logLine(`Upload failed for ${file.name}: ${error.message}`);
-        els.uploadSummary.textContent = `Uploaded ${successCount}/${files.length} | Last fail: ${file.name}`;
+        const chips = failedNames.map(n => `<span class="ve-fail-chip">${escapeHtml(n)}</span>`).join("");
+        setUploadSummary("uploading", `Uploaded ${successCount} / ${files.length}`, `Last fail: ${escapeHtml(file.name)} ${chips}`);
       }
     }
 
@@ -2623,8 +3097,14 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     els.fileInput.value = "";
     els.folderInput.value = "";
     state.selectedFiles = [];
-    const failedText = failedNames.length ? ` | Failed: ${failedNames.join(", ")}` : "";
-    els.uploadSummary.textContent = `Upload complete. Success: ${successCount}, Failed: ${failCount}${failedText}`;
+    if (failCount > 0) {
+      const chips = failedNames.map(n => `<span class="ve-fail-chip">${escapeHtml(n)}</span>`).join("");
+      const detail = `Success: <strong>${successCount}</strong> &middot; Failed: <strong>${failCount}</strong><br>${chips}<br><span style="opacity:.78">Check Activity log for the full error. Retry the failed file(s) or pick a new set.</span>`;
+      setUploadSummary("error", `Upload incomplete — ${failCount} failed`, detail);
+    } else {
+      const detail = `Success: <strong>${successCount}</strong> / ${files.length} &middot; Folder now has ${state.items.length || successCount} images`;
+      setUploadSummary("success", "Upload complete", detail);
+    }
     await loadFolderImages();
   }
 
@@ -3342,6 +3822,10 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     if (els.timelineClearBtn) els.timelineClearBtn.disabled = state.timelineExport.running || !hasVideos;
     els.masterPromptEnabled.disabled = state.running;
     els.promptListEnabled.disabled = state.running;
+    if (els.createSessionBtn) {
+      const raw = els.sessionNameInput ? els.sessionNameInput.value.trim() : "";
+      els.createSessionBtn.disabled = state.running || state.uploadInProgress || state.downloadInProgress || !raw || raw.length < 2;
+    }
     updateMasterPromptControls();
   }
 
@@ -3429,6 +3913,22 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     els.createFolderBtn.addEventListener("click", () =>
       handleAction(createFolder),
     );
+    if (els.createSessionBtn) {
+      els.createSessionBtn.addEventListener("click", () =>
+        handleAction(async () => {
+          const raw = els.sessionNameInput ? els.sessionNameInput.value : "";
+          const result = await createSession(raw);
+          if (result && els.sessionNameInput) {
+            els.sessionNameInput.value = "";
+            updateSessionPreview();
+            updateButtonStates();
+            logLine(`Session ready: "${result.folderName}" — upload images below`);
+            // gentle focus to upload drop
+            if (els.fileDrop) els.fileDrop.scrollIntoView({ behavior: "smooth", block: "center" });
+          }
+        }),
+      );
+    }
     els.deleteFolderBtn.addEventListener("click", () =>
       handleAction(deleteSelectedFolder),
     );
@@ -3685,6 +4185,9 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       config.timelineExportDefaults = { ...config.timelineExportDefaults, ...savedUi.timelineExportConfig };
     }
     if (typeof savedUi.timelineExportName === "string") state.timelineExport.projectName = savedUi.timelineExportName;
+    if (typeof savedUi.autoExpireSessions === "boolean") config.autoExpireSessions = savedUi.autoExpireSessions;
+    if (typeof savedUi.sessionExpiryDays === "number" && savedUi.sessionExpiryDays >= 1) config.sessionExpiryDays = Math.max(1, Math.min(90, Number(savedUi.sessionExpiryDays)));
+    if (savedUi.onboardingDismissed && els.onboarding) els.onboarding.classList.add("ve-hidden");
     const todayStr = new Date().toISOString().slice(0, 10);
     state.videoFilters.dateFrom = todayStr;
     state.videoFilters.dateTo = todayStr;
@@ -3708,6 +4211,14 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     if (els.timelineAspect) els.timelineAspect.value = config.timelineExportDefaults.aspect;
     if (els.timelineQuality) els.timelineQuality.value = config.timelineExportDefaults.quality;
     renderTimelineExport();
+    if (els.autoExpireToggle) els.autoExpireToggle.checked = Boolean(config.autoExpireSessions);
+    if (els.folderBrowserToggle && els.folderBrowser) {
+      const open = Boolean(savedUi.folderBrowserOpen);
+      els.folderBrowserToggle.setAttribute("aria-expanded", String(open));
+      els.folderBrowser.classList.toggle("collapsed", !open);
+      els.folderBrowser.classList.toggle("expanded", open);
+    }
+    updateSessionPreview();
 
     [
       "aspect",
@@ -3748,7 +4259,14 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     updateButtonStates();
     await refreshFolders();
     renderQueue();
+    updateSessionPreview();
     await pollStatuses();
+    // auto-expiry: only locally created sessions, runs hourly + on visibility
+    try { await checkExpiredSessions(); } catch (e) { console.warn("[VE] expiry check failed", e); }
+    setInterval(() => {
+      checkExpiredSessions().catch(e => console.warn("[VE] expiry check failed", e));
+    }, 6 * 60 * 60 * 1000);
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) checkExpiredSessions().catch(()=>{}); });
     setInterval(() => {
       pollStatuses().catch((error) =>
         console.warn("Status poll failed", error),
