@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoExpress Library Manager
 // @namespace    https://app.videoexpress.ai/
-// @version      0.9.1
+// @version      0.9.2
 // @description  Manage folders, upload images, and batch convert images to videos inside VideoExpress AI.
 // @match        https://app.videoexpress.ai/*
 // @grant        none
@@ -2556,22 +2556,71 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
   }
 
   async function fetchAndDownload(video, fileName) {
-    const response = await sessionFetch(
-      `/library/download/${video.id}`,
-      { method: "GET" },
-      `Download ${fileName}`,
-    );
-    const blob = await response.blob();
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = fileName;
-    link.rel = "noopener";
-    link.style.display = "none";
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    const id = String(video && (video.id || video.mediaId || video.videoId) || "").trim();
+    const rawMedia = String(video && (video.mediaPath || video.videoUrl || video.path || video.fileName) || "").trim();
+    // Normalize potential CDN / path candidates
+    const isAbsoluteCdn = /^https?:\/\//i.test(rawMedia) && /cdn|videoexpress/i.test(rawMedia);
+    const cdnUrl = isAbsoluteCdn ? rawMedia : "";
+    // Candidates in priority: output (works for timeline/output), library (works for library media), then direct CDN blob
+    const candidates = [];
+    if (id) {
+      candidates.push({ url: `/download/output/${id}`, label: `download/output/${id}`, useSession: true });
+      candidates.push({ url: `/library/download/${id}`, label: `library/download/${id}`, useSession: true });
+    }
+    if (cdnUrl) candidates.push({ url: cdnUrl, label: `cdn ${cdnUrl.slice(0, 64)}`, useSession: false });
+    // If rawMedia is a bare path like "69320/xxx.mp4", try to resolve via CDN guess (ny-b) — leave as last resort
+    if (!cdnUrl && rawMedia && rawMedia.includes("/") && rawMedia.endsWith(".mp4")) {
+      const guessed = `https://cdn-ny-b.videoexpress.ai/video/${rawMedia.split("/").pop()}`;
+      candidates.push({ url: guessed, label: `cdn-guess ${guessed.slice(0,64)}`, useSession: false });
+    }
+    if (!candidates.length) throw new Error(`Download ${fileName} failed: no id or mediaPath on video object`);
+    let lastErr = null;
+    for (const cand of candidates) {
+      try {
+        let res;
+        if (cand.useSession) {
+          res = await sessionFetch(cand.url, { method: "GET" }, `Download ${fileName} via ${cand.label}`);
+        } else {
+          // Direct CDN — no auth headers, no credentials, follow redirects
+          res = await fetch(cand.url, { method: "GET", credentials: "omit", mode: "cors" });
+          if (!res.ok) {
+            const txt = await res.text().catch(() => "");
+            const e = new Error(`Download ${fileName} via ${cand.label} failed: ${res.status} ${res.statusText}\n${txt.slice(0,300)}`);
+            e.status = res.status; e.bodyText = txt; throw e;
+          }
+        }
+        // Guard: server sometimes returns JSON {"error":"Media file not found."} with 200 or 400
+        const ct = (res.headers && res.headers.get("content-type")) || "";
+        if (ct.includes("application/json")) {
+          const jtxt = await res.clone().text().catch(() => "");
+          if (/\"error\"\s*:/i.test(jtxt)) throw new Error(`Download ${fileName} via ${cand.label} returned JSON error: ${jtxt.slice(0,400)}`);
+        }
+        const blob = await res.blob();
+        // Tiny JSON error masquerading as blob
+        if (blob.size < 2048) {
+          try {
+            const maybe = await blob.slice(0, 2048).text();
+            if (/\"error\"\s*:/i.test(maybe)) throw new Error(`Download ${fileName} via ${cand.label} returned error JSON: ${maybe.slice(0,400)}`);
+          } catch {}
+          // if still tiny but not JSON, still allow — some videos could be tiny?
+          if (blob.size < 100) throw new Error(`Download ${fileName} via ${cand.label} returned empty blob (${blob.size} bytes)`);
+        }
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = fileName; a.rel = "noopener"; a.style.display = "none";
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
+        logLine(`Downloaded ${fileName} via ${cand.label} (${(blob.size/1024/1024).toFixed(2)} MB)`);
+        return;
+      } catch (e) {
+        lastErr = e;
+        const msg = String(e.message || e).split("\n")[0].slice(0,180);
+        logLine(`Download attempt via ${cand.label} failed: ${msg}`);
+        // 400/404 on library/download means try next candidate; continue loop
+        continue;
+      }
+    }
+    throw lastErr || new Error(`Download ${fileName} failed: all candidates exhausted`);
   }
 
   async function fetchAndDownloadWithRetry(video, fileName, opts = {}) {
