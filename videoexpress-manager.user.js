@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoExpress Library Manager
 // @namespace    https://app.videoexpress.ai/
-// @version      0.9.0
+// @version      0.9.1
 // @description  Manage folders, upload images, and batch convert images to videos inside VideoExpress AI.
 // @match        https://app.videoexpress.ai/*
 // @grant        none
@@ -1469,6 +1469,22 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     .ve-steps { grid-template-columns: 1fr 1fr; }
     .ve-step--log{ grid-column: span 2; flex-direction:row; min-height:36px; }
   }
+
+  /* Upload summary — stateful, failure impossible to miss */
+  #ve-upload-summary { margin-top:8px; background:#fff; border:1px solid #E0D8CC; border-radius:6px; padding:8px 9px; font-family:'Instrument Sans',sans-serif; font-size:11.5px; line-height:1.4; display:flex; align-items:flex-start; gap:8px; transition:all .14s ease; }
+  #ve-upload-summary.is-idle { background:#fff; color:#5A5752; border-color:#E0D8CC; }
+  #ve-upload-summary.is-selected { background:#F9FAFB; color:#111827; border-color:#E6E8EF; }
+  #ve-upload-summary.is-uploading { background:#F3F0FF; color:#6D28D9; border-color:var(--cut-orange); border-left-width:3px; }
+  #ve-upload-summary.is-success { background:#ECFDF5; color:#065F46; border-color:#0EA768; border-left-width:3px; border-left-color:#0EA768; }
+  #ve-upload-summary.is-error { background:#FFFBEB; color:#111827; border-color:#F59E0B; border-left-width:3px; border-left-color:#F59E0B; box-shadow:0 0 0 3px rgba(245,158,11,0.14); animation: veShake .32s ease 1; }
+  #ve-upload-summary i.ve-summary-icon { font-size:15px; flex-shrink:0; margin-top:1px; }
+  #ve-upload-summary .ve-summary-main { flex:1; min-width:0; }
+  #ve-upload-summary .ve-summary-title { font-family:'Barlow Condensed',sans-serif; font-size:11px; font-weight:700; letter-spacing:0.06em; text-transform:uppercase; line-height:1.1; }
+  #ve-upload-summary .ve-summary-detail { font-size:11px; color:inherit; opacity:.92; word-break:break-word; }
+  #ve-upload-summary .ve-summary-detail strong { color:inherit; }
+  #ve-upload-summary .ve-fail-chip { display:inline-flex; align-items:center; font-family:'JetBrains Mono',monospace; font-size:9px; font-weight:700; background:#1A1A1E; color:#FFC83D; border:1px solid #000; border-radius:4px; padding:2px 6px; margin:3px 4px 0 0; max-width:100%; word-break:break-all; }
+  @keyframes veShake { 0%,100%{ transform:translateX(0)} 20%{ transform:translateX(-2px)} 40%{ transform:translateX(2px)} 60%{ transform:translateX(-1px)} 80%{ transform:translateX(1px)} }
+
     </style>
     <div id="ve-manager-panel">
       <div id="ve-manager-header">
@@ -1587,7 +1603,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
             </div>
             <input class="ve-file-input" id="ve-file-input" type="file" accept="image/*" multiple />
             <input class="ve-file-input" id="ve-folder-input" type="file" accept="image/*" multiple webkitdirectory directory />
-            <div class="ve-muted" id="ve-upload-summary" style="margin-top:8px; background:#fff; border:1px solid #E0D8CC; border-radius:1px; padding:8px 9px;">No images chosen — pick files or a folder above.</div>
+            <div class="ve-upload-summary is-idle" id="ve-upload-summary" role="status" aria-live="polite"><i class="bi bi-inbox ve-summary-icon"></i><div class="ve-summary-main"><div class="ve-summary-title">No images chosen</div><div class="ve-summary-detail">pick files or a folder above.</div></div></div>
             <div class="ve-row" style="margin-top:8px">
               <button class="ve-button success" id="ve-upload-btn"><i class="bi bi-upload"></i> Upload to library</button>
               <button class="ve-button ghost" id="ve-clear-files-btn" type="button"><i class="bi bi-x-lg"></i> Clear</button>
@@ -2224,10 +2240,28 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     els.videoFilterMaxSize.value = state.videoFilters.maxSizeMb || "";
   }
 
+
+  function setUploadSummary(kind, title, detailHtml) {
+    const el = els.uploadSummary;
+    if (!el) return;
+    el.className = "ve-upload-summary is-" + (kind || "idle");
+    el.setAttribute("role", kind === "error" ? "alert" : "status");
+    el.setAttribute("aria-live", kind === "error" ? "assertive" : "polite");
+    const icons = { idle: "bi-inbox", selected: "bi-images", uploading: "bi-arrow-repeat", success: "bi-check-circle-fill", error: "bi-exclamation-triangle-fill" };
+    const icon = icons[kind] || icons.idle;
+    const titleHtml = title ? `<div class="ve-summary-title">${escapeHtml(title)}</div>` : "";
+    const detail = detailHtml ? `<div class="ve-summary-detail">${detailHtml}</div>` : "";
+    el.innerHTML = `<i class="bi ${icon} ve-summary-icon"></i><div class="ve-summary-main">${titleHtml}${detail}</div>`;
+    // nudge into view when error
+    if (kind === "error") {
+      try { el.scrollIntoView({ behavior: "smooth", block: "center" }); } catch {}
+    }
+  }
+
   function renderSelectedFiles() {
     const files = state.selectedFiles;
     if (!files.length) {
-      els.uploadSummary.textContent = "No images chosen — pick files or a folder above.";
+      setUploadSummary("idle", "No images chosen", "pick files or a folder above.");
       if (els.fileDrop) els.fileDrop.classList.remove("has-files");
       if (els.uploadCount) els.uploadCount.textContent = "0 selected";
       return;
@@ -2239,7 +2273,8 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       .map((file) => file.webkitRelativePath || file.name)
       .join(", ");
     const more = files.length > 3 ? `, +${files.length - 3} more` : "";
-    els.uploadSummary.textContent = `${files.length} image${files.length === 1 ? "" : "s"} selected | ${formatBytes(totalBytes)} | ${sample}${more}`;
+    const detail = `${escapeHtml(formatBytes(totalBytes))} &middot; ${escapeHtml(sample)}${more ? escapeHtml(more) : ""}`;
+    setUploadSummary("selected", `${files.length} image${files.length === 1 ? "" : "s"} ready`, detail);
     if (els.fileDrop) els.fileDrop.classList.toggle("has-files", state.selectedFiles.length > 0);
     if (els.uploadCount) els.uploadCount.textContent = state.selectedFiles.length ? `${state.selectedFiles.length} selected` : "0 selected";
   }
@@ -3036,19 +3071,24 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     let successCount = 0;
     let failCount = 0;
     const failedNames = [];
-    els.uploadSummary.textContent = `Uploading ${files.length} files...`;
+    setUploadSummary("uploading", `Uploading ${files.length} files…`, `0 / ${files.length} &middot; ${escapeHtml(folder.title || folder.name)}`);
 
     for (const file of files) {
       try {
         await api.uploadFile(folder.id, file);
         successCount += 1;
-        const failedText = failedNames.length ? ` | Last fail: ${failedNames[failedNames.length - 1]}` : "";
-        els.uploadSummary.textContent = `Uploaded ${successCount}/${files.length}${failedText}`;
+        if (failedNames.length) {
+          const chips = failedNames.map(n => `<span class="ve-fail-chip">${escapeHtml(n)}</span>`).join("");
+          setUploadSummary("uploading", `Uploaded ${successCount} / ${files.length}`, `Success ${successCount} &middot; Failed ${failCount} ${chips}`);
+        } else {
+          setUploadSummary("uploading", `Uploaded ${successCount} / ${files.length}`, `Success ${successCount} &middot; ${escapeHtml(folder.title || folder.name)}`);
+        }
       } catch (error) {
         failCount += 1;
         failedNames.push(file.name);
         logLine(`Upload failed for ${file.name}: ${error.message}`);
-        els.uploadSummary.textContent = `Uploaded ${successCount}/${files.length} | Last fail: ${file.name}`;
+        const chips = failedNames.map(n => `<span class="ve-fail-chip">${escapeHtml(n)}</span>`).join("");
+        setUploadSummary("uploading", `Uploaded ${successCount} / ${files.length}`, `Last fail: ${escapeHtml(file.name)} ${chips}`);
       }
     }
 
@@ -3057,8 +3097,14 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     els.fileInput.value = "";
     els.folderInput.value = "";
     state.selectedFiles = [];
-    const failedText = failedNames.length ? ` | Failed: ${failedNames.join(", ")}` : "";
-    els.uploadSummary.textContent = `Upload complete. Success: ${successCount}, Failed: ${failCount}${failedText}`;
+    if (failCount > 0) {
+      const chips = failedNames.map(n => `<span class="ve-fail-chip">${escapeHtml(n)}</span>`).join("");
+      const detail = `Success: <strong>${successCount}</strong> &middot; Failed: <strong>${failCount}</strong><br>${chips}<br><span style="opacity:.78">Check Activity log for the full error. Retry the failed file(s) or pick a new set.</span>`;
+      setUploadSummary("error", `Upload incomplete — ${failCount} failed`, detail);
+    } else {
+      const detail = `Success: <strong>${successCount}</strong> / ${files.length} &middot; Folder now has ${state.items.length || successCount} images`;
+      setUploadSummary("success", "Upload complete", detail);
+    }
     await loadFolderImages();
   }
 
