@@ -45,6 +45,14 @@
     appendFilenamePrompt: false,
     promptListEnabled: false,
     promptList: "",
+    timelineExportDefaults: {
+      quality: "high",
+      size: "1080",
+      format: "mp4",
+      aspect: "16:9",
+      namePrefix: "timeline_",
+      pollIntervalMs: 2000,
+    },
   };
 
   const HISTORY_KEY = "videoexpress.manager.history.v1";
@@ -82,6 +90,16 @@
       csrfHeaderName: "X-CSRF-TOKEN",
       bearerToken: "",
       lastRefreshedAt: 0,
+    },
+    timelineExport: {
+      running: false,
+      percent: 0,
+      statusText: "",
+      projectName: "",
+      queueStatus: { in_progress: 0, total: 0 },
+      exportedVideo: null,
+      lastError: null,
+      pollTimer: null,
     },
   };
 
@@ -2247,6 +2265,16 @@ function extractVideoIdFromStatus(payload) {
     }
   }
 
+  function updateTimelineExportConfigFromInputs() {
+    const nameEl = document.getElementById("ve-timeline-name");
+    const aspectEl = document.getElementById("ve-timeline-aspect");
+    const qualityEl = document.getElementById("ve-timeline-quality");
+    if (nameEl) state.timelineExport.projectName = nameEl.value.trim();
+    if (aspectEl) config.timelineExportDefaults.aspect = aspectEl.value || config.timelineExportDefaults.aspect;
+    if (qualityEl) config.timelineExportDefaults.quality = qualityEl.value || config.timelineExportDefaults.quality;
+    saveUiState({ timelineExportConfig: { quality: config.timelineExportDefaults.quality, size: config.timelineExportDefaults.size, format: config.timelineExportDefaults.format, aspect: config.timelineExportDefaults.aspect }, timelineExportName: state.timelineExport.projectName });
+  }
+
   function updateMasterPromptControls() {
     const masterEnabled = els.masterPromptEnabled.checked;
     const promptListEnabled = els.promptListEnabled.checked;
@@ -3249,6 +3277,10 @@ async function downloadQueueCompleted({ onlyRemaining }) {
         ...savedUi.videoFilters,
       };
     }
+    if (savedUi.timelineExportConfig && typeof savedUi.timelineExportConfig === "object") {
+      config.timelineExportDefaults = { ...config.timelineExportDefaults, ...savedUi.timelineExportConfig };
+    }
+    if (typeof savedUi.timelineExportName === "string") state.timelineExport.projectName = savedUi.timelineExportName;
     const todayStr = new Date().toISOString().slice(0, 10);
     state.videoFilters.dateFrom = todayStr;
     state.videoFilters.dateTo = todayStr;

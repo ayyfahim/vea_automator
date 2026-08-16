@@ -16,3 +16,10 @@ describe("timeline export api", () => {
     assert.match(src, /render_project\/tmp/);
   });
 });
+describe("timeline export state", () => {
+  it("timelineExport state defaults exist and persist via UI_STATE_KEY", () => {
+    const src = fs.readFileSync("videoexpress-manager.user.js","utf8");
+    assert.match(src, /timelineExport/);
+    assert.match(src, /timelineExportDefaults|timelineExportConfig/);
+  });
+});
