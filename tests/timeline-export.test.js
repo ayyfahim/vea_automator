@@ -83,3 +83,16 @@ describe("timeline polling", () => {
     assert.match(src, /clearInterval/);
   });
 });
+describe("version bump", () => {
+  it("userscript header version bumped to 0.7.0", () => {
+    const m = fs.readFileSync("videoexpress-manager.user.js","utf8").match(/@version\s+([0-9.]+)/);
+    assert.ok(m, "version not found");
+    assert.equal(m[1], "0.7.0");
+  });
+  it("stalled percent guard warns after 10 polls without infinite loop", () => {
+    const src = fs.readFileSync("videoexpress-manager.user.js","utf8");
+    assert.match(src, /stallCount|_timelineStall/i);
+    assert.match(src, />\s*10/);
+    assert.match(src, /clearInterval/);
+  });
+});

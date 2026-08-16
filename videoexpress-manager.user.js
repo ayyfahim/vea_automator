@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoExpress Library Manager
 // @namespace    https://app.videoexpress.ai/
-// @version      0.6.2
+// @version      0.7.0
 // @description  Manage folders, upload images, and batch convert images to videos inside VideoExpress AI.
 // @match        https://app.videoexpress.ai/*
 // @grant        none
@@ -2267,8 +2267,12 @@ function extractVideoIdFromStatus(payload) {
     return pct === 100 && Number(qs.in_progress || 0) === 0;
   }
   let _timelineProgressStarted = false;
+  let _timelineStallCount = 0;
+  let _timelineLastPercent = null;
   function startTimelineProgressPolling(projectName) {
     _timelineProgressStarted = false;
+    _timelineStallCount = 0;
+    _timelineLastPercent = null;
     if (state.timelineExport.pollTimer) clearInterval(state.timelineExport.pollTimer);
     const intervalMs = Number(config.timelineExportDefaults.pollIntervalMs || 2000);
     state.timelineExport.pollTimer = setInterval(async () => {
@@ -2278,6 +2282,16 @@ function extractVideoIdFromStatus(payload) {
         const progress = await api.getProjectProgress(startFlag);
         _timelineProgressStarted = true;
         const pct = Number(progress.percent ?? 0);
+        // retry guard: detect stalled percent >10 polls — log warning but continue (no infinite loop)
+        if (_timelineLastPercent !== null && pct === _timelineLastPercent) {
+          _timelineStallCount++;
+        } else {
+          _timelineStallCount = 0;
+          _timelineLastPercent = pct;
+        }
+        if (_timelineStallCount > 10) {
+          logLine(`Timeline progress stalled at ${pct}% for ${_timelineStallCount} polls — still polling (no infinite loop)`);
+        }
         state.timelineExport.percent = pct;
         state.timelineExport.queueStatus = progress.queue_status || state.timelineExport.queueStatus;
         state.timelineExport.statusText = `Exporting "${projectName}" — ${pct}% (queue ${progress.queue_status?.in_progress ?? "?"} / ${progress.queue_status?.total ?? "?"})`;
@@ -2413,6 +2427,7 @@ function extractVideoIdFromStatus(payload) {
       throw e;
     }
   }
+  // pollTimer lifecycle: cleared on running=false, on completed via startTimelineProgressPolling, and here; no bootstrap unload handler needed (panel lifetime = page lifetime)
   function stopTimelineExport() {
     if (state.timelineExport.pollTimer) { clearInterval(state.timelineExport.pollTimer); state.timelineExport.pollTimer = null; }
     state.timelineExport.running = false;
