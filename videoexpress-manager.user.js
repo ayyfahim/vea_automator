@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoExpress Library Manager
 // @namespace    https://app.videoexpress.ai/
-// @version      0.8.0
+// @version      0.8.1
 // @description  Manage folders, upload images, and batch convert images to videos inside VideoExpress AI.
 // @match        https://app.videoexpress.ai/*
 // @grant        none
@@ -896,24 +896,94 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
         right: 16px;
         z-index: 2147483647;
         font-family: 'Instrument Sans', 'Barlow Condensed', system-ui, sans-serif;
-        color: #e8e2d6;
+        color: #111827;
+        /* VideoExpress (default) — site theme: violet #7C3AED on light */
+        --cut-orange: #7C3AED;
+        --cut-orange-deep: #6D28D9;
+        --cut-orange-soft: #8B5CF6;
+        --cut-black: #111827;
+        --cut-panel: #F3F4F6;
+        --cut-window: #FFFFFF;
+        --cut-window-warm: #F9FAFB;
+        --cut-ink: #111827;
+        --cut-line: #E5E7EB;
+        --cut-line-soft: #D1D5DB;
+        --cut-border-warm: #E5E7EB;
+        --cut-border-warm-2: #E5E7EB;
+        --cut-muted: #6B7280;
+        --cut-muted-light: #9CA3AF;
+        --cut-success: #0EA768;
+        --cut-warn: #F59E0B;
+        --cut-danger-ink: #111827;
+      }
+      /* Bench Red — original eye-soring but retained */
+      #ve-manager-root[data-theme="bench"] {
         --cut-orange: #FF3B0A;
         --cut-orange-deep: #D12E04;
+        --cut-orange-soft: #FF6B35;
         --cut-black: #0A0A0D;
         --cut-panel: #0F1012;
         --cut-window: #F5F1EB;
-        --cut-window-2: #EDE8DF;
-        --cut-ink: #0A0A0D;
-        --cut-line: #2A2E33;
-        --cut-mute: #8A8680;
-        --cut-mute-2: #5A5752;
+        --cut-window-warm: #F7F3EC;
+        --cut-ink: #1A1A18;
+        --cut-line: #1A1D20;
+        --cut-line-soft: #2A2E33;
+        --cut-border-warm: #D8D0C2;
+        --cut-border-warm-2: #E0D8CC;
+        --cut-muted: #5A5752;
+        --cut-muted-light: #6B6760;
+        --cut-success: #0EA768;
+        --cut-warn: #FFC83D;
+        --cut-danger-ink: #1A1A1E;
       }
-      #ve-manager-root * { scrollbar-width: thin; scrollbar-color: #2A2E33 transparent; }
+      #ve-manager-root[data-theme="bench"] #ve-manager-panel { background: #0A0A0D; }
+      #ve-manager-root[data-theme="bench"] #ve-manager-body { background: #0A0A0D; }
+      /* Teal Dark */
+      #ve-manager-root[data-theme="teal"] {
+        --cut-orange: #0F766E;
+        --cut-orange-deep: #115E59;
+        --cut-orange-soft: #14B8A6;
+        --cut-black: #042F2E;
+        --cut-panel: #0B1A1F;
+        --cut-window: #F0FDFA;
+        --cut-window-warm: #CCFBF1;
+        --cut-ink: #042F2E;
+        --cut-line: #134E4A;
+        --cut-line-soft: #1F5F57;
+        --cut-border-warm: #99F6E4;
+        --cut-border-warm-2: #5EEAD4;
+        --cut-muted: #5F6B6A;
+        --cut-muted-light: #7A8A89;
+        --cut-success: #0EA768;
+        --cut-warn: #F59E0B;
+        --cut-danger-ink: #042F2E;
+      }
+      /* Amber Warm */
+      #ve-manager-root[data-theme="amber"] {
+        --cut-orange: #D97706;
+        --cut-orange-deep: #B45309;
+        --cut-orange-soft: #F59E0B;
+        --cut-black: #1C1917;
+        --cut-panel: #292524;
+        --cut-window: #FFFBEB;
+        --cut-window-warm: #FEF3C7;
+        --cut-ink: #1C1917;
+        --cut-line: #44403C;
+        --cut-line-soft: #57534E;
+        --cut-border-warm: #FDE68A;
+        --cut-border-warm-2: #FCD34D;
+        --cut-muted: #78716C;
+        --cut-muted-light: #A8A29E;
+        --cut-success: #0EA768;
+        --cut-warn: #F59E0B;
+        --cut-danger-ink: #1C1917;
+      }
+      #ve-manager-root * { scrollbar-width: thin; scrollbar-color: var(--cut-line-soft) transparent; }
       #ve-manager-panel {
         width: min(620px, calc(100vw - 24px));
         max-height: calc(100vh - 88px);
         overflow: hidden;
-        background: #0A0A0D;
+        background: var(--cut-panel);
         border: 1.5px solid #000;
         border-radius: 2px;
         box-shadow: 0 22px 70px rgba(0,0,0,0.72), 0 2px 0 #000 inset;
@@ -970,7 +1040,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
         padding: 18px 14px 14px;
         overflow: auto;
         max-height: calc(100vh - 150px);
-        background: #0A0A0D;
+        background: var(--cut-panel);
       }
       #ve-manager-body::-webkit-scrollbar { width: 10px; height: 10px; }
       #ve-manager-body::-webkit-scrollbar-thumb { background: #2A2E33; border: 1px solid #000; border-radius: 0; }
@@ -1178,7 +1248,13 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
           <div id="ve-manager-title">VideoExpress Manager</div>
           <div class="ve-muted">Batch media workflow for My Media</div>
         </div>
-        <button class="ve-button ghost ve-icon-button" id="ve-close-btn" title="Hide panel"><i class="bi bi-x-lg"></i></button>
+        <select id="ve-theme-select" class="ve-select" style="width:auto;min-width:138px;padding:6px 28px 6px 10px;font-family:'Barlow Condensed',sans-serif;font-size:11px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;border:1.5px solid #000;background:#fff;color:#111827;border-radius:1px;cursor:pointer" title="Palette">
+            <option value="videoexpress">VideoExpress</option>
+            <option value="bench">Bench Red</option>
+            <option value="teal">Teal Dark</option>
+            <option value="amber">Amber Warm</option>
+          </select>
+          <button class="ve-button ghost ve-icon-button" id="ve-close-btn" title="Hide panel"><i class="bi bi-x-lg"></i></button>
       </div>
       <div id="ve-manager-body">
         <div class="ve-tabs" role="tablist">
@@ -1431,6 +1507,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     panel: root.querySelector("#ve-manager-panel"),
     toggle: root.querySelector("#ve-manager-toggle"),
     closeBtn: root.querySelector("#ve-close-btn"),
+    themeSelect: root.querySelector("#ve-theme-select"),
     tabs: Array.from(root.querySelectorAll(".ve-tab")),
     tabPanels: Array.from(root.querySelectorAll(".ve-tab-panel")),
     folderSelect: root.querySelector("#ve-folder-select"),
@@ -1557,6 +1634,15 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     setPanelPosition(position.left, position.top, false);
   }
 
+  function applyTheme(theme){
+    const allowed = ["videoexpress","bench","teal","amber"];
+    const next = allowed.includes(theme) ? theme : "videoexpress";
+    if(next === "videoexpress") root.removeAttribute("data-theme");
+    else root.setAttribute("data-theme", next);
+    if(els.themeSelect) els.themeSelect.value = next;
+    saveUiState({ theme: next });
+    logLine(`Palette: ${next}`);
+  }
   function setActiveTab(tab) {
     state.activeTab = tab;
     els.tabs.forEach((element) => {
@@ -1566,6 +1652,9 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       element.classList.toggle("active", element.dataset.panel === tab);
     });
     saveUiState({ activeTab: tab });
+  }
+  if(els.themeSelect){
+    els.themeSelect.addEventListener("change", () => applyTheme(els.themeSelect.value));
   }
 
   function getBadgeClass(status) {
@@ -3551,6 +3640,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       if (!document.hidden) refreshAuthFromPage();
     });
     const savedUi = loadUiState();
+    applyTheme(savedUi.theme || "videoexpress");
     if (savedUi.aspect) config.aspect = savedUi.aspect;
     if (savedUi.videoLength) config.videoLength = savedUi.videoLength;
     if (savedUi.delayBetweenRequestsMs)
