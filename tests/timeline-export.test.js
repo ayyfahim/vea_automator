@@ -23,3 +23,12 @@ describe("timeline export state", () => {
     assert.match(src, /timelineExportDefaults|timelineExportConfig/);
   });
 });
+describe("timeline export UI", () => {
+  it("panel HTML contains timeline tab and controls", () => {
+    const src = fs.readFileSync("videoexpress-manager.user.js","utf8");
+    assert.match(src, /data-tab="timeline"/);
+    assert.match(src, /ve-timeline-export-btn/);
+    assert.match(src, /ve-timeline-progress/);
+    assert.match(src, /ve-timeline-download-btn/);
+  });
+});

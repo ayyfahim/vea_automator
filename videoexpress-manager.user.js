@@ -933,13 +933,14 @@ function extractVideoIdFromStatus(payload) {
         top: 0;
         z-index: 2;
         display: grid;
-        grid-template-columns: repeat(5, 1fr);
+        grid-template-columns: repeat(6, minmax(0, 1fr));
         gap: 0;
         margin: 0 -14px 14px;
         padding: 0 14px;
         background: #ffffff;
         border-bottom: 1px solid #dfe5ed;
       }
+      @media (max-width:680px){ .ve-tabs{ grid-template-columns: repeat(3, minmax(0,1fr)); } }
       .ve-tab {
         height: 42px;
         border: 0;
@@ -1310,6 +1311,7 @@ function extractVideoIdFromStatus(payload) {
           <button class="ve-tab" data-tab="upload" type="button"><i class="bi bi-upload"></i>Upload</button>
           <button class="ve-tab" data-tab="queue" type="button"><i class="bi bi-play-circle"></i>Queue</button>
           <button class="ve-tab" data-tab="downloads" type="button"><i class="bi bi-download"></i>Downloads</button>
+          <button class="ve-tab" data-tab="timeline" type="button"><i class="bi bi-view-list"></i>Timeline</button>
           <button class="ve-tab" data-tab="activity" type="button"><i class="bi bi-activity"></i>Activity</button>
         </div>
         <div class="ve-tab-panel active" data-panel="folders">
@@ -1498,6 +1500,40 @@ function extractVideoIdFromStatus(payload) {
             </table>
           </div>
         </div>
+        <div class="ve-tab-panel" data-panel="timeline">
+  <div class="ve-section">
+    <div class="ve-section-title"><span><i class="bi bi-view-list"></i> Timeline export (chronological)</span></div>
+    <div class="ve-muted" style="margin-bottom:8px">Load videos sorted by name (numeric) → stitched timeline video. Monitoring <code>/render_project/tmp</code> + <code>/project/progress</code>.</div>
+    <div class="ve-row">
+      <select class="ve-select" id="ve-timeline-folder-select"></select>
+      <button class="ve-button ghost" id="ve-timeline-load-btn" type="button"><i class="bi bi-collection-play"></i> Load videos</button>
+    </div>
+    <div class="ve-row">
+      <input class="ve-input" id="ve-timeline-name" placeholder="Project name (e.g. timeline_2026)" />
+      <select class="ve-select" id="ve-timeline-aspect">
+        <option value="16:9">16:9</option><option value="9:16">9:16</option><option value="1:1">1:1</option>
+      </select>
+      <select class="ve-select" id="ve-timeline-quality">
+        <option value="high">high</option><option value="medium">medium</option><option value="low">low</option>
+      </select>
+    </div>
+    <div class="ve-row">
+      <button class="ve-button primary" id="ve-timeline-export-btn" type="button"><i class="bi bi-play-fill"></i> Export Timeline</button>
+      <button class="ve-button warn" id="ve-timeline-stop-btn" type="button"><i class="bi bi-stop-fill"></i> Stop</button>
+    </div>
+    <div class="ve-progress" title="Timeline export progress"><div class="ve-progress-bar" id="ve-timeline-progress"></div></div>
+    <div class="ve-muted" id="ve-timeline-status" style="margin-top:8px">Idle — load a folder and export.</div>
+    <div class="ve-row" style="margin-top:10px">
+      <button class="ve-button success ve-hidden" id="ve-timeline-download-btn" type="button"><i class="bi bi-download"></i> Download Result</button>
+      <span class="ve-muted" id="ve-timeline-result-info"></span>
+    </div>
+  </div>
+  <div class="ve-section">
+    <div class="ve-section-title"><span><i class="bi bi-table"></i> Videos to stitch (<span id="ve-timeline-count">0</span>)</span></div>
+    <div class="ve-muted" id="ve-timeline-list-summary">No videos loaded.</div>
+    <table class="ve-table"><thead><tr><th>#</th><th>Video</th><th>Duration</th></tr></thead><tbody id="ve-timeline-body"></tbody></table>
+  </div>
+</div>
         <div class="ve-tab-panel" data-panel="activity">
           <div class="ve-section">
             <div class="ve-section-title"><span><i class="bi bi-terminal"></i> Activity log</span></div>
@@ -1581,6 +1617,20 @@ function extractVideoIdFromStatus(payload) {
     downloadRemainingBtn: root.querySelector("#ve-download-remaining-btn"),
     retryAllFailedBtn: root.querySelector("#ve-retry-all-failed-btn"),
     retryAllSummary: root.querySelector("#ve-retry-all-summary"),
+    timelineFolderSelect: root.querySelector("#ve-timeline-folder-select"),
+    timelineLoadBtn: root.querySelector("#ve-timeline-load-btn"),
+    timelineName: root.querySelector("#ve-timeline-name"),
+    timelineAspect: root.querySelector("#ve-timeline-aspect"),
+    timelineQuality: root.querySelector("#ve-timeline-quality"),
+    timelineExportBtn: root.querySelector("#ve-timeline-export-btn"),
+    timelineStopBtn: root.querySelector("#ve-timeline-stop-btn"),
+    timelineProgress: root.querySelector("#ve-timeline-progress"),
+    timelineStatus: root.querySelector("#ve-timeline-status"),
+    timelineDownloadBtn: root.querySelector("#ve-timeline-download-btn"),
+    timelineResultInfo: root.querySelector("#ve-timeline-result-info"),
+    timelineCount: root.querySelector("#ve-timeline-count"),
+    timelineBody: root.querySelector("#ve-timeline-body"),
+    timelineListSummary: root.querySelector("#ve-timeline-list-summary"),
     log: root.querySelector("#ve-log"),
   };
 
@@ -1659,6 +1709,10 @@ function extractVideoIdFromStatus(payload) {
       options || `<option value="">No folders found</option>`;
     els.uploadFolderSelect.value = state.selectedFolderId || "";
     els.downloadFolderSelect.value = state.selectedFolderId || "";
+    if (els.timelineFolderSelect) {
+      els.timelineFolderSelect.innerHTML = options || `<option value="">No folders found</option>`;
+      els.timelineFolderSelect.value = state.selectedFolderId || "";
+    }
     els.folderGrid.innerHTML = state.folders.length
       ? state.folders
           .map((folder) => {
@@ -1972,6 +2026,25 @@ function extractVideoIdFromStatus(payload) {
       : missing ? `No completed with videoId yet — ${missing} completed but videoId missing (see Activity log)` : "No completed videos yet. Run queue and wait for completion.";
     els.queueDownloadProgress.style.width = counts.completed ? `${Math.round((counts.downloaded / counts.completed) * 100)}%` : "0%";
     updateButtonStates();
+  }
+
+  function renderTimelineExport() {
+    if (!els.timelineProgress) return;
+    els.timelineProgress.style.width = `${Math.max(0, Math.min(100, Number(state.timelineExport.percent || 0)))}%`;
+    els.timelineStatus.textContent = state.timelineExport.statusText || (state.timelineExport.running ? `Exporting ${state.timelineExport.percent}%` : "Idle — load a folder and export.");
+    const hasResult = Boolean(state.timelineExport.exportedVideo && state.timelineExport.exportedVideo.mediaPath);
+    els.timelineDownloadBtn.classList.toggle("ve-hidden", !hasResult);
+    if (hasResult) {
+      els.timelineResultInfo.textContent = `${state.timelineExport.exportedVideo.filename || state.timelineExport.exportedVideo.id} (${formatBytes(state.timelineExport.exportedVideo.filesize || 0)})`;
+    } else {
+      els.timelineResultInfo.textContent = state.timelineExport.lastError ? `Error: ${state.timelineExport.lastError}` : "";
+    }
+    const vids = state.timelineVideos || [];
+    els.timelineCount.textContent = String(vids.length);
+    els.timelineListSummary.textContent = vids.length ? `${vids.length} videos sorted by name (chronological)` : "No videos loaded.";
+    els.timelineBody.innerHTML = vids.length ? vids.slice(0,150).map((v,i)=>`
+      <tr><td>${i+1}</td><td><div class="ve-media-cell"><div class="ve-thumb" style="background-image:url('${escapeAttr(v.thumbUrl||"")}')"></div><div><div class="ve-title-line">${escapeHtml(v.name||v.fileName||String(v.id))}</div><div class="ve-muted">${v.id} | ${escapeHtml(v.fileName||"")}</div></div></div></td><td>${escapeHtml(formatDuration(v.duration||v.duration_time||0))}</td></tr>
+    `).join("") : `<tr><td colspan="3" class="ve-muted">Load videos first.</td></tr>`;
   }
 
   function escapeHtml(value) {
@@ -2945,6 +3018,11 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     if (els.retryAllFailedBtn) {
       els.retryAllFailedBtn.disabled = state.running || state.uploadInProgress || state.downloadInProgress || failedCountForBtn === 0;
     }
+    const hasVideos = (state.timelineVideos && state.timelineVideos.length > 0);
+    if (els.timelineExportBtn) els.timelineExportBtn.disabled = state.timelineExport.running || state.uploadInProgress || state.downloadInProgress || !hasVideos;
+    if (els.timelineStopBtn) els.timelineStopBtn.disabled = !state.timelineExport.running;
+    if (els.timelineDownloadBtn) els.timelineDownloadBtn.disabled = state.downloadInProgress || !state.timelineExport.exportedVideo;
+    if (els.timelineLoadBtn) els.timelineLoadBtn.disabled = state.timelineExport.running || state.downloadInProgress;
     els.masterPromptEnabled.disabled = state.running;
     els.promptListEnabled.disabled = state.running;
     updateMasterPromptControls();
