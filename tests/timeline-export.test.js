@@ -54,3 +54,32 @@ describe("timeline export core", () => {
     }
   });
 });
+describe("timeline polling", () => {
+  it("startTimelineProgressPolling calls getProjectProgress with start flag alternating", () => {
+    const src = fs.readFileSync("videoexpress-manager.user.js","utf8");
+    assert.match(src, /startTimelineProgressPolling/);
+    assert.match(src, /getProjectProgress/);
+    assert.match(src, /getListOutput/);
+    assert.match(src, /downloadTimelineResult/);
+  });
+  it("isTimelinePollCompleted checks percent 100 and queue_status", () => {
+    const src = fs.readFileSync("videoexpress-manager.user.js","utf8");
+    assert.match(src, /isTimelinePollCompleted/);
+    assert.match(src, /percent/);
+    assert.match(src, /queue_status/);
+  });
+  it("checkTimelineResult polls get_list_output and fallback mediaPath", () => {
+    const src = fs.readFileSync("videoexpress-manager.user.js","utf8");
+    assert.match(src, /checkTimelineResult/);
+    assert.match(src, /getListOutput/);
+    assert.match(src, /mediaPath/);
+    assert.match(src, /exportedVideo/);
+  });
+  it("polling uses 2000ms interval and handles user_queue guard", () => {
+    const src = fs.readFileSync("videoexpress-manager.user.js","utf8");
+    assert.match(src, /pollIntervalMs/);
+    assert.match(src, /2000/);
+    assert.match(src, /getUserQueue/);
+    assert.match(src, /clearInterval/);
+  });
+});

@@ -2261,9 +2261,114 @@ function extractVideoIdFromStatus(payload) {
     logLine(`Timeline: ${videos.length} videos sorted by name (chronological).`);
   }
 
-  // Task 6 hook — stubbed here, fully implemented in Task 6; Task 5's exportTimeline will call it if present
+  function isTimelinePollCompleted(progressRes) {
+    const pct = Number(progressRes?.percent ?? 0);
+    const qs = progressRes?.queue_status || {};
+    return pct === 100 && Number(qs.in_progress || 0) === 0;
+  }
+  let _timelineProgressStarted = false;
   function startTimelineProgressPolling(projectName) {
-    logLine(`Timeline polling stub for "${projectName}" — Task 6 will implement polling.`);
+    _timelineProgressStarted = false;
+    if (state.timelineExport.pollTimer) clearInterval(state.timelineExport.pollTimer);
+    const intervalMs = Number(config.timelineExportDefaults.pollIntervalMs || 2000);
+    state.timelineExport.pollTimer = setInterval(async () => {
+      if (!state.timelineExport.running) { clearInterval(state.timelineExport.pollTimer); return; }
+      try {
+        const startFlag = !_timelineProgressStarted;
+        const progress = await api.getProjectProgress(startFlag);
+        _timelineProgressStarted = true;
+        const pct = Number(progress.percent ?? 0);
+        state.timelineExport.percent = pct;
+        state.timelineExport.queueStatus = progress.queue_status || state.timelineExport.queueStatus;
+        state.timelineExport.statusText = `Exporting "${projectName}" — ${pct}% (queue ${progress.queue_status?.in_progress ?? "?"} / ${progress.queue_status?.total ?? "?"})`;
+        renderTimelineExport();
+        logLine(`Timeline progress: ${pct}% queue ${JSON.stringify(progress.queue_status)}`);
+        try {
+          const q = await api.getUserQueue();
+          const match = (q.results || []).find(r => String(r.name) === String(projectName));
+          if (match) state.timelineExport.statusText = `Queue: ${match.status} — ${pct}%`;
+        } catch {}
+        if (isTimelinePollCompleted(progress)) {
+          clearInterval(state.timelineExport.pollTimer);
+          state.timelineExport.pollTimer = null;
+          state.timelineExport.statusText = `Render complete — fetching result for "${projectName}"...`;
+          renderTimelineExport();
+          await checkTimelineResult(projectName);
+        }
+      } catch (e) {
+        state.timelineExport.lastError = e.message || String(e);
+        state.timelineExport.statusText = `Progress poll error: ${state.timelineExport.lastError}`;
+        logLine(`Timeline progress error: ${e.message}`);
+        renderTimelineExport();
+      }
+    }, intervalMs);
+    (async()=>{
+      try {
+        const p = await api.getProjectProgress(true);
+        _timelineProgressStarted = true;
+        state.timelineExport.percent = Number(p.percent||0);
+        renderTimelineExport();
+      } catch {}
+    })();
+  }
+  async function checkTimelineResult(projectName) {
+    let tries = 0;
+    const maxTries = 30;
+    while (tries < maxTries && state.timelineExport.running) {
+      tries++;
+      try {
+        const out = await api.getListOutput();
+        const results = Array.isArray(out.results) ? out.results : [];
+        let match = results.find(r => String(r.title) === String(projectName));
+        if (!match && results.length) {
+          match = results.slice().sort((a,b)=>{
+            const da = new Date((a.datetime||"").replace(/(\d+)\/(\d+)\/(\d+)/, "$3-$1-$2")).getTime();
+            const db = new Date((b.datetime||"").replace(/(\d+)\/(\d+)\/(\d+)/, "$3-$1-$2")).getTime();
+            return db - da;
+          })[0];
+        }
+        if (match && match.mediaPath) {
+          state.timelineExport.exportedVideo = { id: match.id, filename: match.filename, mediaPath: match.mediaPath, title: match.title, datetime: match.datetime, filesize: match.filesize };
+          state.timelineExport.percent = 100;
+          state.timelineExport.statusText = `Ready to download: ${match.filename} (${match.filesize || ""})`;
+          state.timelineExport.running = false;
+          renderTimelineExport(); updateButtonStates();
+          logLine(`Timeline ready: ${match.filename} -> ${match.mediaPath}`);
+          return match;
+        }
+        state.timelineExport.statusText = `Waiting for result file... attempt ${tries}/${maxTries}`;
+        renderTimelineExport();
+      } catch (e) {
+        logLine(`get_list_output error: ${e.message}`);
+      }
+      await sleep(2000);
+    }
+    state.timelineExport.running = false;
+    state.timelineExport.lastError = "Result not found after polling get_list_output";
+    state.timelineExport.statusText = "Export finished but result file not found — check My Videos > get_list_output.";
+    renderTimelineExport(); updateButtonStates();
+    return null;
+  }
+  async function downloadTimelineResult() {
+    const v = state.timelineExport.exportedVideo;
+    if (!v || !v.mediaPath) throw new Error("No exported video ready to download.");
+    const fileName = sanitizeFileName(v.title || v.filename || state.timelineExport.projectName || "timeline") + ".mp4";
+    logLine(`Downloading timeline result: ${fileName}`);
+    try {
+      if (v.id) {
+        await fetchAndDownloadWithRetry({ id: v.id, name: v.title || v.filename, fileName: v.filename }, fileName);
+      } else {
+        const res = await fetch(v.mediaPath, { credentials: "include" });
+        if (!res.ok) throw new Error(`Fetch result ${res.status}`);
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a"); a.href = url; a.download = fileName; a.rel="noopener"; a.style.display="none"; document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(url),10000);
+      }
+      logLine(`Timeline downloaded: ${fileName}`);
+    } catch (e) {
+      logLine(`Timeline download failed: ${e.message}`);
+      throw e;
+    }
   }
 
   async function exportTimeline() {
@@ -2315,7 +2420,7 @@ function extractVideoIdFromStatus(payload) {
     renderTimelineExport(); updateButtonStates();
   }
   if (typeof window !== "undefined") {
-    window.__ve_test = Object.assign(window.__ve_test || {}, { loadTimelineVideos, exportTimeline, stopTimelineExport, startTimelineProgressPolling });
+    window.__ve_test = Object.assign(window.__ve_test || {}, { loadTimelineVideos, exportTimeline, stopTimelineExport, startTimelineProgressPolling, isTimelinePollCompleted, checkTimelineResult, downloadTimelineResult });
   }
 
   async function createFolder() {
@@ -3381,14 +3486,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     if (els.timelineLoadBtn) els.timelineLoadBtn.addEventListener("click", () => handleAction(loadTimelineVideos));
     if (els.timelineExportBtn) els.timelineExportBtn.addEventListener("click", () => handleAction(exportTimeline));
     if (els.timelineStopBtn) els.timelineStopBtn.addEventListener("click", () => { stopTimelineExport(); });
-    if (els.timelineDownloadBtn) els.timelineDownloadBtn.addEventListener("click", () => handleAction(async () => {
-      const v = state.timelineExport.exportedVideo;
-      if (!v || !v.mediaPath) throw new Error("No exported video ready.");
-      const fileName = sanitizeFileName(v.title || v.filename || state.timelineExport.projectName || "timeline") + ".mp4";
-      const fake = { id: v.id, name: v.title || v.filename, fileName: v.filename };
-      await fetchAndDownloadWithRetry(fake, fileName);
-      logLine(`Timeline download triggered: ${fileName}`);
-    }));
+    if (els.timelineDownloadBtn) els.timelineDownloadBtn.addEventListener("click", () => handleAction(downloadTimelineResult));
     if (els.timelineFolderSelect) els.timelineFolderSelect.addEventListener("change", () => { selectFolder(els.timelineFolderSelect.value); });
     [els.timelineName, els.timelineAspect, els.timelineQuality].forEach(el=>{ if(!el) return; el.addEventListener("change", updateTimelineExportConfigFromInputs); el.addEventListener("input", updateTimelineExportConfigFromInputs); });
   }
