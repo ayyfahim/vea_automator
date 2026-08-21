@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoExpress Library Manager
 // @namespace    https://app.videoexpress.ai/
-// @version      0.9.3
+// @version      0.9.4
 // @description  Manage folders, upload images, and batch convert images to videos inside VideoExpress AI.
 // @match        https://app.videoexpress.ai/*
 // @grant        none
@@ -87,6 +87,8 @@
     },
     activeTab: "folders",
     queue: [],
+    queuePage: 0,
+    queuePageSize: 150,
     activeStatuses: new Map(),
     auth: {
       csrfToken: "",
@@ -1722,6 +1724,13 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
                 <tbody id="ve-queue-body"></tbody>
               </table>
             </div>
+            <div id="ve-queue-pager" style="display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:6px; font-family:'Instrument Sans',sans-serif; font-size:11px; color:#6B7280;">
+              <span id="ve-queue-pager-info" style="font-family:'JetBrains Mono',monospace; font-size:10px;"></span>
+              <span style="display:flex; gap:6px;">
+                <button class="ve-button ghost small" id="ve-queue-prev" type="button" title="Previous page"><i class="bi bi-chevron-left"></i> Prev</button>
+                <button class="ve-button ghost small" id="ve-queue-next" type="button" title="Next page">Next <i class="bi bi-chevron-right"></i></button>
+              </span>
+            </div>
           </div>
         </div>
 
@@ -1964,6 +1973,10 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     autoExpireToggle: root.querySelector("#ve-auto-expire-toggle"),
     folderBrowserToggle: root.querySelector("#ve-folder-browser-toggle"),
     folderBrowser: root.querySelector("#ve-folder-browser"),
+    queuePager: root.querySelector("#ve-queue-pager"),
+    queuePagerInfo: root.querySelector("#ve-queue-pager-info"),
+    queuePrev: root.querySelector("#ve-queue-prev"),
+    queueNext: root.querySelector("#ve-queue-next"),
   };
 
   function logLine(message) {
@@ -2418,21 +2431,34 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       ? `${folder.title || folder.name} | ${state.items.length} images loaded | history updated ${formatDateTime(state.history.updatedAt) || "never"}`
       : "Choose a folder, then “Show images in folder” to build the queue.";
 
-    // Queue preview count: show accurate total vs truncated display (intentional 150 cap for perf)
+    // Queue preview pagination — 150/page, header shows page range (UI-only, no queue logic change)
+    const _qTotal = state.queue.length;
+    const _qPageSize = Number(state.queuePageSize || 150);
+    const _qTotalPages = Math.max(1, Math.ceil(_qTotal / _qPageSize));
+    if (state.queuePage >= _qTotalPages) state.queuePage = Math.max(0, _qTotalPages - 1);
+    if (state.queuePage < 0) state.queuePage = 0;
+    const _qStart = state.queuePage * _qPageSize;
+    const _qEnd = Math.min(_qStart + _qPageSize, _qTotal);
     try {
-      const total = state.queue.length;
-      const shown = Math.min(total, 150);
       const el = document.getElementById("ve-queue-count");
       if (el) {
-        if (!total) el.textContent = "up to 150 shown";
-        else if (total > 150) el.textContent = `Showing ${shown} / ${total} (+${total - shown} hidden)`;
-        else el.textContent = `${total} shown`;
+        if (!_qTotal) el.textContent = "up to 150 shown";
+        else if (_qTotal > _qPageSize) el.textContent = `Showing ${_qStart + 1}-${_qEnd} / ${_qTotal} (page ${state.queuePage + 1}/${_qTotalPages})`;
+        else el.textContent = `${_qTotal} shown`;
       }
+      if (els.queuePager) els.queuePager.style.display = _qTotal > _qPageSize ? "flex" : "none";
+      if (els.queuePagerInfo) {
+        if (!_qTotal) els.queuePagerInfo.textContent = "";
+        else if (_qTotal > _qPageSize) els.queuePagerInfo.textContent = `${_qStart + 1}-${_qEnd} of ${_qTotal} · page ${state.queuePage + 1}/${_qTotalPages}`;
+        else els.queuePagerInfo.textContent = `${_qTotal} items`;
+      }
+      if (els.queuePrev) els.queuePrev.disabled = state.queuePage <= 0;
+      if (els.queueNext) els.queueNext.disabled = state.queuePage >= _qTotalPages - 1 || _qTotal <= _qPageSize;
     } catch {}
 
     els.queueBody.innerHTML = state.queue.length
       ? state.queue
-          .slice(0, 150)
+          .slice(_qStart, _qEnd)
           .map((item) => {
             const record =
               item.record || getRecord(state.selectedFolderId, item.media.id);
@@ -2733,6 +2759,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     saveUiState({ selectedFolderId: state.selectedFolderId });
     state.items = [];
     state.queue = [];
+    state.queuePage = 0;
     state.videos = [];
     state.selectedVideoIds = new Set();
     state.timelineVideos = [];
@@ -2750,6 +2777,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     state.items = payload.results.slice().sort(compareMediaName);
     state.folderMediaCount = payload.total;
     state.queue = buildQueue(folder, state.items);
+    state.queuePage = 0;
     renderQueue();
     logLine(`Loaded ${state.items.length} images from folder ${folder.id}.`);
   }
@@ -4183,6 +4211,12 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     if (els.retryAllFailedBtn) {
       els.retryAllFailedBtn.addEventListener("click", () => handleAction(retryAllFailed));
     }
+    // Queue pager — 150/page, UI-only
+    if (els.queuePrev) els.queuePrev.addEventListener("click", () => { if (state.queuePage > 0) { state.queuePage--; renderQueue(); } });
+    if (els.queueNext) els.queueNext.addEventListener("click", () => {
+      const totalPages = Math.max(1, Math.ceil(state.queue.length / Number(state.queuePageSize || 150)));
+      if (state.queuePage < totalPages - 1) { state.queuePage++; renderQueue(); }
+    });
     if (els.timelineLoadBtn) els.timelineLoadBtn.addEventListener("click", () => handleAction(loadTimelineVideos));
     if (els.timelineAddCompletedBtn) els.timelineAddCompletedBtn.addEventListener("click", () => handleAction(addCompletedGeneratedToTimeline));
     if (els.timelineClearBtn) els.timelineClearBtn.addEventListener("click", () => { clearTimelineVideos(); });
