@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoExpress Library Manager
 // @namespace    https://app.videoexpress.ai/
-// @version      0.9.2
+// @version      0.9.3
 // @description  Manage folders, upload images, and batch convert images to videos inside VideoExpress AI.
 // @match        https://app.videoexpress.ai/*
 // @grant        none
@@ -1706,7 +1706,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
           <div class="ve-section">
             <div class="ve-section-title">
               <span><i class="bi bi-table"></i> Queue preview</span>
-              <span class="ve-muted" style="font-family:'JetBrains Mono',monospace; font-size:9px;">up to 150 shown</span>
+              <span class="ve-muted" id="ve-queue-count" style="font-family:'JetBrains Mono',monospace; font-size:9px;">up to 150 shown</span>
             </div>
             <div style="max-height:360px; overflow:auto; border:1px solid #E0D8CC; border-radius:1px;">
               <table class="ve-table">
@@ -2417,6 +2417,18 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     els.folderSummary.textContent = folder
       ? `${folder.title || folder.name} | ${state.items.length} images loaded | history updated ${formatDateTime(state.history.updatedAt) || "never"}`
       : "Choose a folder, then “Show images in folder” to build the queue.";
+
+    // Queue preview count: show accurate total vs truncated display (intentional 150 cap for perf)
+    try {
+      const total = state.queue.length;
+      const shown = Math.min(total, 150);
+      const el = document.getElementById("ve-queue-count");
+      if (el) {
+        if (!total) el.textContent = "up to 150 shown";
+        else if (total > 150) el.textContent = `Showing ${shown} / ${total} (+${total - shown} hidden)`;
+        else el.textContent = `${total} shown`;
+      }
+    } catch {}
 
     els.queueBody.innerHTML = state.queue.length
       ? state.queue
