@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoExpress Library Manager
 // @namespace    https://app.videoexpress.ai/
-// @version      0.9.4
+// @version      0.9.5
 // @description  Manage folders, upload images, and batch convert images to videos inside VideoExpress AI.
 // @match        https://app.videoexpress.ai/*
 // @grant        none
@@ -1798,8 +1798,8 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
         <!-- TIMELINE -->
         <div class="ve-tab-panel" data-panel="timeline">
           <div class="ve-section">
-            <div class="ve-section-title"><span><i class="bi bi-view-list"></i> Stitch</span><span class="ve-muted" style="font-family:'JetBrains Mono',monospace; font-size:9px;">optional · numeric order</span></div>
-            <p class="ve-section-help">Combine clips in numeric name order into one export.</p>
+            <div class="ve-section-title"><span><i class="bi bi-view-list"></i> Stitch</span><span class="ve-muted" style="font-family:'JetBrains Mono',monospace; font-size:9px;">optional · generation order</span></div>
+            <p class="ve-section-help">Combine clips in generation order (queue order) into one export.</p>
             <div class="ve-row">
               <button class="ve-button ghost" id="ve-timeline-load-btn" type="button"><i class="bi bi-collection-play"></i> Load videos in folder</button>
               <button class="ve-button ghost" id="ve-timeline-add-completed-btn" type="button"><i class="bi bi-plus-circle"></i> Add completed to timeline</button>
@@ -2308,6 +2308,54 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     });
   }
 
+  function getRecordForVideo(video) {
+    if (!video) return null;
+    const vid = String(video.id || video.mediaId || video.videoId || "").trim();
+    const uuid = video.uuid ? String(video.uuid).toLowerCase().trim() : "";
+    if (!vid && !uuid) return null;
+    for (const rec of Object.values(state.history.records)) {
+      if (!rec) continue;
+      if (vid && String(rec.videoId) === vid) return rec;
+      if (uuid && rec.uuid && String(rec.uuid).toLowerCase().trim() === uuid) return rec;
+    }
+    return null;
+  }
+
+  function sortTimelineVideosByGeneration(videos) {
+    if (!Array.isArray(videos) || videos.length <= 1) return videos;
+    const byVideoId = new Map();
+    const byUuid = new Map();
+    for (const rec of Object.values(state.history.records)) {
+      if (!rec) continue;
+      if (rec.videoId) byVideoId.set(String(rec.videoId), rec);
+      if (rec.uuid) byUuid.set(String(rec.uuid).toLowerCase().trim(), rec);
+    }
+    const getRecFast = (video) => {
+      if (!video) return null;
+      const vid = video.id != null ? String(video.id) : "";
+      if (vid && byVideoId.has(vid)) return byVideoId.get(vid);
+      const uuid = video.uuid ? String(video.uuid).toLowerCase().trim() : "";
+      if (uuid && byUuid.has(uuid)) return byUuid.get(uuid);
+      return null;
+    };
+    videos.sort((a, b) => {
+      const recA = getRecFast(a);
+      const recB = getRecFast(b);
+      const posA = recA ? getQueuePositionForMedia(recA.imageId) : null;
+      const posB = recB ? getQueuePositionForMedia(recB.imageId) : null;
+      if (posA != null && posB != null) return posA - posB;
+      if (posA != null) return -1;
+      if (posB != null) return 1;
+      const tA = recA ? (recA.completedAt ? new Date(recA.completedAt).getTime() : (recA.updatedAt ? new Date(recA.updatedAt).getTime() : 0)) : 0;
+      const tB = recB ? (recB.completedAt ? new Date(recB.completedAt).getTime() : (recB.updatedAt ? new Date(recB.updatedAt).getTime() : 0)) : 0;
+      if (tA && tB && tA !== tB) return tA - tB;
+      if (tA) return -1;
+      if (tB) return 1;
+      return compareMediaName(a, b);
+    });
+    return videos;
+  }
+
   function getTimelineFrameSize(aspect, size) {
     const a = aspect || config.timelineExportDefaults?.aspect || "16:9";
     const s = String(size || config.timelineExportDefaults?.size || "1080");
@@ -2378,7 +2426,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     return { options, data: [trackData, emptyTrack] };
   }
   // expose for tests (no global leak in prod except test env)
-  if (typeof window !== "undefined") { window.__ve_test = { buildTimelineBricks, buildTimelinePayload, compareMediaName, getTimelineFrameSize }; }
+  if (typeof window !== "undefined") { window.__ve_test = { buildTimelineBricks, buildTimelinePayload, compareMediaName, getTimelineFrameSize, sortTimelineVideosByGeneration, getRecordForVideo }; }
 
   function setSelectedFiles(fileList) {
     state.selectedFiles = Array.from(fileList || [])
@@ -2528,7 +2576,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     }
     const vids = state.timelineVideos || [];
     els.timelineCount.textContent = String(vids.length);
-    els.timelineListSummary.textContent = vids.length ? `${vids.length} videos sorted by name (chronological)` : "No videos loaded.";
+    els.timelineListSummary.textContent = vids.length ? `${vids.length} videos sorted by generation order` : "No videos loaded.";
     els.timelineBody.innerHTML = vids.length ? vids.slice(0,150).map((v,i)=>`
       <tr><td>${i+1}</td><td><div class="ve-media-cell"><div class="ve-thumb" style="background-image:url('${escapeAttr(v.thumbUrl||"")}')"></div><div><div class="ve-title-line">${escapeHtml(v.name||v.fileName||String(v.id))}</div><div class="ve-muted">${v.id} | ${escapeHtml(v.fileName||"")}</div></div></div></td><td>${escapeHtml(formatDuration(v.duration||v.duration_time||0))}</td></tr>
     `).join("") : `<tr><td colspan="3" class="ve-muted">Load videos first.</td></tr>`;
@@ -2802,11 +2850,11 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     logLine(`Loading timeline videos for "${folder.title || folder.name}"...`);
     const payload = await api.getAllVideos(folder.id);
     const videos = (payload.results || []).filter(v => (v.type === "video" || v.extension === "mp4" || v.fileName?.endsWith?.(".mp4")) );
-    videos.sort(compareMediaName);
+    sortTimelineVideosByGeneration(videos);
     state.timelineVideos = videos;
     renderTimelineExport();
     updateButtonStates();
-    logLine(`Timeline: ${videos.length} videos sorted by name (chronological).`);
+    logLine(`Timeline: ${videos.length} videos sorted by generation order.`);
   }
 
   async function addCompletedGeneratedToTimeline() {
@@ -2906,8 +2954,8 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       existingIds.add(vid);
       added++;
     }
-    // Keep stitch order chronological by name (numeric) + retain generation order for ties
-    state.timelineVideos.sort(compareMediaName);
+    // Keep stitch order by generation (queue position -> completedAt -> name fallback)
+    sortTimelineVideosByGeneration(state.timelineVideos);
     renderTimelineExport();
     updateButtonStates();
     logLine(`Added ${added} completed video(s) to timeline${skipped ? ` (${skipped} already present)` : ""} — total ${state.timelineVideos.length}`);
