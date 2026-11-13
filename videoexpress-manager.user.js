@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoExpress Library Manager
 // @namespace    https://app.videoexpress.ai/
-// @version      0.9.6
+// @version      0.9.7
 // @description  Manage folders, upload images, batch generate images from prompts, and batch convert images to videos inside VideoExpress AI.
 // @match        https://app.videoexpress.ai/*
 // @grant        none
@@ -61,10 +61,11 @@
     imageType: "photorealistic",
     enhanceImagePrompt: true,
     enhanceVideoPrompt: true,
-    // Consistent character: "off", "first" (image 1 is the character), "reference" (picked images).
-    characterMode: "off",
-    referenceMediaId: "",
-    referenceMediaId2: "",
+    // Characters: a list of { tag, description, mediaId }. A prompt line that contains @tag keeps
+    // that character (site Consistent Character, max 2 per line). mediaId "" = the character is
+    // created by the first line that uses its tag. defaultCharacterTag applies to untagged lines.
+    characters: [],
+    defaultCharacterTag: "",
     imageConcurrency: 3,
     imageTimeoutMs: 6 * 60 * 1000,
     renameOutputs: true,
@@ -252,7 +253,7 @@
   function loadGenRun() {
     try {
       const parsed = JSON.parse(localStorage.getItem(GEN_RUN_KEY) || "null");
-      return parsed && Array.isArray(parsed.items) ? parsed : null;
+      return parsed && Array.isArray(parsed.items) ? normalizeGenRun(parsed) : null;
     } catch {
       return null;
     }
@@ -1616,6 +1617,15 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
   .ve-check .ve-checkbox { flex:0 0 15px; margin-top:1px; }
   .ve-reference-preview { display:flex; gap:8px; }
   .ve-reference-preview .ve-thumb { width:96px; height:54px; flex-basis:96px; }
+  .ve-char-row { display:grid; grid-template-columns: 54px 110px 1fr 1.3fr 30px; gap:6px; align-items:center; padding:6px; margin-bottom:6px; background:#F9FAFB; border:1px solid #E6E8EF; border-radius:6px; }
+  .ve-char-row .ve-thumb { width:54px; height:32px; flex-basis:54px; }
+  .ve-char-row .ve-input, .ve-char-row .ve-select { padding:6px 8px; font-size:11.5px; }
+  .ve-char-tag { position:relative; }
+  .ve-char-tag::before { content:'@'; position:absolute; left:8px; top:50%; transform:translateY(-50%); font-family:'JetBrains Mono',monospace; font-size:11.5px; color:var(--cut-orange); font-weight:700; }
+  .ve-char-tag .ve-input { padding-left:20px; font-family:'JetBrains Mono',monospace; }
+  .ve-char-count { font-family:'JetBrains Mono',monospace; font-size:9px; color:#6B7280; }
+  .ve-tag-chip { display:inline-block; margin-right:4px; padding:0 5px; border-radius:999px; background:#F3F0FF; color:var(--cut-orange); font-family:'JetBrains Mono',monospace; font-size:9.5px; font-weight:700; }
+  @media (max-width: 640px) { .ve-char-row { grid-template-columns: 1fr 1fr; } }
   .ve-cell-prompt { word-break:break-word; }
   .ve-cell-prompt .ve-muted { display:block; margin-top:3px; font-size:11px; }
   .ve-error-line { display:block; margin-top:4px; color:#B45309; font-size:10.5px; word-break:break-word; }
@@ -1878,33 +1888,26 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
           </div>
 
           <div class="ve-section" data-show-modes="image2video image">
-            <div class="ve-section-title"><span><i class="bi bi-person-bounding-box"></i> Consistent character</span><span class="ve-muted" style="font-family:'JetBrains Mono',monospace; font-size:9px;">same person across images</span></div>
-            <select class="ve-select" id="ve-character-mode" aria-label="Consistent character mode">
-              <option value="off">Off — every image is independent</option>
-              <option value="first">Use the first image as the character</option>
-              <option value="reference">Use reference image(s) from a folder</option>
-            </select>
-            <div class="ve-hidden" id="ve-reference-row" style="margin-top:8px">
-              <div class="ve-row" style="align-items:flex-end;">
-                <div style="flex:1; min-width:0;">
-                  <label class="ve-field-label" for="ve-reference-folder-select">Reference folder</label>
-                  <select class="ve-select" id="ve-reference-folder-select" aria-label="Reference folder"></select>
-                </div>
-                <div style="flex:0 0 auto;">
-                  <button class="ve-button ghost" id="ve-load-references-btn" type="button"><i class="bi bi-arrow-clockwise"></i> Load images</button>
-                </div>
+            <div class="ve-section-title"><span><i class="bi bi-person-bounding-box"></i> Characters</span><span class="ve-muted" style="font-family:'JetBrains Mono',monospace; font-size:9px;">tag lines with @name · max 2 per line</span></div>
+            <p class="ve-section-help">Write <b>@name</b> in any prompt line where that character appears. Only tagged lines keep the character; other lines are generated normally. A character without a reference image is created by the first line that uses its tag.</p>
+            <div id="ve-character-list"></div>
+            <div class="ve-row" style="margin-top:8px; align-items:flex-end;">
+              <div style="flex:0 0 auto;">
+                <button class="ve-button ghost small" id="ve-add-character-btn" type="button"><i class="bi bi-person-plus"></i> Add character</button>
               </div>
-              <div class="ve-row">
-                <div>
-                  <label class="ve-field-label" for="ve-reference-1">Reference 1</label>
-                  <select class="ve-select" id="ve-reference-1" aria-label="Reference image 1"><option value="">Load a folder first</option></select>
-                </div>
-                <div>
-                  <label class="ve-field-label" for="ve-reference-2">Reference 2 (optional)</label>
-                  <select class="ve-select" id="ve-reference-2" aria-label="Reference image 2"><option value="">None</option></select>
-                </div>
+              <div style="flex:1; min-width:0;">
+                <label class="ve-field-label" for="ve-default-character">Lines without a tag</label>
+                <select class="ve-select" id="ve-default-character" aria-label="Character for lines without a tag"></select>
               </div>
-              <div class="ve-reference-preview" id="ve-reference-preview"></div>
+            </div>
+            <div class="ve-row" style="align-items:flex-end;">
+              <div style="flex:1; min-width:0;">
+                <label class="ve-field-label" for="ve-reference-folder-select">Reference images from folder</label>
+                <select class="ve-select" id="ve-reference-folder-select" aria-label="Reference folder"></select>
+              </div>
+              <div style="flex:0 0 auto;">
+                <button class="ve-button ghost" id="ve-load-references-btn" type="button"><i class="bi bi-arrow-clockwise"></i> Load images</button>
+              </div>
             </div>
             <p class="ve-field-hint" id="ve-character-help"></p>
           </div>
@@ -2284,14 +2287,12 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     imagePromptCount: root.querySelector("#ve-image-prompt-count"),
     videoPromptCount: root.querySelector("#ve-video-prompt-count"),
     promptCheck: root.querySelector("#ve-prompt-check"),
-    characterMode: root.querySelector("#ve-character-mode"),
+    characterList: root.querySelector("#ve-character-list"),
     characterHelp: root.querySelector("#ve-character-help"),
-    referenceRow: root.querySelector("#ve-reference-row"),
+    addCharacterBtn: root.querySelector("#ve-add-character-btn"),
+    defaultCharacter: root.querySelector("#ve-default-character"),
     referenceFolderSelect: root.querySelector("#ve-reference-folder-select"),
     loadReferencesBtn: root.querySelector("#ve-load-references-btn"),
-    reference1: root.querySelector("#ve-reference-1"),
-    reference2: root.querySelector("#ve-reference-2"),
-    referencePreview: root.querySelector("#ve-reference-preview"),
     enhanceImagePrompt: root.querySelector("#ve-enhance-image-prompt"),
     enhanceVideoPrompt: root.querySelector("#ve-enhance-video-prompt"),
     renameOutputs: root.querySelector("#ve-rename-outputs"),
@@ -3612,9 +3613,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     config.enhanceVideoPrompt = Boolean(els.enhanceVideoPrompt.checked);
     config.renameOutputs = Boolean(els.renameOutputs.checked);
     config.moveVideosToFolder = Boolean(els.moveVideos.checked);
-    config.characterMode = els.characterMode.value || "off";
-    config.referenceMediaId = els.reference1.value || "";
-    config.referenceMediaId2 = els.reference2.value || "";
+    config.defaultCharacterTag = els.defaultCharacter.value || "";
     config.imagePrompts = els.imagePrompts.value;
     config.videoPrompts = els.videoPrompts.value;
     if (config.downloadMaxDelayMs < config.downloadMinDelayMs) {
@@ -4311,10 +4310,190 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     if (!["16:9", "9:16"].includes(config.aspect)) {
       problems.push("Image generation supports 16:9 and 9:16 only.");
     }
-    if (config.characterMode === "reference" && !config.referenceMediaId) {
-      problems.push("Pick a reference image for the consistent character.");
+    problems.push(...validateCharacters(imagePrompts));
+    return problems;
+  }
+
+  /* —— Characters (@tag system) —— */
+
+  const TAG_PATTERN = /(^|[^\w@])@([A-Za-z][\w-]{0,30})\b/g;
+
+  function normalizeTag(tag) {
+    return String(tag || "").replace(/^@/, "").trim().toLowerCase();
+  }
+
+  // Tags written in a line, in order, lowercased, without duplicates.
+  function extractTags(line) {
+    const tags = [];
+    for (const match of String(line || "").matchAll(TAG_PATTERN)) {
+      const tag = normalizeTag(match[2]);
+      if (!tags.includes(tag)) tags.push(tag);
+    }
+    return tags;
+  }
+
+  // Characters used by a line: its own tags, or the default when it has none. "@none" = no character.
+  function resolveLineTags(line, defaultTag) {
+    const tags = extractTags(line);
+    if (tags.includes("none")) return [];
+    if (tags.length) return tags;
+    return defaultTag ? [defaultTag] : [];
+  }
+
+  // Replaces @tag with the character's description (or removes it) so the site gets plain text.
+  function applyCharacterTags(line, characters) {
+    const byTag = new Map(characters.map((character) => [normalizeTag(character.tag), character]));
+    return String(line || "")
+      .replace(TAG_PATTERN, (whole, before, raw) => {
+        const tag = normalizeTag(raw);
+        if (tag === "none") return before;
+        const character = byTag.get(tag);
+        if (!character) return whole;
+        const description = String(character.description || "").trim();
+        // No description: use the tag as a name ("@mia" -> "Mia") so the sentence keeps its subject.
+        const name = tag.replace(/[-_]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+        return `${before}${description || name}`;
+      })
+      .replace(/\s{2,}/g, " ")
+      .replace(/\s+([,.;:!?])/g, "$1")
+      .replace(/^[\s,;:]+/, "")
+      .trim();
+  }
+
+  function getCharacters() {
+    return (Array.isArray(config.characters) ? config.characters : []).filter(
+      (character) => normalizeTag(character.tag),
+    );
+  }
+
+  function validateCharacters(imagePrompts) {
+    const problems = [];
+    const characters = getCharacters();
+    const tags = characters.map((character) => normalizeTag(character.tag));
+    const duplicates = tags.filter((tag, index) => tags.indexOf(tag) !== index);
+    if (duplicates.length) problems.push(`Character tags must be unique: @${[...new Set(duplicates)].join(", @")}.`);
+    if (tags.includes("none")) problems.push('"@none" is reserved (it marks a line with no character).');
+    const unknown = new Map();
+    const tooMany = [];
+    imagePrompts.forEach((line, index) => {
+      const used = resolveLineTags(line, config.defaultCharacterTag);
+      used.forEach((tag) => {
+        if (!tags.includes(tag)) unknown.set(tag, (unknown.get(tag) || []).concat(index + 1));
+      });
+      if (used.length > 2) tooMany.push(index + 1);
+    });
+    unknown.forEach((lines, tag) => {
+      problems.push(`@${tag} is used on line ${lines.slice(0, 5).join(", ")}${lines.length > 5 ? "…" : ""} but is not in the character list. Add it, or fix the spelling.`);
+    });
+    if (tooMany.length) {
+      problems.push(`The site keeps at most 2 characters per image. Too many tags on line ${tooMany.slice(0, 5).join(", ")}${tooMany.length > 5 ? "…" : ""}.`);
     }
     return problems;
+  }
+
+  // Short summary for the prompt check line: "@anna 40 lines · @bob 12 · 48 with no character".
+  function describeTagUsage(imagePrompts) {
+    const characters = getCharacters();
+    if (!characters.length && !extractTags(imagePrompts.join("\n")).length) return "";
+    const counts = new Map();
+    let none = 0;
+    imagePrompts.forEach((line) => {
+      const used = resolveLineTags(line, config.defaultCharacterTag);
+      if (!used.length) none += 1;
+      used.forEach((tag) => counts.set(tag, (counts.get(tag) || 0) + 1));
+    });
+    const parts = [...counts].map(([tag, count]) => `@${tag} ${count} line${count === 1 ? "" : "s"}`);
+    if (none) parts.push(`${none} without a character`);
+    return parts.join(" · ");
+  }
+
+  function createCharacterId() {
+    return `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+  }
+
+  function referenceThumb(mediaId) {
+    if (!mediaId) return "";
+    const image = state.referenceImages.find((item) => String(item.id) === String(mediaId));
+    return image ? image.thumbUrl || image.mediaPath || "" : "";
+  }
+
+  function renderCharacters() {
+    if (!els.characterList) return;
+    const characters = Array.isArray(config.characters) ? config.characters : [];
+    const usage = new Map();
+    parsePromptList(els.imagePrompts.value).forEach((line) => {
+      resolveLineTags(line, config.defaultCharacterTag).forEach((tag) => usage.set(tag, (usage.get(tag) || 0) + 1));
+    });
+    const imageOptions = state.referenceImages
+      .map((image) => `<option value="${escapeAttr(String(image.id))}">${escapeHtml(image.name || image.fileName || String(image.id))} (${escapeHtml(String(image.id))})</option>`)
+      .join("");
+    els.characterList.innerHTML = characters.length
+      ? characters
+          .map((character) => {
+            const id = escapeAttr(character.id);
+            const mediaId = String(character.mediaId || "");
+            const known = state.referenceImages.some((image) => String(image.id) === mediaId);
+            const extra = mediaId && !known ? `<option value="${escapeAttr(mediaId)}">Image ${escapeHtml(mediaId)}</option>` : "";
+            const thumb = referenceThumb(mediaId) || character.thumbUrl || "";
+            const count = usage.get(normalizeTag(character.tag)) || 0;
+            return `
+              <div class="ve-char-row" data-character-id="${id}">
+                <div class="ve-thumb" title="${mediaId ? `Reference image ${escapeAttr(mediaId)}` : "Created by its first line"}" style="${thumb ? `background-image:url('${escapeAttr(thumb)}')` : ""}"></div>
+                <div class="ve-char-tag"><input class="ve-input" data-field="tag" value="${escapeAttr(character.tag || "")}" placeholder="name" aria-label="Character tag" spellcheck="false" /></div>
+                <select class="ve-select" data-field="mediaId" aria-label="Reference image">
+                  <option value="">Created by its first line</option>${extra}${imageOptions}
+                </select>
+                <input class="ve-input" data-field="description" value="${escapeAttr(character.description || "")}" placeholder="optional — replaces @tag (default: its name)" aria-label="Description that replaces the tag" />
+                <button class="ve-button ghost ve-icon-button" type="button" data-remove-character="${id}" title="Remove character (${count} line${count === 1 ? "" : "s"} use it)"><i class="bi bi-x-lg"></i></button>
+              </div>`;
+          })
+          .join("")
+      : `<p class="ve-field-hint" style="margin:0 0 4px;">No characters yet. Without characters every image is generated on its own.</p>`;
+    characters.forEach((character) => {
+      const select = els.characterList.querySelector(`[data-character-id="${CSS.escape(character.id)}"] select[data-field="mediaId"]`);
+      if (select) select.value = String(character.mediaId || "");
+    });
+    const current = config.defaultCharacterTag;
+    els.defaultCharacter.innerHTML =
+      `<option value="">No character</option>` +
+      characters
+        .filter((character) => normalizeTag(character.tag))
+        .map((character) => `<option value="${escapeAttr(normalizeTag(character.tag))}">Use @${escapeHtml(normalizeTag(character.tag))}</option>`)
+        .join("");
+    els.defaultCharacter.value = characters.some((character) => normalizeTag(character.tag) === current) ? current : "";
+    config.defaultCharacterTag = els.defaultCharacter.value;
+    els.characterHelp.textContent = characters.length
+      ? `Example line: "@${normalizeTag(characters[0].tag) || "name"} sits in a cafe by the window". With a default set, write @none on lines that should have no character.`
+      : "";
+  }
+
+  function readCharactersFromList() {
+    if (!els.characterList) return;
+    config.characters = (Array.isArray(config.characters) ? config.characters : []).map((character) => {
+      const row = els.characterList.querySelector(`[data-character-id="${CSS.escape(character.id)}"]`);
+      if (!row) return character;
+      return {
+        ...character,
+        tag: normalizeTag(row.querySelector('[data-field="tag"]').value).replace(/[^\w-]/g, ""),
+        mediaId: row.querySelector('[data-field="mediaId"]').value || "",
+        description: row.querySelector('[data-field="description"]').value.trim(),
+      };
+    });
+  }
+
+  function addCharacter(patch = {}) {
+    const characters = Array.isArray(config.characters) ? config.characters : [];
+    const used = characters.map((character) => normalizeTag(character.tag));
+    let tag = normalizeTag(patch.tag || "");
+    if (!tag) {
+      const names = ["hero", "friend", "villain", "guide", "child", "partner"];
+      tag = names.find((name) => !used.includes(name)) || `character${characters.length + 1}`;
+    }
+    config.characters = characters.concat({ id: createCharacterId(), tag, description: "", mediaId: "", ...patch, tag });
+    renderCharacters();
+    persistGenSettings();
+    updatePromptCheck();
+    return tag;
   }
 
   function updatePromptCheck() {
@@ -4341,45 +4520,15 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     } else if (config.mode === "image" && imagePrompts.length) {
       message = `${imagePrompts.length} image${imagePrompts.length === 1 ? "" : "s"} will be made in ${target}.`;
     }
+    const usage = describeTagUsage(imagePrompts);
+    if (usage && !warn) message += ` Characters: ${usage}.`;
+    const characterProblems = imagePrompts.length ? validateCharacters(imagePrompts) : [];
+    if (characterProblems.length) {
+      message = characterProblems[0];
+      warn = true;
+    }
     els.promptCheck.textContent = message;
     els.promptCheck.classList.toggle("is-warning", warn);
-  }
-
-  function updateCharacterControls() {
-    const mode = els.characterMode.value;
-    els.referenceRow.classList.toggle("ve-hidden", mode !== "reference");
-    els.characterHelp.textContent = {
-      off: "Each image is generated on its own.",
-      first: "Image 1 is generated first. Every other image keeps the same character (the site's Consistent Character feature).",
-      reference: "Every image keeps the character from the reference image(s). Use two references for two characters.",
-    }[mode] || "";
-    renderReferencePreview();
-  }
-
-  function renderReferencePreview() {
-    const ids = [els.reference1.value, els.reference2.value].filter(Boolean);
-    els.referencePreview.innerHTML = ids
-      .map((id) => {
-        const image = state.referenceImages.find((item) => String(item.id) === String(id));
-        const url = image ? image.thumbUrl || image.mediaPath || "" : "";
-        return `<div class="ve-thumb" title="${escapeAttr(image ? image.name : `Image ${id}`)}" style="background-image:url('${escapeAttr(url)}')"></div>`;
-      })
-      .join("");
-  }
-
-  function fillReferenceSelects(selected1, selected2) {
-    const options = state.referenceImages
-      .map((image) => `<option value="${escapeAttr(String(image.id))}">${escapeHtml(image.name || image.fileName || String(image.id))} (${escapeHtml(String(image.id))})</option>`)
-      .join("");
-    const keepOption = (id) =>
-      id && !state.referenceImages.some((image) => String(image.id) === String(id))
-        ? `<option value="${escapeAttr(String(id))}">Image ${escapeHtml(String(id))}</option>`
-        : "";
-    els.reference1.innerHTML = `<option value="">Choose an image</option>${keepOption(selected1)}${options}`;
-    els.reference2.innerHTML = `<option value="">None</option>${keepOption(selected2)}${options}`;
-    els.reference1.value = selected1 || "";
-    els.reference2.value = selected2 || "";
-    renderReferencePreview();
   }
 
   async function loadReferenceImages() {
@@ -4387,20 +4536,34 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     if (!folderId) throw new Error("Pick a reference folder first.");
     const payload = await api.getAllImages(folderId);
     state.referenceImages = payload.results.slice().sort(compareMediaName);
-    fillReferenceSelects(els.reference1.value, els.reference2.value);
+    renderCharacters();
     logLine(`Loaded ${state.referenceImages.length} reference images from folder ${folderId}.`);
   }
 
+  // "Use as character" on a finished row: adds (or updates) a character with that image as its reference.
   function useImageAsCharacter(mediaId, imageUrl) {
+    readCharactersFromList();
+    const answer = window.prompt("Tag for this character (you will write @tag in prompt lines):", "hero");
+    if (answer === null) return;
+    const tag = normalizeTag(answer).replace(/[^\w-]/g, "");
+    if (!tag || tag === "none") {
+      alert("Use letters, numbers, - or _ for the tag (not \"none\").");
+      return;
+    }
     if (!state.referenceImages.some((image) => String(image.id) === String(mediaId))) {
       state.referenceImages.unshift({ id: mediaId, name: `Image ${mediaId}`, thumbUrl: imageUrl });
     }
-    els.characterMode.value = "reference";
-    fillReferenceSelects(String(mediaId), "");
-    updateConfigFromInputs();
-    updateCharacterControls();
-    persistGenSettings();
-    logLine(`Image ${mediaId} is now the consistent-character reference.`);
+    const existing = (config.characters || []).find((character) => normalizeTag(character.tag) === tag);
+    if (existing) {
+      existing.mediaId = String(mediaId);
+      existing.thumbUrl = imageUrl;
+      renderCharacters();
+      persistGenSettings();
+    } else {
+      addCharacter({ tag, mediaId: String(mediaId), thumbUrl: imageUrl });
+    }
+    updatePromptCheck();
+    logLine(`@${tag} now uses image ${mediaId} as its reference.`);
   }
 
   function persistGenSettings() {
@@ -4412,9 +4575,8 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       enhanceVideoPrompt: config.enhanceVideoPrompt,
       renameOutputs: config.renameOutputs,
       moveVideosToFolder: config.moveVideosToFolder,
-      characterMode: config.characterMode,
-      referenceMediaId: config.referenceMediaId,
-      referenceMediaId2: config.referenceMediaId2,
+      characters: (config.characters || []).map(({ id, tag, description, mediaId, thumbUrl }) => ({ id, tag, description, mediaId, thumbUrl })),
+      defaultCharacterTag: config.defaultCharacterTag,
       referenceFolderId: els.referenceFolderSelect.value || "",
       imagePrompts: config.imagePrompts,
       videoPrompts: config.videoPrompts,
@@ -4437,22 +4599,35 @@ async function downloadQueueCompleted({ onlyRemaining }) {
         videoLength: config.videoLength,
         enhanceImagePrompt: config.enhanceImagePrompt,
         enhanceVideoPrompt: config.enhanceVideoPrompt,
-        characterMode: config.characterMode,
-        referenceIds:
-          config.characterMode === "reference"
-            ? [config.referenceMediaId, config.referenceMediaId2].filter(Boolean)
-            : [],
+        characters: getCharacters().map((character) => ({
+          tag: normalizeTag(character.tag),
+          description: character.description || "",
+          mediaId: character.mediaId ? String(character.mediaId) : "",
+        })),
+        defaultCharacterTag: config.defaultCharacterTag || "",
         renameOutputs: config.renameOutputs,
         moveVideosToFolder: config.moveVideosToFolder,
       },
-      characterMediaId: null,
-      items: imagePrompts.map((imagePrompt, index) => ({
-        index,
-        imagePrompt,
-        videoPrompt: mode === "image2video" ? resolveVideoPrompt(videoPrompts, index) : "",
-        image: { status: "pending" },
-        video: mode === "image2video" ? { status: "pending" } : null,
-      })),
+      // tag -> media id of the character's reference image (library pick, or the line that created it)
+      characterMedia: Object.fromEntries(
+        getCharacters()
+          .filter((character) => character.mediaId)
+          .map((character) => [normalizeTag(character.tag), String(character.mediaId)]),
+      ),
+      items: imagePrompts.map((imagePrompt, index) => {
+        const characters = getCharacters();
+        const rawVideo = mode === "image2video" ? resolveVideoPrompt(videoPrompts, index) : "";
+        return {
+          index,
+          imagePrompt,
+          tags: resolveLineTags(imagePrompt, config.defaultCharacterTag),
+          promptText: applyCharacterTags(imagePrompt, characters),
+          videoPrompt: rawVideo,
+          videoPromptText: applyCharacterTags(rawVideo, characters),
+          image: { status: "pending" },
+          video: mode === "image2video" ? { status: "pending" } : null,
+        };
+      }),
     };
   }
 
@@ -4462,13 +4637,62 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     renderGenRun();
   }
 
-  function genCharacterRefs(run, item) {
-    const settings = run.settings;
-    if (settings.characterMode === "reference") return settings.referenceIds;
-    if (settings.characterMode === "first" && item.index > 0 && run.characterMediaId) {
-      return [run.characterMediaId];
+  // Older (0.9.6) runs used characterMode "first" / "reference" for every line. Convert them.
+  function normalizeGenRun(run) {
+    if (!run || run.characterMedia) return run;
+    const settings = run.settings || {};
+    run.characterMedia = {};
+    let tags = [];
+    if (settings.characterMode === "first") {
+      tags = ["character"];
+      settings.characters = [{ tag: "character", description: "", mediaId: "" }];
+      if (run.characterMediaId) run.characterMedia.character = String(run.characterMediaId);
+    } else if (settings.characterMode === "reference") {
+      settings.characters = (settings.referenceIds || []).map((mediaId, index) => ({ tag: `ref${index + 1}`, description: "", mediaId: String(mediaId) }));
+      settings.characters.forEach((character) => {
+        run.characterMedia[character.tag] = character.mediaId;
+      });
+      tags = settings.characters.map((character) => character.tag);
+    } else {
+      settings.characters = [];
     }
-    return [];
+    run.items.forEach((item) => {
+      if (!item.tags) item.tags = tags.slice();
+      if (!item.promptText) item.promptText = item.imagePrompt;
+      if (item.videoPromptText === undefined) item.videoPromptText = item.videoPrompt || "";
+    });
+    return run;
+  }
+
+  // The first line that uses a tag creates that character when it has no reference image.
+  function definingItem(run, tag) {
+    return run.items.find((item) => (item.tags || []).includes(tag)) || null;
+  }
+
+  // "ready", "wait" (a character this line needs is still being created) or { blocked: reason }.
+  function genReadiness(run, item) {
+    for (const tag of item.tags || []) {
+      if (run.characterMedia[tag]) continue;
+      const owner = definingItem(run, tag);
+      if (!owner || owner === item) continue;
+      if (owner.image.status === "saved" && owner.image.mediaId) {
+        run.characterMedia[tag] = String(owner.image.mediaId);
+        continue;
+      }
+      if (owner.image.status === "failed") {
+        return { blocked: `@${tag} was not created because line ${owner.index + 1} failed. Fix that line and press Resume.` };
+      }
+      return "wait";
+    }
+    return "ready";
+  }
+
+  function genCharacterRefs(run, item) {
+    return (item.tags || [])
+      .map((tag) => run.characterMedia[tag])
+      .filter(Boolean)
+      .filter((value, index, list) => list.indexOf(value) === index)
+      .slice(0, 2);
   }
 
   async function sleepUnlessStopped(ms) {
@@ -4559,7 +4783,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       }
       if (!mediaId) {
         updateGenItem(item, "image", { status: "generating", error: "", uuid: null, character: refs.join(",") });
-        let prompt = item.imagePrompt;
+        let prompt = item.promptText || item.imagePrompt;
         if (settings.enhanceImagePrompt) {
           try {
             prompt = refs.length
@@ -4588,7 +4812,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       }
       if (settings.renameOutputs) {
         try {
-          await api.renameItem(mediaId, makeOutputName(item.index, item.imagePrompt));
+          await api.renameItem(mediaId, makeOutputName(item.index, item.promptText || item.imagePrompt));
         } catch (error) {
           logLine(`${tag} could not rename the image: ${shortError(error)}`);
         }
@@ -4598,7 +4822,13 @@ async function downloadQueueCompleted({ onlyRemaining }) {
         mediaId,
         url: item.image.uuid ? `${PREVIEW_BASE_URL}${item.image.uuid}.jpg` : item.image.url || "",
       });
-      logLine(`${tag} image saved (media ${mediaId}).`);
+      // This line created any of its characters that had no reference yet.
+      const created = (item.tags || []).filter((name) => !run.characterMedia[name] && definingItem(run, name) === item);
+      created.forEach((name) => {
+        run.characterMedia[name] = String(mediaId);
+      });
+      if (created.length) saveGenRun();
+      logLine(`${tag} image saved (media ${mediaId})${created.length ? ` — created @${created.join(", @")}` : ""}.`);
       return true;
     } catch (error) {
       updateGenItem(item, "image", { status: "failed", error: shortError(error) });
@@ -4646,7 +4876,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
         updateGenItem(item, "video", { moved: true });
       }
       if (finished && run.settings.renameOutputs && !item.video.renamed) {
-        await api.renameItem(videoId, makeOutputName(item.index, item.imagePrompt));
+        await api.renameItem(videoId, makeOutputName(item.index, item.promptText || item.imagePrompt));
         updateGenItem(item, "video", { renamed: true, renameChecks: 0 });
       }
     } catch (error) {
@@ -4658,7 +4888,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
   // Check once per poll and re-apply our name, up to 3 times.
   async function verifyGenVideoName(run, item) {
     const video = item.video;
-    const expected = makeOutputName(item.index, item.imagePrompt);
+    const expected = makeOutputName(item.index, item.promptText || item.imagePrompt);
     try {
       const media = await getJson(`/library/get_media_item/${video.mediaId}`, "Load media item");
       const current = String((media && media.name) || "");
@@ -4685,7 +4915,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       try {
         const result = await api.generateImageVideo(
           { id: item.image.mediaId, uuid: "", type: apiImageType(settings.imageType), isShared: false },
-          item.videoPrompt,
+          item.videoPromptText || item.videoPrompt,
           { aspect: settings.aspect, videoLength: settings.videoLength, enhanceVideoPrompt: settings.enhanceVideoPrompt },
         );
         if (!result || !result.success || !result.uuid) {
@@ -4699,8 +4929,8 @@ async function downloadQueueCompleted({ onlyRemaining }) {
           folderId: run.folderId,
           folderTitle: run.folderTitle,
           imageId: item.image.mediaId,
-          imageName: makeOutputName(item.index, item.imagePrompt),
-          prompt: item.videoPrompt,
+          imageName: makeOutputName(item.index, item.promptText || item.imagePrompt),
+          prompt: item.videoPromptText || item.videoPrompt,
           aspect: settings.aspect,
           videoLength: settings.videoLength,
           generatorRunId: run.id,
@@ -4824,20 +5054,25 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     const imageQueue = run.items.filter((item) => item.image.status !== "saved");
     let imagesActive = 0;
     try {
-      // "Use the first image as the character": image 1 must exist before the others start.
-      if (run.settings.characterMode === "first") {
-        const first = run.items[0];
-        if (first.image.status !== "saved") {
-          imageQueue.splice(imageQueue.indexOf(first), 1);
-          const ok = await processGenImage(run, first);
-          if (!ok) throw new Error("Image 1 failed, so there is no character to keep. Fix line 1 and press Resume.");
-        }
-        run.characterMediaId = first.image.mediaId;
-        saveGenRun();
-      }
+      // Picks the next line whose characters exist. A line that creates a character runs before
+      // the lines that use it, so hundreds of lines can share a few characters.
       const imageWorker = async () => {
         while (!state.gen.stopRequested && imageQueue.length) {
-          const item = imageQueue.shift();
+          const readyIndex = imageQueue.findIndex((item) => genReadiness(run, item) === "ready");
+          if (readyIndex === -1) {
+            const blocked = imageQueue.filter((item) => typeof genReadiness(run, item) === "object");
+            if (blocked.length) {
+              blocked.forEach((item) => {
+                imageQueue.splice(imageQueue.indexOf(item), 1);
+                updateGenItem(item, "image", { status: "failed", error: genReadiness(run, item).blocked });
+              });
+              continue;
+            }
+            if (imagesActive === 0) break; // nothing can make progress
+            await sleep(700);
+            continue;
+          }
+          const [item] = imageQueue.splice(readyIndex, 1);
           imagesActive += 1;
           try {
             await processGenImage(run, item);
@@ -4887,6 +5122,8 @@ async function downloadQueueCompleted({ onlyRemaining }) {
 
   async function startGenerator() {
     if (state.gen.running || state.running) return;
+    readCharactersFromList();
+    updateConfigFromInputs();
     const problems = validateGenInputs(config.mode);
     if (problems.length) throw new Error(problems.join("\n"));
     const current = state.gen.run;
@@ -4903,6 +5140,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     if (state.gen.running || state.running) return;
     const run = state.gen.run;
     if (!run) throw new Error("There is no run to resume.");
+    normalizeGenRun(run);
     if (!state.folders.some((folder) => String(folder.id) === String(run.folderId))) {
       throw new Error(`The run's folder (${run.folderTitle}) no longer exists.`);
     }
@@ -4942,35 +5180,42 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       return;
     }
     const modeLabel = run.mode === "image2video" ? "Image → Video" : "Image maker";
-    const character = {
-      off: "no consistent character",
-      first: "character from image 1",
-      reference: `character from image ${run.settings.referenceIds.join(" + ")}`,
-    }[run.settings.characterMode] || "";
+    const castTags = (run.settings.characters || []).map((character) => `@${character.tag}`);
+    const character = castTags.length ? `characters ${castTags.join(" ")}` : "no characters";
     els.genSummary.textContent = `${modeLabel} → “${run.folderTitle}” · ${run.settings.aspect} · ${character} · started ${formatDateTime(run.createdAt)}${state.gen.running ? " · running" : counts.unfinished ? " · press Resume to continue" : " · done"}`;
     const showVideo = run.mode === "image2video";
+    const shown = 300;
     els.genBody.innerHTML = run.items
-      .slice(0, 300)
+      .slice(0, shown)
       .map((item) => {
         const image = item.image || {};
         const video = item.video || {};
         const thumb = image.url || (image.uuid ? `${PREVIEW_BASE_URL}${image.uuid}.jpg` : "");
         const showThumb = image.status === "saved" || (image.uuid && image.status === "saving");
         const useButton = image.status === "saved" && image.mediaId
-          ? `<button class="ve-button ghost small ve-use-character" type="button" data-use-character="${escapeAttr(String(image.mediaId))}" data-thumb="${escapeAttr(thumb)}" title="Keep this character in the next run">Use as character</button>`
+          ? `<button class="ve-button ghost small ve-use-character" type="button" data-use-character="${escapeAttr(String(image.mediaId))}" data-thumb="${escapeAttr(thumb)}" title="Make this image a character reference (asks for a @tag)">Use as character</button>`
           : "";
         const imageError = image.error ? `<span class="ve-error-line">${escapeHtml(image.error)}</span>` : "";
         const videoError = video.error ? `<span class="ve-error-line">${escapeHtml(video.error)}</span>` : "";
+        const chips = (item.tags || [])
+          .map((name) => {
+            const creates = !(run.settings.characters || []).some((c) => c.tag === name && c.mediaId) && definingItem(run, name) === item;
+            return `<span class="ve-tag-chip" title="${creates ? "This line creates the character" : "Keeps this character"}">@${escapeHtml(name)}${creates ? " ✦" : ""}</span>`;
+          })
+          .join("");
         return `
           <tr>
             <td>${padIndex(item.index)}</td>
             <td><div class="ve-thumb" style="${showThumb ? `background-image:url('${escapeAttr(thumb)}')` : ""}"></div>${useButton}</td>
-            <td class="ve-cell-prompt">${escapeHtml(item.imagePrompt)}${item.videoPrompt ? `<span class="ve-muted">▶ ${escapeHtml(item.videoPrompt)}</span>` : ""}</td>
+            <td class="ve-cell-prompt">${chips}${escapeHtml(item.promptText || item.imagePrompt)}${item.videoPrompt ? `<span class="ve-muted">▶ ${escapeHtml(item.videoPromptText || item.videoPrompt)}</span>` : ""}</td>
             <td><span class="ve-badge ${getBadgeClass(image.status)}">${escapeHtml(image.status || "pending")}</span>${imageError}</td>
             <td>${showVideo ? `<span class="ve-badge ${getBadgeClass(video.status)}">${escapeHtml(video.status || "pending")}</span>${videoError}` : ""}</td>
           </tr>`;
       })
-      .join("");
+      .join("") +
+      (run.items.length > shown
+        ? `<tr><td colspan="5" class="ve-muted">… ${run.items.length - shown} more lines run in the background (counts above include them).</td></tr>`
+        : "");
   }
 
   // —— Prompt helper ——
@@ -4999,17 +5244,34 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       "Include the subject and how they look (gender, age, hair, clothing), their pose, the setting, lighting, mood and framing (close-up, medium shot or wide shot).",
       "Keep each prompt to 1–3 sentences on a single line.",
     ];
-    const characterRules = {
-      off: [],
-      first: [
-        "The FIRST image defines the main character; every later image is generated to keep that same person. Describe the character fully in line 1 (gender, age, hair, face, clothing).",
-        'In later lines, refer to them as "the same woman" / "the same man" and keep the same clothing unless the story needs a change.',
-      ],
-      reference: [
-        "A reference photo of the main character is already provided to the tool, so every image keeps that same person.",
-        'Refer to them as "the same woman" / "the same man"; describe the new pose, setting and action, not their face.',
-      ],
-    }[config.characterMode] || [];
+    const cast = getCharacters();
+    const tagRules = [
+      "Recurring characters are marked with an @tag written where their name would go, e.g. \"@anna sits by the cafe window\". The tool keeps the same person in every image prompt line that contains their tag (at most 2 tags per line).",
+      "Only put a tag in lines where that character is actually visible. Lines without a tag are generated without a fixed character, which is right for landscapes, objects and crowds.",
+    ];
+    let characterRules;
+    if (cast.length) {
+      characterRules = [
+        ...tagRules,
+        "Use only these tags:",
+        ...cast.map((character) => {
+          const tag = normalizeTag(character.tag);
+          const source = character.mediaId ? "has a reference photo" : "is created by the first line that uses the tag";
+          const text = character.description ? ` (the tag is replaced by "${character.description}")` : ` (the tag is replaced by the name "${tag.charAt(0).toUpperCase()}${tag.slice(1)}", so in the first line that uses it describe the character right after it)`;
+          return `  @${tag}: ${source}${text}`;
+        }),
+      ];
+      if (config.defaultCharacterTag) {
+        characterRules.push(`Lines with no tag automatically get @${config.defaultCharacterTag}. Write @none in a line that should have no character.`);
+      }
+    } else {
+      characterRules = [
+        ...tagRules,
+        "Invent a short lowercase tag for each recurring character (e.g. @anna, @dad). In the FIRST line that uses a tag, describe the character fully right after it (gender, age, hair, face, clothing); later lines only need the tag plus the new pose, place and action.",
+        "Before the prompt blocks, add one block called CHARACTERS listing each tag as \"@tag — one-line description\".",
+      ];
+    }
+    characterRules.push("You may use the tags in video prompts too; they are replaced the same way.");
 
     add("You are writing prompts for VideoExpress.ai, an AI tool that generates images and turns each image into a short video clip.");
     if (mode === "image2video") {
@@ -5017,7 +5279,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
         "Turn my idea (at the end) into a list of scenes. Each scene becomes one image, and that image is then animated into one video clip.",
         "",
         "OUTPUT FORMAT",
-        "Return exactly two plain-text code blocks and nothing else:",
+        `Return ${cast.length ? "exactly two" : "the CHARACTERS block (if any) and then two"} plain-text code blocks and nothing else:`,
         "1. IMAGE PROMPTS: one line per scene.",
         "2. VIDEO PROMPTS: one line per scene, same order, same number of lines.",
         "Line N of the video block animates line N of the image block. No numbering, bullets, headings, blank lines, or line breaks inside a prompt.",
@@ -5027,7 +5289,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
         "Turn my idea (at the end) into a list of images.",
         "",
         "OUTPUT FORMAT",
-        "Return one plain-text code block with one image prompt per line and nothing else. No numbering, bullets, headings or blank lines.",
+        `Return ${cast.length ? "one" : "the CHARACTERS block (if any) and then one"} plain-text code block with one image prompt per line and nothing else. No numbering, bullets, headings or blank lines.`,
       );
     } else {
       const names = state.items.map((item) => cleanPrompt(item.name || item.fileName || ""));
@@ -5049,7 +5311,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
         `- Each video clip is ${seconds} seconds long (VideoExpress makes clips of 3–10 seconds). Describe only what fits in ${seconds} seconds: one main action or movement per clip.`,
       );
     }
-    if (mode !== "video" && characterRules.length) add(...characterRules.map((rule) => `- ${rule}`));
+    if (mode !== "video") add("", "CHARACTERS", ...characterRules.map((rule) => (rule.startsWith("  @") ? rule : `- ${rule}`)));
 
     if (mode !== "video") add("", "IMAGE PROMPT RULES", ...imageRules.map((rule) => `- ${rule}`));
     if (mode !== "image") {
@@ -5215,9 +5477,12 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       });
       [
         els.aspect, els.imageType, els.videoLength, els.imageConcurrency, els.imagePrompts, els.videoPrompts,
-        els.characterMode, els.reference1, els.reference2, els.referenceFolderSelect, els.loadReferencesBtn,
+        els.addCharacterBtn, els.defaultCharacter, els.referenceFolderSelect, els.loadReferencesBtn,
         els.enhanceImagePrompt, els.enhanceVideoPrompt, els.renameOutputs, els.moveVideos,
       ].forEach((element) => {
+        element.disabled = genBusy;
+      });
+      els.characterList.querySelectorAll("input, select, button").forEach((element) => {
         element.disabled = genBusy;
       });
       if (genBusy) els.loadMediaBtn.disabled = true;
@@ -5548,17 +5813,44 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       element.addEventListener("change", () => {
         updateConfigFromInputs();
         persistGenSettings();
+        renderCharacters();
       });
     });
     [
-      els.imageType, els.imageConcurrency, els.characterMode, els.reference1, els.reference2,
+      els.imageType, els.imageConcurrency, els.defaultCharacter,
       els.enhanceImagePrompt, els.enhanceVideoPrompt, els.renameOutputs, els.moveVideos,
     ].forEach((element) => {
       element.addEventListener("change", () => {
         updateConfigFromInputs();
-        updateCharacterControls();
         persistGenSettings();
+        updatePromptCheck();
       });
+    });
+    els.addCharacterBtn.addEventListener("click", () => {
+      readCharactersFromList();
+      addCharacter();
+      const rows = els.characterList.querySelectorAll('[data-field="tag"]');
+      if (rows.length) rows[rows.length - 1].select();
+    });
+    const onCharacterEdit = (event) => {
+      if (!event.target.closest("[data-field]")) return;
+      readCharactersFromList();
+      persistGenSettings();
+      updatePromptCheck();
+    };
+    els.characterList.addEventListener("input", onCharacterEdit);
+    els.characterList.addEventListener("change", (event) => {
+      onCharacterEdit(event);
+      renderCharacters(); // refresh thumbnail, default-tag list and cleaned tag text
+    });
+    els.characterList.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-remove-character]");
+      if (!button) return;
+      readCharactersFromList();
+      config.characters = (config.characters || []).filter((character) => character.id !== button.dataset.removeCharacter);
+      renderCharacters();
+      persistGenSettings();
+      updatePromptCheck();
     });
     els.referenceFolderSelect.addEventListener("change", () => {
       persistGenSettings();
@@ -5599,9 +5891,18 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     ["enhanceImagePrompt", "enhanceVideoPrompt", "renameOutputs", "moveVideosToFolder"].forEach((key) => {
       if (typeof savedUi[key] === "boolean") config[key] = savedUi[key];
     });
-    ["characterMode", "referenceMediaId", "referenceMediaId2", "imagePrompts", "videoPrompts"].forEach((key) => {
+    ["imagePrompts", "videoPrompts", "defaultCharacterTag"].forEach((key) => {
       if (typeof savedUi[key] === "string") config[key] = savedUi[key];
     });
+    if (Array.isArray(savedUi.characters)) {
+      config.characters = savedUi.characters
+        .filter((character) => character && character.tag)
+        .map((character) => ({ ...character, id: character.id || createCharacterId() }));
+    } else if (savedUi.characterMode === "reference" && savedUi.referenceMediaId) {
+      // 0.9.6 settings: one reference used on every line -> a character used by default.
+      config.characters = [{ id: createCharacterId(), tag: "hero", description: "", mediaId: String(savedUi.referenceMediaId) }];
+      config.defaultCharacterTag = "hero";
+    }
     if (savedUi.delayBetweenRequestsMs)
       config.delayBetweenRequestsMs = savedUi.delayBetweenRequestsMs;
     if (savedUi.parallelLimitRetryDelayMs) {
@@ -5669,10 +5970,9 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     els.enhanceVideoPrompt.checked = config.enhanceVideoPrompt;
     els.renameOutputs.checked = config.renameOutputs;
     els.moveVideos.checked = config.moveVideosToFolder;
-    els.characterMode.value = config.characterMode;
     els.imagePrompts.value = config.imagePrompts;
     els.videoPrompts.value = config.videoPrompts;
-    fillReferenceSelects(config.referenceMediaId, config.referenceMediaId2);
+    renderCharacters();
     updateMasterPromptControls();
     state.selectedFolderId = savedUi.selectedFolderId || null;
     applyVideoFiltersToInputs();
@@ -5724,14 +6024,13 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     restorePanelPosition(savedUi.panelPosition);
     setActiveTab(savedUi.activeTab || "folders");
     setMode(config.mode);
-    updateCharacterControls();
     renderGenRun();
     renderSelectedFiles();
     renderVideos();
     updateButtonStates();
     await refreshFolders();
     if (savedUi.referenceFolderId) els.referenceFolderSelect.value = String(savedUi.referenceFolderId);
-    if (config.characterMode === "reference" && els.referenceFolderSelect.value) {
+    if ((config.characters || []).some((character) => character.mediaId) && els.referenceFolderSelect.value) {
       loadReferenceImages().catch((error) => logLine(`Could not load reference images: ${error.message}`));
     }
     updatePromptCheck();
