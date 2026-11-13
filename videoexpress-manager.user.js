@@ -3145,6 +3145,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     renderFolders();
     saveUiState({ selectedFolderId: state.selectedFolderId });
     logLine(`Loaded ${state.folders.length} folders.`);
+    updateButtonStates();
   }
 
   function selectFolder(folderId) {
@@ -3161,6 +3162,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     renderVideos();
     renderTimelineExport();
     updatePromptCheck();
+    updateButtonStates();
   }
 
   async function loadFolderImages() {
