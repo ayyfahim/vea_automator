@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         VideoExpress Library Manager
 // @namespace    https://app.videoexpress.ai/
-// @version      0.9.7
-// @description  Manage folders, upload images, batch generate images from prompts, and batch convert images to videos inside VideoExpress AI.
+// @version      0.10.0
+// @description  Manage folders, upload images, batch generate images from prompts, and batch convert images to videos inside VideoExpress AI. New features are opt-in via the header's "Try new features" dropdown.
 // @match        https://app.videoexpress.ai/*
 // @grant        none
 // @run-at       document-idle
@@ -72,6 +72,11 @@
     moveVideosToFolder: true,
     imagePrompts: "",
     videoPrompts: "",
+    // "Try new features" (labs) mode, chosen in the header dropdown. Off by default.
+    labsEnabled: false,
+    autoDownload: false,
+    autoDownloadSince: "",
+    uploadSkipExisting: true,
   };
 
   const MAX_VIDEO_LENGTH = 10; // The server caps AI videos at 10 seconds.
@@ -83,6 +88,15 @@
   const UI_STATE_KEY = "videoexpress.manager.ui-state.v1";
   const SESSION_META_KEY = "videoexpress.manager.sessions.v1";
   const GEN_RUN_KEY = "videoexpress.manager.generator-run.v1";
+  // Labs ("Try new features") limits.
+  const VIDEO_PARALLEL_LIMIT = 5; // the server renders at most 5 AI videos at once per account
+  const LOG_MAX_LINES = 500;
+  const STALE_STARTED_MS = 10 * 60 * 1000; // "started" with no job id for this long = the answer was lost
+  const ACTIVE_JOB_MAX_AGE_MS = 60 * 60 * 1000; // older in-flight records don't block the slot wait
+  const SLOT_WAIT_MAX_MS = 30 * 60 * 1000;
+  const POLL_GIVE_UP_MS = 30 * 60 * 1000; // status checks failing this long trigger a library check
+  const TITLE_PREFIX_RE = /^\[VE [^\]]*\] /;
+  const RECORD_KEY_PATTERN = /^library:\d+:folder:[^:]+:media:[^:]+$/;
   let _queryUuidSupported = null; // cache probe for server-side uuid query support (I3)
 
   const state = {
@@ -93,6 +107,7 @@
     history: loadHistory(),
     running: false,
     stopRequested: false,
+    downloadStopRequested: false, // labs: downloads have their own Pause flag
     uploadInProgress: false,
     downloadInProgress: false,
     selectedFiles: [],
@@ -136,6 +151,18 @@
       stopRequested: false,
     },
     referenceImages: [],
+    // Labs-only runtime state.
+    retryWhileRunning: new Set(),
+    runningFolderId: null,
+    runQueueItems: [],
+    slotWait: null,
+    slotWaitOff: false,
+    queueFilter: "all",
+    queueViewTotal: 0,
+    failedUploadFiles: [],
+    historyDirty: false,
+    storageFullWarned: false,
+    autoDownloadBusy: false,
   };
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -234,7 +261,59 @@
 
   function saveHistory() {
     state.history.updatedAt = new Date().toISOString();
-    localStorage.setItem(HISTORY_KEY, JSON.stringify(state.history, null, 2));
+    if (!labsOn()) {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(state.history, null, 2));
+      return;
+    }
+    // Labs: compact JSON, and a full browser storage no longer throws out of the queue.
+    state.historyDirty = false;
+    try {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(state.history));
+    } catch (error) {
+      if (!isStorageFullError(error)) throw error;
+      const trimmed = trimHistoryPayloads();
+      try {
+        localStorage.setItem(HISTORY_KEY, JSON.stringify(state.history));
+        logLine(`Browser storage was full. Removed saved server responses from ${trimmed} finished item(s) and saved the history again.`);
+      } catch (retryError) {
+        if (!isStorageFullError(retryError)) throw retryError;
+        if (!state.storageFullWarned) {
+          state.storageFullWarned = true;
+          logLine("Browser storage is full, so the queue history could not be saved. Export it from the Log tab, then clear the history of old folders.");
+        }
+      }
+    }
+  }
+
+  function isStorageFullError(error) {
+    return Boolean(
+      error &&
+        (error.name === "QuotaExceededError" ||
+          error.name === "NS_ERROR_DOM_QUOTA_REACHED" ||
+          error.code === 22 ||
+          error.code === 1014),
+    );
+  }
+
+  // Drops the stored server responses of finished items; failed items keep a one-line reason.
+  function trimHistoryPayloads() {
+    let trimmed = 0;
+    for (const record of Object.values(state.history.records)) {
+      if (!record || typeof record !== "object") continue;
+      const status = normalizeStatus(record.status);
+      if (status !== "completed" && status !== "failed") continue;
+      if (!record.statusPayload && !record.response) continue;
+      if (status === "failed" && !record.errorDetail) record.errorDetail = getFailureReason(record);
+      delete record.statusPayload;
+      delete record.response;
+      trimmed += 1;
+    }
+    return trimmed;
+  }
+
+  // Labs: writes deferred with setRecord(..., { defer: true }) are saved here in one go.
+  function flushHistory() {
+    if (state.historyDirty) saveHistory();
   }
 
   function loadUiState() {
@@ -425,7 +504,8 @@
       const folderName = s.folderName || key;
       let live = null;
       if (folderId) live = (state.folders || []).find(f => String(f.id) === folderId);
-      if (!live) live = (state.folders || []).find(f => String(f.title || f.name) === folderName);
+      // Labs: when the folder id is known, only that folder may be deleted, never another folder with the same name.
+      if (!live && !(labsOn() && folderId)) live = (state.folders || []).find(f => String(f.title || f.name) === folderName);
       if (!live) {
         delete meta.sessions[key];
         changed = true;
@@ -768,6 +848,7 @@
         remainingPages.push({ page, start, idx: remainingPages.length });
       }
       const buckets = new Array(remainingPages.length);
+      const failedPages = [];
       await asyncPool(3, remainingPages, async ({ page, start, idx }) => {
         try {
           const payload = await api.getMedia(folderId, page, start, "");
@@ -776,8 +857,21 @@
         } catch (e) {
           console.warn(`[VE] getAllVideos page ${page} failed:`, e);
           buckets[idx] = [];
+          if (labsOn()) {
+            // Labs: one retry, then say so instead of returning a silently shorter list.
+            try {
+              await sleep(1000);
+              const retry = await api.getMedia(folderId, page, start, "");
+              buckets[idx] = Array.isArray(retry.results) ? retry.results : [];
+            } catch {
+              failedPages.push(page);
+            }
+          }
         }
       });
+      if (failedPages.length) {
+        logLine(`Could not load page ${failedPages.sort((a, b) => a - b).join(", ")} of folder ${folderId}, so the list may be incomplete. Load it again to retry.`);
+      }
       const rest = buckets.flat();
       const all = [...firstResults, ...rest];
       // Sort by name to match previous behavior if needed, otherwise return as-is
@@ -833,10 +927,12 @@
       );
     },
 
-    async getStatus(uuid) {
+    async getStatus(uuid, options = {}) {
       const cacheBust = Date.now();
+      // Labs asks for the server's time estimate too (the site's own app does this).
+      const estimate = options && options.estimate ? "upd_estimated_time=1&" : "";
       return getJson(
-        `/ai/api/status/${uuid}?_=${cacheBust}`,
+        `/ai/api/status/${uuid}?${estimate}_=${cacheBust}`,
         `Load status ${uuid}`,
       );
     },
@@ -1072,8 +1168,12 @@
     return state.history.records[makeRecordKey(folderId, mediaId)] || null;
   }
 
-  function setRecord(folderId, mediaId, value) {
+  function setRecord(folderId, mediaId, value, options) {
     state.history.records[makeRecordKey(folderId, mediaId)] = value;
+    if (options && options.defer && labsOn()) {
+      state.historyDirty = true;
+      return;
+    }
     saveHistory();
   }
 
@@ -1091,6 +1191,19 @@
     if (!record || typeof record !== "object") return "";
     const status = normalizeStatus(record.status);
     if (status !== "failed" && status !== "parallel_limit") return "";
+    // Labs: prefer the server's own message (plan limit, blocked word, JSON error bodies).
+    // Reads config.labsEnabled directly because the tests run this function on its own.
+    if (config.labsEnabled === true) {
+      const detail = [
+        record.errorDetail,
+        record.response && typeof record.response === "object" && (record.response.error || record.response.msg || record.response.message),
+        serverMessageFromText(record.error),
+      ].find((value) => value && String(value).trim());
+      if (detail) {
+        const text = String(detail).trim().split("\n")[0];
+        return text.length > 180 ? text.slice(0, 177) + "..." : text;
+      }
+    }
     const candidates = [
       record.error,
       record.response && (record.response.error || record.response.message),
@@ -1104,6 +1217,29 @@
     raw = raw.split("\n")[0].trim();
     if (raw.length > 180) raw = raw.slice(0, 177) + "...";
     return raw || (status === "parallel_limit" ? "Parallel limit" : "Failed");
+  }
+
+  // Pulls the message out of a JSON error body, e.g. 'Generate video failed: 400 Bad Request\n{"error":"..."}'.
+  function serverMessageFromText(value) {
+    const text = String(value || "");
+    const start = text.indexOf("{");
+    if (start === -1) return "";
+    try {
+      const json = JSON.parse(text.slice(start));
+      const message = json && (json.error || json.msg || json.message);
+      if (!message) return "";
+      return json.badWord ? `${message} (blocked word: ${json.badWord})` : String(message);
+    } catch {
+      return "";
+    }
+  }
+
+  function parseJsonBody(error) {
+    try {
+      return JSON.parse((error && error.bodyText) || "");
+    } catch {
+      return null;
+    }
   }
 
 function extractVideoIdFromStatus(payload) {
@@ -1154,7 +1290,9 @@ function extractVideoIdFromStatus(payload) {
       const prompt = composePrompt(individualPrompt);
       const record = getRecord(folder.id, media.id);
       const historyStatus = record ? record.status : "";
-      const pendingMediaStatus = media.uuid
+      // Labs: an image's own uuid is its image job, not a video job, so it says nothing about video status.
+      // Reads config.labsEnabled directly because the tests run this function on its own.
+      const pendingMediaStatus = media.uuid && config.labsEnabled !== true
         ? media.isPending
           ? "running"
           : "submitted"
@@ -1204,6 +1342,117 @@ function extractVideoIdFromStatus(payload) {
       if (String(items[i] && items[i].id) === needle) return i + 1;
     }
     return null;
+  }
+
+  /* —— "Try new features" (labs) mode ——
+   * Every change behind the header's version dropdown checks labsOn(). With the dropdown on
+   * "Stable" (the default) the manager behaves as it did before this mode existed. */
+  function labsOn() {
+    return config.labsEnabled === true;
+  }
+
+  function localDateString(date = new Date()) {
+    const pad = (value) => String(value).padStart(2, "0");
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+  }
+
+  function recordAgeMs(record) {
+    const time = Date.parse((record && (record.updatedAt || record.startedAt)) || "");
+    return Number.isFinite(time) ? Date.now() - time : Infinity;
+  }
+
+  // "started" with no job id after 10 min: the page closed or crashed before the server answered.
+  function isStaleStartedRecord(record) {
+    if (!labsOn() || !record) return false;
+    return normalizeStatus(record.status) === "started" && !record.uuid && recordAgeMs(record) > STALE_STARTED_MS;
+  }
+
+  // Videos still rendering for this account, as far as the saved history knows (all folders).
+  function countActiveVideoJobs() {
+    let active = 0;
+    for (const record of Object.values(state.history.records)) {
+      if (!record || !record.uuid) continue;
+      const status = normalizeStatus(record.status);
+      if (status !== "submitted" && status !== "running") continue;
+      const started = Date.parse(record.startedAt || record.updatedAt || "");
+      if (Number.isFinite(started) && Date.now() - started > ACTIVE_JOB_MAX_AGE_MS) continue;
+      active += 1;
+    }
+    return active;
+  }
+
+  // "1:20 elapsed · ~2:40 left" (server_start_time and estimated_time come from the status call).
+  function formatJobTiming(record) {
+    if (!record) return "";
+    const payload = record.statusPayload && typeof record.statusPayload === "object" ? record.statusPayload : {};
+    const start = Date.parse(payload.server_start_time || record.startedAt || "");
+    if (!Number.isFinite(start)) return "";
+    const elapsedMs = Math.max(0, Date.now() - start);
+    const parts = [elapsedMs < 1000 ? "just started" : `${formatDuration(elapsedMs)} elapsed`];
+    const estimate = Number(payload.estimated_time);
+    if (Number.isFinite(estimate) && estimate > 0) {
+      const leftMs = estimate * 1000 - elapsedMs;
+      parts.push(leftMs >= 1000 ? `~${formatDuration(leftMs)} left` : "finishing");
+    }
+    return parts.join(" · ");
+  }
+
+  // Stable: downloads and the generate queue share one Pause flag. Labs: each has its own.
+  function downloadStopRequested() {
+    return labsOn() ? state.downloadStopRequested : state.stopRequested;
+  }
+
+  function clearDownloadStop() {
+    if (labsOn()) state.downloadStopRequested = false;
+    else state.stopRequested = false;
+  }
+
+  // Stable: a plain sleep. Labs: wakes up within half a second when Pause is pressed.
+  async function queueSleep(ms) {
+    if (!labsOn()) return sleep(ms);
+    const until = Date.now() + Math.max(0, Number(ms) || 0);
+    while (Date.now() < until && !state.stopRequested) {
+      await sleep(Math.min(500, Math.max(0, until - Date.now())));
+    }
+  }
+
+  // Labs: waits until fewer than 5 of this account's videos are rendering, so the next request
+  // isn't one the server rejects. Status polling (every 15 s) frees the slots.
+  async function waitForVideoSlot(stopCheck) {
+    if (!labsOn() || state.slotWaitOff) return { forced: false };
+    let waitStarted = 0;
+    let forced = false;
+    while (!stopCheck()) {
+      const active = countActiveVideoJobs();
+      if (active < VIDEO_PARALLEL_LIMIT) break;
+      const now = Date.now();
+      if (!waitStarted) {
+        waitStarted = now;
+        logLine(`${active} videos are rendering (limit ${VIDEO_PARALLEL_LIMIT}). Waiting for one to finish before sending the next.`);
+      } else if (now - waitStarted > SLOT_WAIT_MAX_MS) {
+        logLine(`No video slot freed up in ${Math.round(SLOT_WAIT_MAX_MS / 60000)} min. Sending the next request anyway.`);
+        forced = true;
+        break;
+      }
+      if (!state.slotWait || state.slotWait.active !== active) {
+        state.slotWait = { active, since: waitStarted };
+        if (els.folderSummary && state.running) renderQueue();
+      }
+      await sleep(2000);
+    }
+    if (state.slotWait) {
+      state.slotWait = null;
+      if (state.running) renderQueue();
+    }
+    return { forced };
+  }
+
+  // If the server accepts a request sent while the history says 5 are rendering, the history is out of date.
+  function noteForcedSlotResult(slot, accepted) {
+    if (slot && slot.forced && accepted && !state.slotWaitOff) {
+      state.slotWaitOff = true;
+      logLine("The server accepted it, so some saved in-progress items are out of date. Not waiting for slots for the rest of this run.");
+    }
   }
 
   const root = document.createElement("div");
@@ -1666,6 +1915,20 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
   #ve-upload-summary .ve-fail-chip { display:inline-flex; align-items:center; font-family:'JetBrains Mono',monospace; font-size:9px; font-weight:700; background:#1A1A1E; color:#FFC83D; border:1px solid #000; border-radius:4px; padding:2px 6px; margin:3px 4px 0 0; max-width:100%; word-break:break-all; }
   @keyframes veShake { 0%,100%{ transform:translateX(0)} 20%{ transform:translateX(-2px)} 40%{ transform:translateX(2px)} 60%{ transform:translateX(-1px)} 80%{ transform:translateX(1px)} }
 
+  /* Version mode: "Try new features" (labs). Labs-only controls stay hidden in Stable. */
+  #ve-manager-root:not([data-labs="on"]) .ve-labs-only { display: none !important; }
+  #ve-manager-header .ve-version-select { width:auto; min-width:150px; padding:6px 26px 6px 10px; font-family:'Barlow Condensed',sans-serif; font-size:11px; font-weight:700; letter-spacing:0.06em; text-transform:uppercase; border:1.5px solid #000; background:#fff; color:#111827; border-radius:1px; cursor:pointer; }
+  #ve-manager-root[data-labs="on"] #ve-manager-header .ve-version-select { background:#FFC83D; color:#0A0A0D; }
+  #ve-manager-header .ve-version-select:disabled { opacity:.6; cursor:not-allowed; }
+  .ve-labs-tag { display:inline-block; margin-left:6px; padding:1px 5px; border-radius:4px; background:#FFF4D6; border:1px solid #F5D27A; color:#7A4B00; font-family:'JetBrains Mono',monospace; font-size:8.5px; font-weight:700; letter-spacing:0.06em; text-transform:uppercase; vertical-align:middle; }
+  .ve-job-timing { display:block; margin-top:4px; font-family:'JetBrains Mono',monospace; font-size:9.5px; color:#6B7280; }
+  .ve-queue-filter { width:auto; padding:3px 6px; font-size:10.5px; border-radius:6px; }
+  #ve-context-run { color: var(--cut-orange); font-weight:600; }
+  .ve-whatsnew { margin:0; padding-left:16px; font-family:'Instrument Sans',sans-serif; font-size:11px; line-height:1.45; color:#374151; }
+  .ve-whatsnew li { margin-bottom:2px; }
+  .ve-whatsnew b { color:#111827; }
+  @media (max-width: 640px) { #ve-manager-header { flex-wrap: wrap; } }
+
     </style>
     <div id="ve-manager-panel">
       <div id="ve-manager-header">
@@ -1674,6 +1937,10 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
            <div class="ve-header-sub">Batch image → video · Library 4 · drag header to move</div>
         </div>
         <div style="display:flex; gap:6px; align-items:center;">
+          <select id="ve-version-select" class="ve-select ve-version-select" aria-label="Version mode" title="Version mode. New features stay off until you choose “Try new features”. You can switch while nothing is running.">
+            <option value="stable">Stable version</option>
+            <option value="labs">Try new features</option>
+          </select>
           <select id="ve-theme-select" class="ve-select" style="width:auto;min-width:128px;padding:6px 28px 6px 10px;font-family:'Barlow Condensed',sans-serif;font-size:11px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;border:1.5px solid #000;background:#fff;color:#111827;border-radius:1px;cursor:pointer" title="Palette">
             <option value="videoexpress">VideoExpress</option>
             <option value="bench">Bench Red</option>
@@ -1688,7 +1955,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
         <div class="ve-context-bar" id="ve-context-bar">
           <div class="ve-context-left">
             <span class="ve-context-pill" id="ve-context-pill"><i class="bi bi-folder2"></i> <span id="ve-context-name">product-shots-04</span> <small id="ve-context-id" style="opacity:.65">#101</small></span>
-            <span class="ve-context-meta" id="ve-context-meta"><strong id="ve-context-count">8</strong> images · <strong id="ve-context-done">2</strong> done</span>
+            <span class="ve-context-meta" id="ve-context-meta"><strong id="ve-context-count">8</strong> images · <strong id="ve-context-done">2</strong> done<span class="ve-labs-only" id="ve-context-run"></span></span>
           </div>
           <div class="ve-context-right">
             <select id="ve-context-select" class="ve-context-select" title="Switch active folder"></select>
@@ -1785,8 +2052,10 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
             <input class="ve-file-input" id="ve-file-input" type="file" accept="image/*" multiple />
             <input class="ve-file-input" id="ve-folder-input" type="file" accept="image/*" multiple webkitdirectory directory />
             <div class="ve-upload-summary is-idle" id="ve-upload-summary" role="status" aria-live="polite"><i class="bi bi-inbox ve-summary-icon"></i><div class="ve-summary-main"><div class="ve-summary-title">No images chosen</div><div class="ve-summary-detail">pick files or a folder above.</div></div></div>
+            <label class="ve-check ve-labs-only" style="margin-top:8px"><input class="ve-checkbox" id="ve-upload-skip-existing" type="checkbox" /> <span><b>Skip images already in this folder</b> — matched by file name, so a resumed upload makes no duplicates <span class="ve-labs-tag">new</span></span></label>
             <div class="ve-row" style="margin-top:8px">
               <button class="ve-button success" id="ve-upload-btn"><i class="bi bi-upload"></i> Upload to library</button>
+              <button class="ve-button ghost ve-labs-only" id="ve-retry-uploads-btn" type="button" title="Upload the files that failed last time again"><i class="bi bi-arrow-clockwise"></i> <span id="ve-retry-uploads-label">Retry failed uploads</span></button>
               <button class="ve-button ghost" id="ve-clear-files-btn" type="button"><i class="bi bi-x-lg"></i> Clear</button>
               <button class="ve-button ghost" id="ve-show-upload-btn" type="button" style="display:none;">legacy</button>
             </div>
@@ -1997,16 +2266,26 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
             <div class="ve-progress" title="Download progress"><div class="ve-progress-bar" id="ve-queue-download-progress"></div></div>
             <div class="ve-row" style="margin-top:10px">
               <button class="ve-button primary" id="ve-download-completed-btn" type="button"><i class="bi bi-download"></i> Download completed</button>
+              <button class="ve-button ghost small ve-labs-only" id="ve-download-remaining-btn" type="button" title="Download only the completed videos that were not downloaded yet"><i class="bi bi-download"></i> Remaining only</button>
               <button class="ve-button ghost small" id="ve-retry-all-failed-btn" type="button" title="Retry every failed item"><i class="bi bi-arrow-clockwise"></i> Retry failed</button>
             </div>
-            <button class="ve-button ghost small ve-hidden" id="ve-download-remaining-btn" type="button" style="display:none;">Remaining only</button>
+            <label class="ve-check ve-labs-only" style="margin-top:8px"><input class="ve-checkbox" id="ve-auto-download" type="checkbox" /> <span><b>Auto-download</b> — download each video of the active folder as soon as it finishes (from when you tick this). Pause stops the current batch; untick to turn it off. <span class="ve-labs-tag">new</span></span></label>
             <p class="ve-field-hint" id="ve-retry-all-summary"></p>
           </div>
 
           <div class="ve-section" data-show-modes="video">
             <div class="ve-section-title">
               <span><i class="bi bi-table"></i> Queue preview</span>
-              <span class="ve-muted" id="ve-queue-count" style="font-family:'JetBrains Mono',monospace; font-size:9px;">up to 150 shown</span>
+              <span style="display:flex; align-items:center; gap:6px;">
+                <select class="ve-select ve-queue-filter ve-labs-only" id="ve-queue-filter" aria-label="Show queue items" title="Show only some queue items">
+                  <option value="all">All</option>
+                  <option value="ready">Ready</option>
+                  <option value="running">Running</option>
+                  <option value="done">Done</option>
+                  <option value="retry">Needs retry</option>
+                </select>
+                <span class="ve-muted" id="ve-queue-count" style="font-family:'JetBrains Mono',monospace; font-size:9px;">up to 150 shown</span>
+              </span>
             </div>
             <div style="max-height:360px; overflow:auto; border:1px solid #E0D8CC; border-radius:1px;">
               <table class="ve-table">
@@ -2143,10 +2422,43 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
 
         <!-- ACTIVITY -->
         <div class="ve-tab-panel" data-panel="activity">
+          <div class="ve-section ve-labs-only" id="ve-labs-whatsnew">
+            <div class="ve-section-title"><span><i class="bi bi-stars"></i> Try new features is on</span><span class="ve-muted" style="font-family:'JetBrains Mono',monospace; font-size:9px;">switch back in the header</span></div>
+            <ul class="ve-whatsnew">
+              <li><b>Separate Pause buttons</b>: pausing downloads no longer stops the generate queue, and an old Pause no longer cuts folder loads short (lists stopped at 100 videos).</li>
+              <li><b>Waits for a free video slot</b> before sending (5 at a time), instead of sending requests that get rejected and then sleeping 60 s.</li>
+              <li><b>Pause works at once</b>, even during the parallel-limit wait.</li>
+              <li><b>Time estimates</b> on running items, from the server's own estimate.</li>
+              <li><b>Canceled or lost jobs</b> (CANCELED / ABSENT) become “failed” you can retry, instead of “running” forever. Status checks that keep failing are checked against My AI Videos.</li>
+              <li><b>Stuck items</b> (“started” after a reload, no job id) get a Retry button. Retry during a run also retries items the queue already passed.</li>
+              <li><b>Real failure reasons</b> from the server (plan limit, blocked word). A plan limit pauses the queue instead of failing every item.</li>
+              <li><b>Auto-download</b>, <b>Remaining only</b> downloads, and a <b>queue filter</b>.</li>
+              <li><b>Upload</b> skips images already in the folder and can retry failed files.</li>
+              <li><b>Progress in the tab title</b>, activity dots on the steps, and a note when the queue runs in another folder.</li>
+              <li><b>Collect</b>: “Clear filters” clears the dates too, and “today” is your local date.</li>
+              <li><b>Safer storage</b>: smaller history, no crash when browser storage is full, and export / import below.</li>
+              <li><b>Session auto-delete</b> only deletes the exact folder it created, never one with the same name.</li>
+              <li>Character descriptions keep their ( ) characters; folder and filter counts are correct; the log keeps the newest 500 lines.</li>
+            </ul>
+          </div>
           <div class="ve-section">
             <div class="ve-section-title"><span><i class="bi bi-terminal"></i> Event log</span><span class="ve-muted" style="font-family:'JetBrains Mono',monospace; font-size:9px;">live · stays on page</span></div>
             <p class="ve-section-help">Polling, retries, and download progress appear here. Helpful when queue seems stuck on “5 in progress”.</p>
             <div class="ve-log" id="ve-log"></div>
+            <div class="ve-row ve-labs-only" style="margin-top:8px">
+              <button class="ve-button ghost small" id="ve-copy-log-btn" type="button"><i class="bi bi-clipboard"></i> <span id="ve-copy-log-label">Copy log</span></button>
+              <button class="ve-button ghost small" id="ve-clear-log-btn" type="button"><i class="bi bi-x-lg"></i> Clear log</button>
+            </div>
+          </div>
+          <div class="ve-section ve-labs-only">
+            <div class="ve-section-title"><span><i class="bi bi-safe"></i> Backup</span><span class="ve-muted" style="font-family:'JetBrains Mono',monospace; font-size:9px;">queue history · JSON</span></div>
+            <p class="ve-section-help">Save the queue history (job ids, statuses, downloads) to a file, or merge a saved file back in. Use it before clearing browser data or to move to another browser. Newer entries win when both sides have the same item.</p>
+            <div class="ve-row">
+              <button class="ve-button ghost" id="ve-export-history-btn" type="button"><i class="bi bi-box-arrow-down"></i> Export history</button>
+              <button class="ve-button ghost" id="ve-import-history-btn" type="button"><i class="bi bi-box-arrow-in-up"></i> Import history</button>
+            </div>
+            <input class="ve-file-input" id="ve-import-history-input" type="file" accept="application/json,.json" />
+            <p class="ve-field-hint" id="ve-backup-summary"></p>
           </div>
         </div>
 
@@ -2310,10 +2622,37 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     copyPromptGuideBtn: root.querySelector("#ve-copy-prompt-guide-btn"),
     copyPromptGuideLabel: root.querySelector("#ve-copy-prompt-guide-label"),
     promptHelperHint: root.querySelector("#ve-prompt-helper-hint"),
+    // Version mode ("Try new features") and its labs-only controls.
+    versionSelect: root.querySelector("#ve-version-select"),
+    contextRun: root.querySelector("#ve-context-run"),
+    uploadSkipExisting: root.querySelector("#ve-upload-skip-existing"),
+    retryUploadsBtn: root.querySelector("#ve-retry-uploads-btn"),
+    retryUploadsLabel: root.querySelector("#ve-retry-uploads-label"),
+    autoDownload: root.querySelector("#ve-auto-download"),
+    queueFilter: root.querySelector("#ve-queue-filter"),
+    copyLogBtn: root.querySelector("#ve-copy-log-btn"),
+    copyLogLabel: root.querySelector("#ve-copy-log-label"),
+    clearLogBtn: root.querySelector("#ve-clear-log-btn"),
+    exportHistoryBtn: root.querySelector("#ve-export-history-btn"),
+    importHistoryBtn: root.querySelector("#ve-import-history-btn"),
+    importHistoryInput: root.querySelector("#ve-import-history-input"),
+    backupSummary: root.querySelector("#ve-backup-summary"),
   };
 
   function logLine(message) {
     const line = `[${new Date().toLocaleTimeString()}] ${message}`;
+    if (labsOn()) {
+      // Labs: keep the newest LOG_MAX_LINES lines so long unattended runs don't slow the page down.
+      let next = els.log.textContent ? `${line}\n${els.log.textContent}` : line;
+      let cut = -1;
+      for (let count = 0; count < LOG_MAX_LINES; count += 1) {
+        cut = next.indexOf("\n", cut + 1);
+        if (cut === -1) break;
+      }
+      if (cut !== -1) next = next.slice(0, cut);
+      els.log.textContent = next;
+      return;
+    }
     els.log.textContent = `${line}\n${els.log.textContent}`.trim();
   }
 
@@ -2360,6 +2699,39 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     if(els.themeSelect) els.themeSelect.value = next;
     saveUiState({ theme: next });
     logLine(`Palette: ${next}`);
+  }
+
+  // Header dropdown: "Stable version" (the default) or "Try new features" (labs mode).
+  function applyVersionMode(mode, options = {}) {
+    const labs = mode === "labs";
+    const changed = labs !== labsOn();
+    config.labsEnabled = labs;
+    if (labs) root.setAttribute("data-labs", "on");
+    else root.removeAttribute("data-labs");
+    if (els.versionSelect) els.versionSelect.value = labs ? "labs" : "stable";
+    if (options.persist !== false) saveUiState({ versionMode: labs ? "labs" : "stable" });
+    if (!changed) return;
+    if (!labs) {
+      // Back to stable: undo the labs-only text that stable code never rewrites.
+      if (els.filterCount) els.filterCount.textContent = "\u2014";
+      state.queueFilter = "all";
+      if (els.queueFilter) els.queueFilter.value = "all";
+    }
+    if (options.render !== false) {
+      renderFolders();
+      renderQueue();
+      renderVideos();
+      renderTimelineExport();
+      renderCharacters();
+      updateButtonStates();
+    }
+    if (options.log !== false) {
+      logLine(
+        labs
+          ? "Try new features is on. The Log tab lists what changed. Switch back to Stable version in the header at any time."
+          : "Stable version: the new features are off.",
+      );
+    }
   }
   function setActiveTab(tab) {
     const domTab = tab === "folders" ? "library" : tab === "upload" ? "library" : tab;
@@ -2470,9 +2842,19 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       if (els.contextName) els.contextName.textContent = sel.title || sel.name;
       if (els.contextId) els.contextId.textContent = `#${sel.id}`;
       if (els.uploadFolderName) els.uploadFolderName.textContent = `\u2192 ${sel.title || sel.name}`;
+    } else if (labsOn()) {
+      // Labs: no demo placeholder text when nothing is selected.
+      if (els.contextName) els.contextName.textContent = "No folder selected";
+      if (els.contextId) els.contextId.textContent = "";
+      if (els.uploadFolderName) els.uploadFolderName.textContent = "\u2192 pick a folder";
     }
     if (els.folderCount) els.folderCount.textContent = String(state.folders.length);
-    if (els.contextCount) els.contextCount.textContent = String(state.items.length);
+    if (labsOn()) {
+      // Labs: the folder count element was never wired up (it always said 5).
+      const folderCountEl = root.querySelector("#ve-folder-count");
+      if (folderCountEl) folderCountEl.textContent = String(state.folders.length);
+    }
+    if (els.contextCount) els.contextCount.textContent = labsOn() && !state.items.length ? "\u2014" : String(state.items.length);
     try {
       const counts = getQueueDownloadCounts();
       if (els.contextDone) els.contextDone.textContent = String(counts.completed || state.queue.filter((q) => normalizeStatus(q.status) === "completed").length);
@@ -2508,6 +2890,12 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     els.downloadSummary.textContent = total
       ? `${visibleVideos.length}/${total} visible | ${visibleSelectedCount} visible selected | ${selectedCount} total selected`
       : "No videos loaded — choose a folder and “Load videos in folder.”";
+    if (labsOn() && els.filterCount) {
+      // Labs: say how many videos the filters hide (the date filter defaults to today and sits in a closed panel).
+      const dateOn = Boolean(state.videoFilters.dateFrom || state.videoFilters.dateTo);
+      const shown = total ? `${visibleVideos.length} of ${total} shown` : "";
+      els.filterCount.textContent = [shown, dateOn ? "date filter on" : ""].filter(Boolean).join(" · ") || "\u2014";
+    }
     els.videoMasterCheckbox.checked =
       visibleVideos.length > 0 && visibleSelectedCount === visibleVideos.length;
     els.videoMasterCheckbox.indeterminate =
@@ -2781,11 +3169,27 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     updateButtonStates();
   }
 
+  // Labs queue-preview filter: all | ready | running | done | retry.
+  function queueItemCategory(item) {
+    const status = normalizeStatus(item.status);
+    if (status === "completed") return "done";
+    if (status === "failed" || status === "parallel_limit" || isStaleStartedRecord(item.record)) return "retry";
+    if (status === "submitted" || status === "running" || status === "started") return "running";
+    if (!item.skip) return "ready";
+    return "other";
+  }
+
+  function filterQueueForView(queue) {
+    const filter = state.queueFilter || "all";
+    if (filter === "all") return queue;
+    return queue.filter((item) => queueItemCategory(item) === filter);
+  }
+
   function renderQueue() {
     const runningCount = state.queue.filter((item) => {
       const status = normalizeStatus(item.status);
       return (
-        status === "submitted" || status === "running" || status === "started"
+        status === "submitted" || status === "running" || (status === "started" && !isStaleStartedRecord(item.record))
       );
     }).length;
     const doneCount = state.queue.filter(
@@ -2793,7 +3197,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     ).length;
     const failedCount = state.queue.filter((item) => {
       const s = normalizeStatus(item.status);
-      return s === "failed" || s === "parallel_limit";
+      return s === "failed" || s === "parallel_limit" || isStaleStartedRecord(item.record);
     }).length;
     const queuedCount = state.queue.filter((item) => {
       const status = normalizeStatus(item.status);
@@ -2805,6 +3209,11 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     els.statRunning.textContent = String(runningCount);
     els.statDone.textContent = String(doneCount);
     els.statFailed.textContent = String(failedCount);
+    if (labsOn()) {
+      // Labs: the context bar counts were only refreshed with the folder list, so they went stale after loading images.
+      if (els.contextCount) els.contextCount.textContent = state.items.length ? String(state.items.length) : "\u2014";
+      if (els.contextDone) els.contextDone.textContent = String(getQueueDownloadCounts().completed || doneCount);
+    }
     if (els.statusLine) {
       els.statusLine.innerHTML = `<span><strong>${state.items.length}</strong> images</span><span class="dot running"></span><span><strong>${runningCount}</strong> running</span><span class="dot done"></span><span><strong>${doneCount}</strong> done</span><span class="dot fail"></span><span><strong>${failedCount}</strong> need retry</span><span style="opacity:.4">\u00b7</span><span><strong>${queuedCount}</strong> ready</span>`;
     }
@@ -2815,10 +3224,18 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     const folder = getSelectedFolder();
     els.folderSummary.textContent = folder
       ? `${folder.title || folder.name} | ${state.items.length} images loaded | history updated ${formatDateTime(state.history.updatedAt) || "never"}`
-      : "Choose a folder, then “Show images in folder” to build the queue.";
+      : labsOn()
+        ? "Choose a folder, then “Load images from folder” to build the queue."
+        : "Choose a folder, then “Show images in folder” to build the queue.";
+    if (labsOn() && state.running && state.slotWait) {
+      els.folderSummary.textContent += ` | Waiting for a free video slot (${state.slotWait.active}/${VIDEO_PARALLEL_LIMIT} rendering)`;
+    }
 
     // Queue preview pagination — 150/page, header shows page range (UI-only, no queue logic change)
-    const _qTotal = state.queue.length;
+    // Labs: the preview can be filtered by status first.
+    const viewQueue = labsOn() ? filterQueueForView(state.queue) : state.queue;
+    const _qTotal = viewQueue.length;
+    state.queueViewTotal = _qTotal;
     const _qPageSize = Number(state.queuePageSize || 150);
     const _qTotalPages = Math.max(1, Math.ceil(_qTotal / _qPageSize));
     if (state.queuePage >= _qTotalPages) state.queuePage = Math.max(0, _qTotalPages - 1);
@@ -2842,8 +3259,8 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       if (els.queueNext) els.queueNext.disabled = state.queuePage >= _qTotalPages - 1 || _qTotal <= _qPageSize;
     } catch {}
 
-    els.queueBody.innerHTML = state.queue.length
-      ? state.queue
+    els.queueBody.innerHTML = viewQueue.length
+      ? viewQueue
           .slice(_qStart, _qEnd)
           .map((item) => {
             const record =
@@ -2858,10 +3275,15 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
             const isDownloaded = record && record.downloadedAt;
             const isFailed = normalizeStatus(latestStatus) === "failed";
             const isParallel = normalizeStatus(latestStatus) === "parallel_limit";
-            const canRetry = isFailed || isParallel;
-            const reason = canRetry ? getFailureReason(record || { status: latestStatus, error: item.record && item.record.error, response: item.record && item.record.response, statusPayload: item.record && item.record.statusPayload }) : "";
-            const reasonAttr = escapeAttr(reason);
+            // Labs: a "started" item whose answer was lost (page closed mid-request) can be retried.
+            const isStale = isStaleStartedRecord(record);
+            const canRetry = isFailed || isParallel || isStale;
+            const reason = isStale
+              ? "No answer was saved for this request (the page was closed or reloaded while sending). Check My AI Videos, then Retry if the video is missing."
+              : canRetry ? getFailureReason(record || { status: latestStatus, error: item.record && item.record.error, response: item.record && item.record.response, statusPayload: item.record && item.record.statusPayload }) : "";
+            const reasonAttr = labsOn() ? escapeHtml(reason) : escapeAttr(reason);
             const reasonHtml = escapeHtml(reason);
+            const timing = labsOn() && ["submitted", "running"].includes(normalizeStatus(latestStatus)) ? formatJobTiming(record) : "";
             return `
               <tr>
                 <td>
@@ -2875,21 +3297,22 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
                 </td>
                 <td>${escapeHtml(item.prompt || "(empty prompt)")}</td>
                 <td>
-                  <span class="ve-badge ${getBadgeClass(displayStatus)}">${escapeHtml(displayStatus)}</span>
+                  <span class="ve-badge ${getBadgeClass(displayStatus)}">${escapeHtml(isStale ? "stuck" : displayStatus)}</span>
                   ${canRetry && reason ? `<span class="ve-info" title="${reasonAttr}" data-failure-reason="${reasonAttr}" role="button" tabindex="0" aria-label="Failure reason">i</span>` : ""}
                   ${isDownloaded ? ` <span class="ve-badge completed">downloaded</span>` : ""}
+                  ${timing ? `<span class="ve-job-timing">${escapeHtml(timing)}</span>` : ""}
                 </td>
                 <td>${escapeHtml(formatDateTime(updatedAt) || "-")}</td>
                 <td>
                   <div class="ve-queue-actions">
-                    ${canRetry ? `<button class="ve-retry-btn" data-retry-media-id="${escapeAttr(String(item.media.id))}" title="${canRetry ? `Retry ${reasonHtml}` : ""}"><i class="bi bi-arrow-clockwise"></i> Retry</button>` : `<span class="ve-muted">—</span>`}
+                    ${canRetry ? `<button class="ve-retry-btn" data-retry-media-id="${escapeAttr(String(item.media.id))}" title="${canRetry ? `Retry ${labsOn() ? reasonAttr : reasonHtml}` : ""}"><i class="bi bi-arrow-clockwise"></i> Retry</button>` : `<span class="ve-muted">—</span>`}
                   </div>
                 </td>
               </tr>
             `;
           })
           .join("")
-      : `<tr><td colspan="5" class="ve-muted">No items loaded yet.</td></tr>`;
+      : `<tr><td colspan="5" class="ve-muted">${labsOn() && state.queue.length ? "No items match this filter." : "No items loaded yet."}</td></tr>`;
     const missing = Object.values(state.history.records).filter(r => String(r.folderId)===String(state.selectedFolderId) && normalizeStatus(r.status)==="completed" && !r.videoId).length;
     const counts = getQueueDownloadCounts();
     els.queueDownloadSummary.textContent = counts.completed
@@ -2903,6 +3326,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
 
   function renderTimelineExport() {
     if (!els.timelineProgress) return;
+    updateTitleProgress();
     els.timelineProgress.style.width = `${Math.max(0, Math.min(100, Number(state.timelineExport.percent || 0)))}%`;
     els.timelineStatus.textContent = state.timelineExport.statusText || (state.timelineExport.running ? `Exporting ${state.timelineExport.percent}%` : "Idle — choose a folder, load videos, then export.");
     const hasResult = Boolean(state.timelineExport.exportedVideo && state.timelineExport.exportedVideo.mediaPath);
@@ -2924,7 +3348,8 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       const note = vids.length ? `${vids.length} on timeline` : "Timeline empty";
       if (completedTotal) {
         const scopeLabel = state.selectedFolderId ? ` — ${completedScoped} completed in this folder, ${completedTotal} total` : ` — ${completedTotal} completed total`;
-        els.timelineCompletedSummary.textContent = `${note}${scopeLabel}. Click "Add Completed Generated" to add them.`;
+        const buttonName = labsOn() ? "Add completed to timeline" : "Add Completed Generated";
+        els.timelineCompletedSummary.textContent = `${note}${scopeLabel}. Click "${buttonName}" to add them.`;
       } else {
         els.timelineCompletedSummary.textContent = `${note}. No completed generated videos yet — run queue first.`;
       }
@@ -2942,6 +3367,12 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
 
   function escapeAttr(value) {
     return escapeHtml(value).replace(/\(/g, "%28").replace(/\)/g, "%29");
+  }
+
+  // Text inside an HTML attribute (an input value, a title). escapeAttr is for url('...') only:
+  // it turns "(" into "%28", which corrupted character descriptions. Labs uses plain escaping.
+  function attrText(value) {
+    return labsOn() ? escapeHtml(value) : escapeAttr(value);
   }
 
   function sanitizeFileName(value) {
@@ -3063,14 +3494,14 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
           return m ? Number(m[1]) : 0;
         })();
         const retryable = isRetryableDownloadStatus(status) || /file not found|not ready/i.test(String(e.message || ""));
-        if (attempt >= maxRetries || !retryable || state.stopRequested) throw e;
+        if (attempt >= maxRetries || !retryable || downloadStopRequested()) throw e;
         const delay = Math.round(baseDelay * Math.pow(1.7, attempt) + randomDelay(0, 1000));
         logLine(`Download ${fileName} got ${status || "error"} (attempt ${attempt + 1}/${maxRetries + 1}), retrying in ${Math.round(delay / 1000)}s...`);
         const retryText = `Retrying ${fileName} in ${Math.round(delay / 1000)}s (${attempt + 1}/${maxRetries})`;
         if (els.queueDownloadSummary) els.queueDownloadSummary.textContent = retryText;
         if (els.downloadSummary) els.downloadSummary.textContent = retryText;
         await sleep(delay);
-        if (state.stopRequested) throw new Error("stopped");
+        if (downloadStopRequested()) throw new Error("stopped");
       }
     }
     throw lastError;
@@ -3082,12 +3513,15 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     return Math.round(min + Math.random() * (max - min));
   }
 
-  async function asyncPool(poolLimit, items, iteratorFn) {
+  async function asyncPool(poolLimit, items, iteratorFn, shouldStop) {
     const limit = Math.max(1, Number(poolLimit) || 1);
+    // Stable: every pool stops on the shared Pause flag. Labs: only pools that pass a stop check
+    // (the download queues) stop, so an earlier Pause never cuts a folder load or lookup short.
+    const stopNow = typeof shouldStop === "function" ? shouldStop : () => !labsOn() && state.stopRequested;
     if (limit === 1) {
       const results = [];
       for (const [idx, item] of items.entries()) {
-        if (state.stopRequested) break;
+        if (stopNow()) break;
         try {
           const v = await iteratorFn(item, idx);
           results.push({ status: "fulfilled", value: v });
@@ -3101,7 +3535,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     const ret = [];
     const executing = new Set();
     for (const [index, item] of items.entries()) {
-      if (state.stopRequested) break;
+      if (stopNow()) break;
       const p = (async () => iteratorFn(item, index))();
       ret.push(p);
       executing.add(p);
@@ -3538,15 +3972,46 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
 
   async function uploadSelectedFiles() {
     const folder = getSelectedFolder();
-    const files = state.selectedFiles;
+    let files = state.selectedFiles;
     if (!folder) throw new Error("Select a folder before uploading.");
     if (!files.length) throw new Error("Choose one or more image files first.");
 
     state.uploadInProgress = true;
     updateButtonStates();
+    // Labs: skip files whose name is already in the folder (resuming a big upload doesn't make duplicates).
+    const skippedNames = [];
+    if (labsOn() && config.uploadSkipExisting) {
+      try {
+        setUploadSummary("uploading", "Checking the folder…", `Looking for images already in ${escapeHtml(folder.title || folder.name)}`);
+        const existing = await api.getAllImages(folder.id);
+        const names = new Set(existing.results.map((media) => String(media.name || "").trim().toLowerCase()));
+        files = files.filter((file) => {
+          const title = file.name.replace(/\.[a-z0-9]+$/i, "").trim().toLowerCase();
+          if (!names.has(title)) return true;
+          skippedNames.push(file.name);
+          return false;
+        });
+        if (skippedNames.length) logLine(`Skipping ${skippedNames.length} image(s) already in "${folder.title || folder.name}" (same file name).`);
+      } catch (error) {
+        logLine(`Could not check the folder for existing images (${error.message}), so all files are uploaded.`);
+      }
+      if (!files.length) {
+        state.uploadInProgress = false;
+        state.selectedFiles = [];
+        state.failedUploadFiles = [];
+        els.fileInput.value = "";
+        els.folderInput.value = "";
+        if (els.fileDrop) els.fileDrop.classList.remove("has-files");
+        if (els.uploadCount) els.uploadCount.textContent = "0 selected";
+        updateButtonStates();
+        setUploadSummary("success", "Nothing new to upload", `All ${skippedNames.length} image(s) are already in ${escapeHtml(folder.title || folder.name)}.`);
+        return;
+      }
+    }
     let successCount = 0;
     let failCount = 0;
     const failedNames = [];
+    const failedFiles = [];
     setUploadSummary("uploading", `Uploading ${files.length} files…`, `0 / ${files.length} &middot; ${escapeHtml(folder.title || folder.name)}`);
 
     for (const file of files) {
@@ -3562,6 +4027,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       } catch (error) {
         failCount += 1;
         failedNames.push(file.name);
+        failedFiles.push(file);
         logLine(`Upload failed for ${file.name}: ${error.message}`);
         const chips = failedNames.map(n => `<span class="ve-fail-chip">${escapeHtml(n)}</span>`).join("");
         setUploadSummary("uploading", `Uploaded ${successCount} / ${files.length}`, `Last fail: ${escapeHtml(file.name)} ${chips}`);
@@ -3569,19 +4035,33 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     }
 
     state.uploadInProgress = false;
+    if (labsOn()) state.failedUploadFiles = failedFiles;
     updateButtonStates();
     els.fileInput.value = "";
     els.folderInput.value = "";
     state.selectedFiles = [];
+    if (labsOn()) {
+      if (els.fileDrop) els.fileDrop.classList.remove("has-files");
+      if (els.uploadCount) els.uploadCount.textContent = "0 selected";
+      // Labs: reload first so the summary shows the folder's real image count.
+      try {
+        await loadFolderImages();
+      } catch (error) {
+        logLine(`Could not reload the folder after the upload: ${error.message}`);
+      }
+    }
+    const skippedText = skippedNames.length ? ` &middot; skipped ${skippedNames.length} already in the folder` : "";
     if (failCount > 0) {
       const chips = failedNames.map(n => `<span class="ve-fail-chip">${escapeHtml(n)}</span>`).join("");
-      const detail = `Success: <strong>${successCount}</strong> &middot; Failed: <strong>${failCount}</strong><br>${chips}<br><span style="opacity:.78">Check Activity log for the full error. Retry the failed file(s) or pick a new set.</span>`;
+      const hint = labsOn() ? "Press <b>Retry failed uploads</b> to send them again." : "Retry the failed file(s) or pick a new set.";
+      const detail = `Success: <strong>${successCount}</strong> &middot; Failed: <strong>${failCount}</strong>${skippedText}<br>${chips}<br><span style="opacity:.78">Check Activity log for the full error. ${hint}</span>`;
       setUploadSummary("error", `Upload incomplete — ${failCount} failed`, detail);
     } else {
-      const detail = `Success: <strong>${successCount}</strong> / ${files.length} &middot; Folder now has ${state.items.length || successCount} images`;
+      const imageCount = labsOn() ? state.items.length : state.items.length || successCount;
+      const detail = `Success: <strong>${successCount}</strong> / ${files.length}${skippedText} &middot; Folder now has ${imageCount} images`;
       setUploadSummary("success", "Upload complete", detail);
     }
-    await loadFolderImages();
+    if (!labsOn()) await loadFolderImages();
   }
 
   function clampVideoLength(value) {
@@ -3659,7 +4139,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
 
     updateConfigFromInputs();
     state.downloadInProgress = true;
-    state.stopRequested = false;
+    clearDownloadStop();
     updateButtonStates();
 
     let processed = 0;
@@ -3673,7 +4153,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
 
     try {
       await asyncPool(concurrency, videos, async (video) => {
-        if (state.stopRequested) return;
+        if (downloadStopRequested()) return;
         const myIdx = ++nextIdx;
         const downloadName = resolveVideoDownloadName(video);
         els.downloadSummary.textContent = `${label}: downloading ${myIdx}/${total} | ${downloadName}`;
@@ -3687,7 +4167,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
         } finally {
           processed += 1;
           els.downloadProgress.style.width = `${Math.round((processed / total) * 100)}%`;
-          if (concurrency === 1 && processed < total && !state.stopRequested) {
+          if (concurrency === 1 && processed < total && !downloadStopRequested()) {
             const waitMs = randomDelay(config.downloadMinDelayMs, config.downloadMaxDelayMs);
             if (waitMs > 0) {
               const failedText = failedNames.length ? ` | Failed: ${failedNames.slice(-2).join(", ")}` : "";
@@ -3698,33 +4178,37 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
             els.downloadSummary.textContent = `${label}: ${processed}/${total} | success ${processed - failCount} failed ${failCount}`;
           }
         }
-      });
+      }, downloadStopRequested);
     } finally {
       state.downloadInProgress = false;
       updateButtonStates();
       const successCount = processed - failCount;
       const failedText = failedNames.length ? ` | Failed: ${failedNames.join(", ")}` : "";
-      if (state.stopRequested) {
+      if (downloadStopRequested()) {
         els.downloadSummary.textContent = `${label}: stopped after ${processed}/${total}${failedText}`;
       } else {
         els.downloadSummary.textContent = `${label}: ${successCount}/${total} downloaded, ${failCount} failed${failedText}`;
       }
       logLine(
-        state.stopRequested
+        downloadStopRequested()
           ? "Download queue stopped."
           : `Download queue finished. ${successCount} succeeded, ${failCount} failed.`,
       );
     }
   }
 
-async function downloadQueueCompleted({ onlyRemaining }) {
+async function downloadQueueCompleted({ onlyRemaining, auto = false, recordFilter = null } = {}) {
   if (state.downloadInProgress) return;
   updateConfigFromInputs();
   const folder = getSelectedFolder();
   if (!folder) throw new Error("No folder selected.");
+  // Labs: an earlier Pause must not cancel this new download (the 8 s wait below checks the flag).
+  if (labsOn()) state.downloadStopRequested = false;
+  // Labs auto-download passes recordFilter (only videos that finished after it was turned on).
+  const inScope = (rec) => !recordFilter || recordFilter(rec);
 
-  const missingBefore = Object.values(state.history.records).filter(
-    (rec) => String(rec.folderId) === String(folder.id) && normalizeStatus(rec.status) === "completed" && (!onlyRemaining || !rec.downloadedAt) && !rec.videoId && rec.uuid
+  const missingBefore = auto ? [] : Object.values(state.history.records).filter(
+    (rec) => String(rec.folderId) === String(folder.id) && normalizeStatus(rec.status) === "completed" && (!onlyRemaining || !rec.downloadedAt) && !rec.videoId && rec.uuid && inScope(rec)
   );
 
   if (missingBefore.length) {
@@ -3782,16 +4266,17 @@ async function downloadQueueCompleted({ onlyRemaining }) {
   }
 
   let entries = Object.values(state.history.records)
-    .filter((rec) => String(rec.folderId) === String(folder.id) && normalizeStatus(rec.status) === "completed" && (!onlyRemaining || !rec.downloadedAt))
+    .filter((rec) => String(rec.folderId) === String(folder.id) && normalizeStatus(rec.status) === "completed" && (!onlyRemaining || !rec.downloadedAt) && inScope(rec))
     .filter((rec) => rec.videoId)
     .map((rec) => ({ rec }));
 
   let missingWithoutVideoId = Object.values(state.history.records).filter(
-    (rec) => String(rec.folderId) === String(folder.id) && normalizeStatus(rec.status) === "completed" && (!onlyRemaining || !rec.downloadedAt) && !rec.videoId,
+    (rec) => String(rec.folderId) === String(folder.id) && normalizeStatus(rec.status) === "completed" && (!onlyRemaining || !rec.downloadedAt) && !rec.videoId && inScope(rec),
   );
 
   // Retry timer for eventual consistency: I2 fix — handle partial as well as full missing; I4 full fallback on retry; I6 dedupe by recompute; I3 cancellable
-  if (missingWithoutVideoId.length) {
+  // (Labs auto-download skips it: the next status poll resolves missing ids anyway.)
+  if (missingWithoutVideoId.length && !auto) {
     const needRetry = entries.length === 0 || missingWithoutVideoId.length > 0;
     if (needRetry) {
       const retryMsg = entries.length === 0
@@ -3800,10 +4285,10 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       logLine(retryMsg);
       els.queueDownloadSummary.textContent = `VideoId missing for ${missingWithoutVideoId.length}, retrying in 8s... (Stop to cancel)`;
       for (let waited = 0; waited < 8000; waited += 500) {
-        if (state.stopRequested) break;
+        if (downloadStopRequested()) break;
         await sleep(500);
       }
-      if (state.stopRequested) throw new Error("stopped");
+      if (downloadStopRequested()) throw new Error("stopped");
       // I4: reuse same 3-stage fallback as initial missingBefore block
       const toRetry = [...missingWithoutVideoId];
       await resolveMissingVideoIdsViaStatus(toRetry);
@@ -3838,11 +4323,11 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       }
       // Recompute from scratch to avoid duplicates (I6) and include newly resolved
       entries = Object.values(state.history.records)
-        .filter((rec) => String(rec.folderId) === String(folder.id) && normalizeStatus(rec.status) === "completed" && (!onlyRemaining || !rec.downloadedAt))
+        .filter((rec) => String(rec.folderId) === String(folder.id) && normalizeStatus(rec.status) === "completed" && (!onlyRemaining || !rec.downloadedAt) && inScope(rec))
         .filter((rec) => rec.videoId)
         .map((rec) => ({ rec }));
       missingWithoutVideoId = Object.values(state.history.records).filter(
-        (rec) => String(rec.folderId) === String(folder.id) && normalizeStatus(rec.status) === "completed" && (!onlyRemaining || !rec.downloadedAt) && !rec.videoId,
+        (rec) => String(rec.folderId) === String(folder.id) && normalizeStatus(rec.status) === "completed" && (!onlyRemaining || !rec.downloadedAt) && !rec.videoId && inScope(rec),
       );
       if (entries.length) logLine(`Retry resolved ${entries.length} total entries, ${missingWithoutVideoId.length} still missing`);
     }
@@ -3851,7 +4336,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
   if (!entries.length) throw new Error(onlyRemaining ? "No remaining downloads." : "No completed videos to download." + (missingWithoutVideoId.length ? ` (${missingWithoutVideoId.length} completed but videoId missing — will auto-resolve on next 15s poll)` : ""));
 
   state.downloadInProgress = true;
-  state.stopRequested = false;
+  clearDownloadStop();
   updateButtonStates();
   let completed = 0, failed = 0;
   const total = entries.length;
@@ -3863,7 +4348,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
   let nextQIdx = 0;
   try {
     await asyncPool(concurrency, entries, async ({ rec }) => {
-      if (state.stopRequested) return;
+      if (downloadStopRequested()) return;
       const vid = rec.videoId;
       if (!vid) { failed++; processed++; logLine(`Skip ${rec.imageName}: no videoId resolvable`); return; }
       const myQIdx = ++nextQIdx;
@@ -3888,7 +4373,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
         processed++;
         els.queueDownloadProgress.style.width = `${Math.round((processed/total)*100)}%`;
         renderQueue(); updateButtonStates();
-        if (concurrency === 1 && processed < total && !state.stopRequested) {
+        if (concurrency === 1 && processed < total && !downloadStopRequested()) {
           const waitMs = randomDelay(config.downloadMinDelayMs, config.downloadMaxDelayMs);
           if (waitMs > 0) {
             els.queueDownloadSummary.textContent = `${onlyRemaining ? "Remaining" : "Completed"}: waiting ${Math.round(waitMs/1000)}s (${processed}/${total})`;
@@ -3898,17 +4383,108 @@ async function downloadQueueCompleted({ onlyRemaining }) {
           els.queueDownloadSummary.textContent = `${onlyRemaining ? "Remaining" : "Completed"}: ${processed}/${total} | ${completed} ok ${failed} failed`;
         }
       }
-    });
+    }, downloadStopRequested);
   } finally {
     state.downloadInProgress = false;
     updateButtonStates(); renderQueue();
     const ok = completed;
-    els.queueDownloadSummary.textContent = state.stopRequested
+    els.queueDownloadSummary.textContent = downloadStopRequested()
       ? `${onlyRemaining ? "Remaining" : "Completed"}: stopped ${processed}/${total} downloaded`
       : `${onlyRemaining ? "Remaining" : "Completed"}: ${ok}/${total} downloaded, ${failed} failed | Remaining: ${getQueueDownloadCounts().remaining}`;
-    logLine(state.stopRequested ? "Queue download stopped." : `Queue download finished ${ok}/${total}.`);
+    logLine(downloadStopRequested() ? "Queue download stopped." : `Queue download finished ${ok}/${total}.`);
   }
 }
+
+  // Labs auto-download: after each status poll, download the active folder's videos that finished
+  // since the box was ticked. Runs in the background; errors only go to the log.
+  async function maybeAutoDownload() {
+    if (!labsOn() || !config.autoDownload) return;
+    if (state.downloadInProgress || state.uploadInProgress || state.autoDownloadBusy) return;
+    const folder = getSelectedFolder();
+    if (!folder) return;
+    const since = Date.parse(config.autoDownloadSince || "") || 0;
+    const isDue = (rec) =>
+      Boolean(rec && rec.finishedAt && !rec.downloadedAt && (Date.parse(rec.finishedAt) || 0) >= since);
+    const due = Object.values(state.history.records).filter(
+      (rec) => rec && String(rec.folderId) === String(folder.id) && normalizeStatus(rec.status) === "completed" && rec.videoId && isDue(rec),
+    );
+    if (!due.length) return;
+    state.autoDownloadBusy = true;
+    try {
+      logLine(`Auto-download: ${due.length} new video(s) in "${folder.title || folder.name}".`);
+      await downloadQueueCompleted({ onlyRemaining: true, auto: true, recordFilter: isDue });
+    } catch (error) {
+      logLine(`Auto-download: ${error.message || error}`);
+    } finally {
+      state.autoDownloadBusy = false;
+    }
+  }
+
+  // Labs backup: the queue history as a JSON file.
+  function exportHistoryBackup() {
+    const backup = {
+      type: "videoexpress-manager-history",
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      history: state.history,
+    };
+    const fileName = `videoexpress-history-${localDateString()}.json`;
+    const url = URL.createObjectURL(new Blob([JSON.stringify(backup)], { type: "application/json" }));
+    const a = document.createElement("a");
+    a.href = url; a.download = fileName; a.rel = "noopener"; a.style.display = "none";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    const count = Object.keys(state.history.records).length;
+    logLine(`Exported ${count} history record(s) to ${fileName}.`);
+    if (els.backupSummary) els.backupSummary.textContent = `Exported ${count} record(s) to ${fileName}.`;
+  }
+
+  // Merges a backup (or a raw copy of videoexpress.manager.history.v1) into the local history.
+  // Only well-formed record keys and plain objects are taken; for an item on both sides the newer updatedAt wins.
+  async function importHistoryBackup(file) {
+    if (!file) return;
+    if (file.size > 25 * 1024 * 1024) throw new Error("That file is too large to be a history backup (over 25 MB).");
+    let parsed;
+    try {
+      parsed = JSON.parse(await file.text());
+    } catch {
+      throw new Error("That file is not valid JSON.");
+    }
+    const source = parsed && parsed.history && typeof parsed.history === "object" ? parsed.history : parsed;
+    const records = source && source.records;
+    if (!records || typeof records !== "object" || Array.isArray(records)) throw new Error("No queue history found in that file.");
+    let added = 0;
+    let updated = 0;
+    let skipped = 0;
+    for (const [key, record] of Object.entries(records)) {
+      if (!RECORD_KEY_PATTERN.test(key) || !record || typeof record !== "object" || Array.isArray(record)) {
+        skipped += 1;
+        continue;
+      }
+      const local = state.history.records[key];
+      if (!local) {
+        state.history.records[key] = record;
+        added += 1;
+        continue;
+      }
+      const localTime = Date.parse(local.updatedAt || "") || 0;
+      const importedTime = Date.parse(record.updatedAt || "") || 0;
+      if (importedTime > localTime) {
+        state.history.records[key] = record;
+        updated += 1;
+      } else {
+        skipped += 1;
+      }
+    }
+    saveHistory();
+    const folder = getSelectedFolder();
+    if (folder && state.items.length && !state.running) state.queue = buildQueue(folder, state.items);
+    renderQueue();
+    renderTimelineExport();
+    const summary = `Imported history: ${added} added, ${updated} updated, ${skipped} unchanged or skipped.`;
+    logLine(summary);
+    if (els.backupSummary) els.backupSummary.textContent = summary;
+  }
 
   async function runQueue() {
     if (state.running) return;
@@ -3919,171 +4495,239 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     updateConfigFromInputs();
     state.running = true;
     state.stopRequested = false;
+    const runItems = state.queue;
+    if (labsOn()) {
+      state.runningFolderId = folder.id;
+      state.runQueueItems = runItems;
+      state.retryWhileRunning.clear();
+      state.slotWaitOff = false;
+    }
     updateButtonStates();
 
     try {
-      for (const item of state.queue) {
+      for (const item of runItems) {
         if (state.stopRequested) break;
-        if (!item.prompt) {
-          item.status = "skipped";
-          continue;
-        }
-
-        const existing = getRecord(folder.id, item.media.id);
-        const existingStatus = existing ? normalizeStatus(existing.status) : "";
-        if (
-          existing &&
-          (["submitted", "running", "completed"].includes(existingStatus) ||
-            (config.skipStartedWithoutUuid && existingStatus === "started"))
-        ) {
-          item.status = existing.status;
-          continue;
-        }
-
-        let retries =
-          existing && existing.parallelLimitRetries
-            ? existing.parallelLimitRetries
-            : 0;
-        let done = false;
-
-        while (!done) {
+        await runQueueItem(folder, item);
+      }
+      // Labs: items sent to Retry during this run that the loop had already passed.
+      while (labsOn() && !state.stopRequested && state.retryWhileRunning.size) {
+        const ids = new Set(state.retryWhileRunning);
+        state.retryWhileRunning.clear();
+        const retryItems = runItems.filter((item) => ids.has(String(item.media.id)));
+        if (retryItems.length) logLine(`Retrying ${retryItems.length} item(s) that were sent to Retry during this run.`);
+        for (const item of retryItems) {
           if (state.stopRequested) break;
-
-          const startedAt = new Date().toISOString();
-          const baseRecord = {
-            libraryId: config.libraryId,
-            folderId: folder.id,
-            folderName: folder.name,
-            folderTitle: folder.title,
-            imageId: item.media.id,
-            imageName: item.media.name,
-            imageFileName: item.media.fileName,
-            mediaPath: item.media.mediaPath,
-            prompt: item.prompt,
-            aspect: config.aspect,
-            videoLength: config.videoLength,
-            startedAt,
-            updatedAt: startedAt,
-            status: "started",
-            videoId: null,
-            downloadedAt: null,
-            completedAt: null,
-          };
-          setRecord(folder.id, item.media.id, baseRecord);
-          item.record = baseRecord;
-          item.status = "started";
-          renderQueue();
-          logLine(`Submitting ${item.media.name}`);
-
-          try {
-            const result = await api.generateImageVideo(
-              item.media,
-              item.prompt,
-            );
-            const completedAt = new Date().toISOString();
-
-            if (
-              result &&
-              isParallelLimitMessage(result.error || result.message)
-            ) {
-              retries += 1;
-              const nextRecord = {
-                ...baseRecord,
-                status: "parallel_limit",
-                response: result,
-                parallelLimitRetries: retries,
-                updatedAt: completedAt,
-                completedAt,
-              };
-              setRecord(folder.id, item.media.id, nextRecord);
-              item.record = nextRecord;
-              item.status = "parallel_limit";
-              renderQueue();
-
-              if (
-                config.autoRetryOnParallelLimit &&
-                retries <= config.maxParallelLimitRetries
-              ) {
-                logLine(
-                  `Parallel limit hit. Waiting ${Math.round(config.parallelLimitRetryDelayMs / 1000)}s before retry.`,
-                );
-                await sleep(config.parallelLimitRetryDelayMs);
-                continue;
-              }
-
-              done = true;
-              break;
-            }
-
-            const nextRecord = {
-              ...baseRecord,
-              status: result && result.success ? "submitted" : "failed",
-              uuid: result && result.uuid ? result.uuid : null,
-              estimatedTimeSeconds:
-                result && typeof result.estimatedTimeSeconds !== "undefined"
-                  ? result.estimatedTimeSeconds
-                  : null,
-              response: result,
-              completedAt,
-              updatedAt: completedAt,
-            };
-            setRecord(folder.id, item.media.id, nextRecord);
-            item.record = nextRecord;
-            item.status = nextRecord.status;
-            if (nextRecord.uuid) {
-              state.activeStatuses.set(nextRecord.uuid, {
-                folderId: folder.id,
-                mediaId: item.media.id,
-              });
-            }
-            renderQueue();
-            done = true;
-          } catch (error) {
-            const failedAt = new Date().toISOString();
-            const message = String(
-              error && (error.message || error.stack || error),
-            );
-            const status = isParallelLimitMessage(message)
-              ? "parallel_limit"
-              : "failed";
-            if (status === "parallel_limit") retries += 1;
-
-            const nextRecord = {
-              ...baseRecord,
-              status,
-              error: message,
-              parallelLimitRetries: retries,
-              failedAt,
-              updatedAt: failedAt,
-            };
-            setRecord(folder.id, item.media.id, nextRecord);
-            item.record = nextRecord;
-            item.status = status;
-            renderQueue();
-            logLine(`Submit failed for ${item.media.name}: ${message}`);
-
-            if (
-              status === "parallel_limit" &&
-              config.autoRetryOnParallelLimit &&
-              retries <= config.maxParallelLimitRetries
-            ) {
-              await sleep(config.parallelLimitRetryDelayMs);
-              continue;
-            }
-
-            done = true;
-          }
-        }
-
-        if (config.delayBetweenRequestsMs > 0 && !state.stopRequested) {
-          await sleep(config.delayBetweenRequestsMs);
+          await runQueueItem(folder, item);
         }
       }
     } finally {
       state.running = false;
+      if (labsOn() || state.runningFolderId) {
+        state.runningFolderId = null;
+        state.runQueueItems = [];
+        state.retryWhileRunning.clear();
+        state.slotWait = null;
+      }
       updateButtonStates();
       renderQueue();
       logLine(state.stopRequested ? "Queue stopped." : "Queue run finished.");
+    }
+  }
+
+  // Labs: a plan limit fails every later item the same way, so pause instead of burning through the queue.
+  function pauseQueueForPlanLimit(detail) {
+    if (state.stopRequested) return;
+    state.stopRequested = true;
+    logLine(`Plan limit reached, so the queue is paused. Server said: ${detail || "plan limit"}`);
+  }
+
+  // One queue item: submit it and handle the parallel limit. Returns when the item is done or Pause is pressed.
+  async function runQueueItem(folder, item) {
+    if (!item.prompt) {
+      item.status = "skipped";
+      return;
+    }
+
+    const existing = getRecord(folder.id, item.media.id);
+    const existingStatus = existing ? normalizeStatus(existing.status) : "";
+    if (
+      existing &&
+      (["submitted", "running", "completed"].includes(existingStatus) ||
+        (config.skipStartedWithoutUuid && existingStatus === "started"))
+    ) {
+      item.status = existing.status;
+      return;
+    }
+
+    let retries =
+      existing && existing.parallelLimitRetries
+        ? existing.parallelLimitRetries
+        : 0;
+    let done = false;
+    const limitWarn = { since: 0, warnedAt: 0 }; // labs: long parallel-limit waits get a warning
+
+    while (!done) {
+      if (state.stopRequested) break;
+      let slot = null;
+      if (labsOn()) {
+        slot = await waitForVideoSlot(() => state.stopRequested);
+        if (state.stopRequested) break;
+      }
+
+      const startedAt = new Date().toISOString();
+      const baseRecord = {
+        libraryId: config.libraryId,
+        folderId: folder.id,
+        folderName: folder.name,
+        folderTitle: folder.title,
+        imageId: item.media.id,
+        imageName: item.media.name,
+        imageFileName: item.media.fileName,
+        mediaPath: item.media.mediaPath,
+        prompt: item.prompt,
+        aspect: config.aspect,
+        videoLength: config.videoLength,
+        startedAt,
+        updatedAt: startedAt,
+        status: "started",
+        videoId: null,
+        downloadedAt: null,
+        completedAt: null,
+      };
+      setRecord(folder.id, item.media.id, baseRecord);
+      item.record = baseRecord;
+      item.status = "started";
+      renderQueue();
+      logLine(`Submitting ${item.media.name}`);
+
+      try {
+        const result = await api.generateImageVideo(
+          item.media,
+          item.prompt,
+        );
+        const completedAt = new Date().toISOString();
+
+        if (
+          result &&
+          isParallelLimitMessage(result.error || result.message)
+        ) {
+          retries += 1;
+          const nextRecord = {
+            ...baseRecord,
+            status: "parallel_limit",
+            response: result,
+            parallelLimitRetries: retries,
+            updatedAt: completedAt,
+            completedAt,
+          };
+          setRecord(folder.id, item.media.id, nextRecord);
+          item.record = nextRecord;
+          item.status = "parallel_limit";
+          renderQueue();
+
+          if (
+            config.autoRetryOnParallelLimit &&
+            retries <= config.maxParallelLimitRetries
+          ) {
+            logLine(
+              `Parallel limit hit. Waiting ${Math.round(config.parallelLimitRetryDelayMs / 1000)}s before retry.`,
+            );
+            if (labsOn()) warnLongParallelLimit(item, limitWarn);
+            await queueSleep(config.parallelLimitRetryDelayMs);
+            continue;
+          }
+
+          done = true;
+          break;
+        }
+
+        const nextRecord = {
+          ...baseRecord,
+          status: result && result.success ? "submitted" : "failed",
+          uuid: result && result.uuid ? result.uuid : null,
+          estimatedTimeSeconds:
+            result && typeof result.estimatedTimeSeconds !== "undefined"
+              ? result.estimatedTimeSeconds
+              : null,
+          response: result,
+          completedAt,
+          updatedAt: completedAt,
+        };
+        if (labsOn() && nextRecord.status === "failed" && result && typeof result === "object") {
+          const detail = result.error || result.msg || result.message;
+          if (detail) nextRecord.errorDetail = result.badWord ? `${detail} (blocked word: ${result.badWord})` : String(detail);
+        }
+        setRecord(folder.id, item.media.id, nextRecord);
+        item.record = nextRecord;
+        item.status = nextRecord.status;
+        if (nextRecord.uuid) {
+          state.activeStatuses.set(nextRecord.uuid, {
+            folderId: folder.id,
+            mediaId: item.media.id,
+          });
+        }
+        renderQueue();
+        if (labsOn()) {
+          noteForcedSlotResult(slot, nextRecord.status === "submitted");
+          if (nextRecord.status === "failed") logLine(`Submit failed for ${item.media.name}: ${nextRecord.errorDetail || "the server did not accept the request"}`);
+          if (result && result.isUserLimit) pauseQueueForPlanLimit(nextRecord.errorDetail);
+        }
+        done = true;
+      } catch (error) {
+        const failedAt = new Date().toISOString();
+        const message = String(
+          error && (error.message || error.stack || error),
+        );
+        const status = isParallelLimitMessage(message)
+          ? "parallel_limit"
+          : "failed";
+        if (status === "parallel_limit") retries += 1;
+
+        const nextRecord = {
+          ...baseRecord,
+          status,
+          error: message,
+          parallelLimitRetries: retries,
+          failedAt,
+          updatedAt: failedAt,
+        };
+        const body = labsOn() ? parseJsonBody(error) : null;
+        const detail = labsOn() ? serverMessageFromText(message) : "";
+        if (detail) nextRecord.errorDetail = detail;
+        setRecord(folder.id, item.media.id, nextRecord);
+        item.record = nextRecord;
+        item.status = status;
+        renderQueue();
+        logLine(`Submit failed for ${item.media.name}: ${labsOn() ? detail || message.split("\n")[0] : message}`);
+        if (labsOn() && body && body.isUserLimit) pauseQueueForPlanLimit(detail);
+
+        if (
+          status === "parallel_limit" &&
+          config.autoRetryOnParallelLimit &&
+          retries <= config.maxParallelLimitRetries
+        ) {
+          if (labsOn()) warnLongParallelLimit(item, limitWarn);
+          await queueSleep(config.parallelLimitRetryDelayMs);
+          continue;
+        }
+
+        done = true;
+      }
+    }
+
+    if (config.delayBetweenRequestsMs > 0 && !state.stopRequested) {
+      await queueSleep(config.delayBetweenRequestsMs);
+    }
+  }
+
+  // Labs: the queue keeps waiting on the 5-video limit, but says so every 15 minutes.
+  function warnLongParallelLimit(item, limitWarn) {
+    const now = Date.now();
+    if (!limitWarn.since) limitWarn.since = now;
+    const waitedMs = now - limitWarn.since;
+    if (waitedMs >= 15 * 60 * 1000 && now - limitWarn.warnedAt >= 15 * 60 * 1000) {
+      limitWarn.warnedAt = now;
+      logLine(`${item.media.name} has waited ${Math.round(waitedMs / 60000)} min on the 5-video limit. Check My AI Videos for stuck jobs; the queue keeps waiting.`);
     }
   }
 
@@ -4107,26 +4751,40 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     const existing = state.history.records[key];
     if (!existing) throw new Error(`No history record for media ${mediaId} in folder ${folder.id}`);
     const st = normalizeStatus(existing.status);
-    if (st !== "failed" && st !== "parallel_limit") throw new Error(`Item ${mediaId} is not failed (status: ${existing.status || "idle"})`);
+    const stale = isStaleStartedRecord(existing);
+    if (st !== "failed" && st !== "parallel_limit" && !stale) throw new Error(`Item ${mediaId} is not failed (status: ${existing.status || "idle"})`);
     const next = resetRecordForRetry(existing);
     if (next) {
       delete next.error;
       delete next.response;
       delete next.statusPayload;
       delete next.failedAt;
+      if (labsOn()) delete next.errorDetail;
     }
     state.history.records[key] = next;
     saveHistory();
-    logLine(`Retrying failed item ${existing.imageName || mediaId} — reason: ${getFailureReason(existing) || st}`);
+    logLine(`Retrying failed item ${existing.imageName || mediaId} — reason: ${stale ? "no answer was saved for the earlier request" : getFailureReason(existing) || st}`);
     if (folder && state.items.length) {
       state.queue = buildQueue(folder, state.items);
       renderQueue();
     }
     if (!state.running) {
       await runQueue();
+    } else if (labsOn()) {
+      queueRetryDuringRun(folder, [mediaId]);
     } else {
       logLine(`Queue running — item ${mediaId} will be retried after current item finishes.`);
     }
+  }
+
+  // Labs: the running loop only moves forward, so remember retries and run them at the end of the pass.
+  function queueRetryDuringRun(folder, mediaIds) {
+    if (String(folder.id) !== String(state.runningFolderId)) {
+      logLine(`The queue is running in another folder. Press Start generating here after it finishes to retry ${mediaIds.length} item(s).`);
+      return;
+    }
+    mediaIds.forEach((id) => state.retryWhileRunning.add(String(id)));
+    logLine(`${mediaIds.length} item(s) will be retried in this run. Items the queue already passed run at the end.`);
   }
   async function retryAllFailed() {
     const folder = getSelectedFolder();
@@ -4135,13 +4793,13 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       const rec = state.history.records[k];
       if (!rec || String(rec.folderId) !== String(folder.id)) return false;
       const s = normalizeStatus(rec.status);
-      return s === "failed" || s === "parallel_limit";
+      return s === "failed" || s === "parallel_limit" || isStaleStartedRecord(rec);
     });
     if (!failedKeys.length) throw new Error("No failed items to retry in this folder.");
     for (const key of failedKeys) {
       const rec = state.history.records[key];
       const next = resetRecordForRetry(rec);
-      if (next) { delete next.error; delete next.response; delete next.statusPayload; delete next.failedAt; }
+      if (next) { delete next.error; delete next.response; delete next.statusPayload; delete next.failedAt; if (labsOn()) delete next.errorDetail; }
       state.history.records[key] = next;
     }
     saveHistory();
@@ -4151,10 +4809,27 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       renderQueue();
     }
     if (!state.running) await runQueue();
+    else if (labsOn()) queueRetryDuringRun(folder, failedKeys.map((key) => state.history.records[key] && state.history.records[key].imageId).filter((id) => id != null));
     else logLine(`Queue running — ${failedKeys.length} item(s) queued for retry.`);
   }
 
+  // Stable: every call runs a pass. Labs: one pass at a time, and history is saved once per pass.
+  let _pollPromise = null;
   async function pollStatuses() {
+    if (!labsOn()) return pollStatusesPass();
+    if (_pollPromise) return _pollPromise;
+    _pollPromise = (async () => {
+      try {
+        await pollStatusesPass();
+      } finally {
+        flushHistory();
+        _pollPromise = null;
+      }
+    })();
+    return _pollPromise;
+  }
+
+  async function pollStatusesPass() {
     const pendingRecords = Object.values(state.history.records).filter(
       (record) => {
         const status = normalizeStatus(record.status);
@@ -4167,9 +4842,10 @@ async function downloadQueueCompleted({ onlyRemaining }) {
 
     for (const record of pendingRecords) {
       try {
-        const statusPayload = await api.getStatus(record.uuid);
+        const statusPayload = await api.getStatus(record.uuid, { estimate: labsOn() });
         const status = normalizeStatus(statusPayload.status);
         let mapped = "running";
+        let labsReason = "";
 
         if (
           status === "succeeded" ||
@@ -4182,6 +4858,12 @@ async function downloadQueueCompleted({ onlyRemaining }) {
           mapped = "completed";
         } else if (status === "failed" || status === "error") {
           mapped = "failed";
+        } else if (labsOn() && (status === "canceled" || status === "cancelled" || status === "absent")) {
+          // Labs: the site treats these as final too. Without this they poll as "running" forever.
+          mapped = "failed";
+          labsReason = status === "absent"
+            ? "The server no longer has this job (ABSENT). Retry to make the video again."
+            : "The job was canceled on the server (CANCELED).";
         } else if (
           status === "queued" ||
           status === "pending" ||
@@ -4190,21 +4872,41 @@ async function downloadQueueCompleted({ onlyRemaining }) {
           mapped = "running";
         }
 
-        const videoId = mapped === "completed" ? extractVideoIdFromStatus(statusPayload) : record.videoId || null;
+        let base = record;
+        if (labsOn()) {
+          // The record may have been retried or cleared while this request was in flight.
+          const latest = getRecord(record.folderId, record.imageId);
+          if (!latest || latest.uuid !== record.uuid) continue;
+          base = latest;
+        }
+        const videoId = mapped === "completed" ? extractVideoIdFromStatus(statusPayload) : base.videoId || null;
         if (mapped === "completed" && videoId) console.log("[VE] videoId captured", record.uuid, videoId, statusPayload);
         if (mapped === "completed" && !videoId) console.warn("[VE] videoId MISSING for completed", record.uuid, statusPayload);
         const nextRecord = {
-          ...record,
+          ...base,
           status: mapped,
           statusPayload,
-          videoId: videoId || record.videoId || null,
-          completedAt: mapped === "completed" ? (record.completedAt || new Date().toISOString()) : record.completedAt || null,
-          downloadedAt: record.downloadedAt || null,
+          videoId: videoId || base.videoId || null,
+          completedAt: mapped === "completed" ? (base.completedAt || new Date().toISOString()) : base.completedAt || null,
+          downloadedAt: base.downloadedAt || null,
           updatedAt: new Date().toISOString(),
         };
-        setRecord(record.folderId, record.imageId, nextRecord);
+        if (labsOn()) {
+          delete nextRecord.pollFailures;
+          delete nextRecord.pollFailingSince;
+          // completedAt holds the submit time for queue items; finishedAt is when the video was done.
+          if (mapped === "completed" && !base.finishedAt) nextRecord.finishedAt = new Date().toISOString();
+          if (labsReason) {
+            nextRecord.error = labsReason;
+            nextRecord.errorDetail = labsReason;
+            nextRecord.failedAt = new Date().toISOString();
+            logLine(`${base.imageName || base.uuid}: ${labsReason}`);
+          }
+        }
+        setRecord(record.folderId, record.imageId, nextRecord, { defer: true });
       } catch (error) {
-        logLine(`Status poll failed for ${record.uuid}: ${error.message}`);
+        if (labsOn()) await handleStatusPollFailure(record, error);
+        else logLine(`Status poll failed for ${record.uuid}: ${error.message}`);
       }
     }
 
@@ -4233,7 +4935,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
                     ...record,
                     videoId: vid,
                     updatedAt: new Date().toISOString()
-                  });
+                  }, { defer: true });
                   logLine(`Matched video ID ${vid} for ${record.imageName || record.uuid} via library`);
                 }
               }
@@ -4250,6 +4952,48 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       state.queue = buildQueue(folder, state.items);
       renderQueue();
     }
+  }
+
+  // Labs: a status call that keeps failing is logged on the 1st and every 10th failure. After 20+ failures
+  // over 30 min with HTTP 500/404 (the server's answer for a job it doesn't know), check My AI Videos
+  // before closing the item, so it ends as "completed" or a retryable "failed" instead of polling forever.
+  async function handleStatusPollFailure(record, error) {
+    const latest = getRecord(record.folderId, record.imageId);
+    if (!latest || latest.uuid !== record.uuid) return;
+    const nowIso = new Date().toISOString();
+    const failures = Number(latest.pollFailures || 0) + 1;
+    const since = latest.pollFailingSince || nowIso;
+    const message = String((error && error.message) || error || "").split("\n")[0].slice(0, 160);
+    const name = latest.imageName || latest.uuid;
+    if (failures === 1 || failures % 10 === 0) {
+      logLine(`Status check failed for ${name} (${failures}x in a row): ${message}`);
+    }
+    const failingForMs = Date.now() - (Date.parse(since) || Date.now());
+    const httpStatus = Number(error && error.status);
+    if (failures >= 20 && failingForMs >= POLL_GIVE_UP_MS && (httpStatus === 500 || httpStatus === 404)) {
+      let found = null;
+      try {
+        found = await findRecentAiVideo(latest.uuid);
+      } catch {
+        found = null;
+      }
+      const next = { ...latest, updatedAt: nowIso };
+      delete next.pollFailures;
+      delete next.pollFailingSince;
+      if (found && !found.isPending && (found.mediaPath || normalizeStatus(found.status) === "completed")) {
+        Object.assign(next, { status: "completed", videoId: String(found.id), finishedAt: nowIso, completedAt: latest.completedAt || nowIso });
+        logLine(`${name}: its status check kept failing, but the video is in My AI Videos (#${found.id}), so it is marked completed.`);
+      } else if (found) {
+        logLine(`${name}: its status check keeps failing, but the video is still rendering in My AI Videos. Still waiting.`);
+      } else {
+        const reason = `Status check failed ${failures} times over ${Math.round(failingForMs / 60000)} min (${message}), and the video is not among the newest My AI Videos.`;
+        Object.assign(next, { status: "failed", error: reason, errorDetail: reason, failedAt: nowIso });
+        logLine(`${name}: marked failed. ${reason}`);
+      }
+      setRecord(latest.folderId, latest.imageId, next, { defer: true });
+      return;
+    }
+    setRecord(latest.folderId, latest.imageId, { ...latest, pollFailures: failures, pollFailingSince: since }, { defer: true });
   }
 
   /* ------------------------------------------------------------------
@@ -4439,11 +5183,11 @@ async function downloadQueueCompleted({ onlyRemaining }) {
             return `
               <div class="ve-char-row" data-character-id="${id}">
                 <div class="ve-thumb" title="${mediaId ? `Reference image ${escapeAttr(mediaId)}` : "Created by its first line"}" style="${thumb ? `background-image:url('${escapeAttr(thumb)}')` : ""}"></div>
-                <div class="ve-char-tag"><input class="ve-input" data-field="tag" value="${escapeAttr(character.tag || "")}" placeholder="name" aria-label="Character tag" spellcheck="false" /></div>
+                <div class="ve-char-tag"><input class="ve-input" data-field="tag" value="${attrText(character.tag || "")}" placeholder="name" aria-label="Character tag" spellcheck="false" /></div>
                 <select class="ve-select" data-field="mediaId" aria-label="Reference image">
                   <option value="">Created by its first line</option>${extra}${imageOptions}
                 </select>
-                <input class="ve-input" data-field="description" value="${escapeAttr(character.description || "")}" placeholder="optional — replaces @tag (default: its name)" aria-label="Description that replaces the tag" />
+                <input class="ve-input" data-field="description" value="${attrText(character.description || "")}" placeholder="optional — replaces @tag (default: its name)" aria-label="Description that replaces the tag" />
                 <button class="ve-button ghost ve-icon-button" type="button" data-remove-character="${id}" title="Remove character (${count} line${count === 1 ? "" : "s"} use it)"><i class="bi bi-x-lg"></i></button>
               </div>`;
           })
@@ -4910,6 +5654,12 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     const tag = `#${padIndex(item.index)}`;
     let attempts = 0;
     while (!state.gen.stopRequested) {
+      let slot = null;
+      if (labsOn()) {
+        // Labs: wait for one of the 5 video slots instead of sending a request the server rejects.
+        slot = await waitForVideoSlot(() => state.gen.stopRequested);
+        if (state.gen.stopRequested) break;
+      }
       attempts += 1;
       updateGenItem(item, "video", { status: "submitting", error: "" });
       try {
@@ -4922,6 +5672,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
           const message = (result && (result.error || result.message || result.msg)) || "The site did not accept the video request.";
           throw Object.assign(new Error(message), { final: !isParallelLimitMessage(message) });
         }
+        if (labsOn()) noteForcedSlotResult(slot, true);
         const now = new Date().toISOString();
         updateGenItem(item, "video", { status: "running", uuid: result.uuid, submittedAt: now });
         setRecord(run.folderId, item.image.mediaId, {
@@ -5047,6 +5798,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
   async function runGenerator(run) {
     state.gen.running = true;
     state.gen.stopRequested = false;
+    if (labsOn()) state.slotWaitOff = false;
     updateButtonStates();
     renderGenRun();
     const label = run.mode === "image2video" ? "Image → Video" : "Image maker";
@@ -5168,6 +5920,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
 
   function renderGenRun() {
     if (!els.genBody) return;
+    updateTitleProgress();
     const run = state.gen.run;
     const counts = getGenCounts(run);
     els.genStatTotal.textContent = String(counts.total);
@@ -5447,7 +6200,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     els.downloadRemainingBtn.disabled = state.running || state.uploadInProgress || state.downloadInProgress || queueCounts.remaining === 0;
     const failedCountForBtn = state.queue.filter((item) => {
       const s = normalizeStatus(item.status);
-      return s === "failed" || s === "parallel_limit";
+      return s === "failed" || s === "parallel_limit" || isStaleStartedRecord(item.record);
     }).length;
     if (els.retryAllFailedBtn) {
       els.retryAllFailedBtn.disabled = state.running || state.uploadInProgress || state.downloadInProgress || failedCountForBtn === 0;
@@ -5487,7 +6240,68 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       });
       if (genBusy) els.loadMediaBtn.disabled = true;
     }
+    // The version mode only changes while nothing is running, so a run never mixes old and new behaviour.
+    if (els.versionSelect) {
+      els.versionSelect.disabled =
+        state.running || state.uploadInProgress || state.downloadInProgress || genBusy || state.timelineExport.running;
+    }
+    if (els.retryUploadsBtn) {
+      const failedUploads = state.failedUploadFiles.length;
+      els.retryUploadsBtn.disabled = !failedUploads || state.uploadInProgress || state.running || state.downloadInProgress;
+      if (els.retryUploadsLabel) els.retryUploadsLabel.textContent = failedUploads ? `Retry ${failedUploads} failed` : "Retry failed uploads";
+    }
     updateMasterPromptControls();
+    updateLabsChrome();
+  }
+
+  // Labs: progress in the tab title, activity dots on the step tabs, and a note when the queue runs in another folder.
+  function updateLabsChrome() {
+    updateTitleProgress();
+    els.tabs.forEach((tab) => {
+      const name = tab.dataset.tab;
+      const busy =
+        labsOn() &&
+        ((name === "queue" && (state.running || state.gen.running)) ||
+          (name === "downloads" && state.downloadInProgress) ||
+          (name === "timeline" && state.timelineExport.running) ||
+          (name === "library" && state.uploadInProgress));
+      tab.classList.toggle("has-activity", Boolean(busy));
+    });
+    if (els.contextRun) {
+      let note = "";
+      if (labsOn() && state.running) {
+        const runFolder = state.folders.find((folder) => String(folder.id) === String(state.runningFolderId));
+        note = runFolder && String(runFolder.id) !== String(state.selectedFolderId)
+          ? ` · ▶ queue running in “${runFolder.title || runFolder.name}”`
+          : " · ▶ queue running";
+      } else if (labsOn() && state.gen.running) {
+        note = " · ▶ generating";
+      }
+      els.contextRun.textContent = note;
+    }
+  }
+
+  function updateTitleProgress() {
+    const base = document.title.replace(TITLE_PREFIX_RE, "");
+    let label = "";
+    if (labsOn()) {
+      if (state.running && state.runQueueItems.length) {
+        const done = state.runQueueItems.filter((item) => {
+          const record = getRecord(state.runningFolderId, item.media.id);
+          return record && normalizeStatus(record.status) === "completed";
+        }).length;
+        label = `▶ ${done}/${state.runQueueItems.length}`;
+      } else if (state.gen.running && state.gen.run) {
+        const counts = getGenCounts(state.gen.run);
+        label = state.gen.run.mode === "image2video" ? `▶ ${counts.videos}/${counts.total}` : `▶ ${counts.images}/${counts.total}`;
+      } else if (state.downloadInProgress) {
+        label = "⬇";
+      } else if (state.timelineExport.running) {
+        label = `⏺ ${Math.round(Number(state.timelineExport.percent) || 0)}%`;
+      }
+    }
+    const next = label ? `[VE ${label}] ${base}` : base;
+    if (document.title !== next) document.title = next;
   }
 
   async function handleAction(action) {
@@ -5637,7 +6451,8 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       });
     });
     els.clearVideoFiltersBtn.addEventListener("click", () => {
-      const todayStr = new Date().toISOString().slice(0, 10);
+      // Labs: "Clear filters" clears the date range too (stable resets it to today's UTC date).
+      const todayStr = labsOn() ? "" : new Date().toISOString().slice(0, 10);
       state.videoFilters = {
         query: "",
         dateFrom: todayStr,
@@ -5696,7 +6511,8 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     els.downloadCompletedBtn.addEventListener("click", () => handleAction(() => downloadQueueCompleted({ onlyRemaining: false })));
     els.downloadRemainingBtn.addEventListener("click", () => handleAction(() => downloadQueueCompleted({ onlyRemaining: true })));
     els.stopDownloadsBtn.addEventListener("click", () => {
-      state.stopRequested = true;
+      if (labsOn()) state.downloadStopRequested = true;
+      else state.stopRequested = true;
       logLine(
         "Download stop requested. Current browser download will finish starting first.",
       );
@@ -5786,7 +6602,8 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     // Queue pager — 150/page, UI-only
     if (els.queuePrev) els.queuePrev.addEventListener("click", () => { if (state.queuePage > 0) { state.queuePage--; renderQueue(); } });
     if (els.queueNext) els.queueNext.addEventListener("click", () => {
-      const totalPages = Math.max(1, Math.ceil(state.queue.length / Number(state.queuePageSize || 150)));
+      const shown = labsOn() ? state.queueViewTotal : state.queue.length;
+      const totalPages = Math.max(1, Math.ceil(shown / Number(state.queuePageSize || 150)));
       if (state.queuePage < totalPages - 1) { state.queuePage++; renderQueue(); }
     });
     if (els.timelineLoadBtn) els.timelineLoadBtn.addEventListener("click", () => handleAction(loadTimelineVideos));
@@ -5872,6 +6689,60 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       if (!button || state.gen.running) return;
       useImageAsCharacter(button.dataset.useCharacter, button.dataset.thumb);
     });
+
+    // —— Version mode ("Try new features") and its labs-only controls ——
+    if (els.versionSelect) {
+      els.versionSelect.addEventListener("change", () => applyVersionMode(els.versionSelect.value));
+    }
+    if (els.uploadSkipExisting) {
+      els.uploadSkipExisting.addEventListener("change", () => {
+        config.uploadSkipExisting = Boolean(els.uploadSkipExisting.checked);
+        saveUiState({ uploadSkipExisting: config.uploadSkipExisting });
+      });
+    }
+    if (els.retryUploadsBtn) {
+      els.retryUploadsBtn.addEventListener("click", () => {
+        if (!state.failedUploadFiles.length) return;
+        const files = state.failedUploadFiles;
+        state.failedUploadFiles = [];
+        setSelectedFiles(files);
+        handleAction(uploadSelectedFiles);
+      });
+    }
+    if (els.autoDownload) {
+      els.autoDownload.addEventListener("change", () => {
+        config.autoDownload = Boolean(els.autoDownload.checked);
+        config.autoDownloadSince = config.autoDownload ? new Date().toISOString() : "";
+        saveUiState({ autoDownload: config.autoDownload, autoDownloadSince: config.autoDownloadSince });
+        logLine(config.autoDownload ? "Auto-download on: videos of the active folder that finish from now on are downloaded." : "Auto-download off.");
+      });
+    }
+    if (els.queueFilter) {
+      els.queueFilter.addEventListener("change", () => {
+        state.queueFilter = els.queueFilter.value || "all";
+        state.queuePage = 0;
+        renderQueue();
+      });
+    }
+    if (els.copyLogBtn) {
+      els.copyLogBtn.addEventListener("click", async () => {
+        const ok = await copyTextToClipboard(els.log.textContent || "");
+        if (els.copyLogLabel) {
+          els.copyLogLabel.textContent = ok ? "Copied!" : "Copy failed";
+          setTimeout(() => { els.copyLogLabel.textContent = "Copy log"; }, 2000);
+        }
+      });
+    }
+    if (els.clearLogBtn) els.clearLogBtn.addEventListener("click", () => { els.log.textContent = ""; });
+    if (els.exportHistoryBtn) els.exportHistoryBtn.addEventListener("click", () => handleAction(async () => exportHistoryBackup()));
+    if (els.importHistoryBtn && els.importHistoryInput) {
+      els.importHistoryBtn.addEventListener("click", () => els.importHistoryInput.click());
+      els.importHistoryInput.addEventListener("change", () => {
+        const file = els.importHistoryInput.files && els.importHistoryInput.files[0];
+        els.importHistoryInput.value = "";
+        if (file) handleAction(() => importHistoryBackup(file));
+      });
+    }
   }
 
   async function bootstrap() {
@@ -5883,6 +6754,21 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     });
     const savedUi = loadUiState();
     applyTheme(savedUi.theme || "videoexpress");
+    // Version mode first, so everything below starts in the chosen mode. Stable unless the user picked labs.
+    applyVersionMode(savedUi.versionMode, { persist: false, render: false, log: false });
+    if (typeof savedUi.uploadSkipExisting === "boolean") config.uploadSkipExisting = savedUi.uploadSkipExisting;
+    if (typeof savedUi.autoDownload === "boolean") config.autoDownload = savedUi.autoDownload;
+    if (typeof savedUi.autoDownloadSince === "string") config.autoDownloadSince = savedUi.autoDownloadSince;
+    if (labsOn()) {
+      // Labs: no demo placeholder text while the folder list loads.
+      if (els.contextName) els.contextName.textContent = "Loading folders…";
+      if (els.contextId) els.contextId.textContent = "";
+      if (els.contextCount) els.contextCount.textContent = "\u2014";
+      if (els.contextDone) els.contextDone.textContent = "\u2014";
+      if (els.uploadFolderName) els.uploadFolderName.textContent = "";
+    }
+    if (els.uploadSkipExisting) els.uploadSkipExisting.checked = Boolean(config.uploadSkipExisting);
+    if (els.autoDownload) els.autoDownload.checked = Boolean(config.autoDownload);
     if (savedUi.aspect) config.aspect = savedUi.aspect;
     if (savedUi.videoLength) config.videoLength = clampVideoLength(savedUi.videoLength);
     if (typeof savedUi.mode === "string") config.mode = savedUi.mode;
@@ -5948,7 +6834,8 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     if (typeof savedUi.autoExpireSessions === "boolean") config.autoExpireSessions = savedUi.autoExpireSessions;
     if (typeof savedUi.sessionExpiryDays === "number" && savedUi.sessionExpiryDays >= 1) config.sessionExpiryDays = Math.max(1, Math.min(90, Number(savedUi.sessionExpiryDays)));
     if (savedUi.onboardingDismissed && els.onboarding) els.onboarding.classList.add("ve-hidden");
-    const todayStr = new Date().toISOString().slice(0, 10);
+    // Labs: "today" is the local date (toISOString() gives the UTC date, a day off in the evening or early morning).
+    const todayStr = labsOn() ? localDateString() : new Date().toISOString().slice(0, 10);
     state.videoFilters.dateFrom = todayStr;
     state.videoFilters.dateTo = todayStr;
 
@@ -6046,12 +6933,48 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       checkExpiredSessions().catch(e => console.warn("[VE] expiry check failed", e));
     }, 6 * 60 * 60 * 1000);
     document.addEventListener("visibilitychange", () => { if (!document.hidden) checkExpiredSessions().catch(()=>{}); });
+    // Labs: skip a tick while the previous one is still polling (stable starts a new pass every tick).
+    let statusTickBusy = false;
     setInterval(() => {
+      if (labsOn() && statusTickBusy) return;
+      statusTickBusy = true;
       pollStatuses()
         .then(() => (state.gen.running ? null : pollGenRun()))
-        .catch((error) => console.warn("Status poll failed", error));
+        .then(() => {
+          if (labsOn()) maybeAutoDownload().catch((error) => console.warn("Auto-download failed", error));
+        })
+        .catch((error) => console.warn("Status poll failed", error))
+        .finally(() => {
+          statusTickBusy = false;
+        });
     }, config.pollIntervalMs);
+    window.addEventListener("pagehide", () => {
+      if (labsOn()) flushHistory();
+    });
     logLine("Manager ready.");
+    if (labsOn()) logLine("Try new features is on. The Log tab lists what changed.");
+  }
+
+  if (typeof window !== "undefined") {
+    window.__ve_test = Object.assign(window.__ve_test || {}, {
+      labs: {
+        applyVersionMode,
+        labsOn,
+        countActiveVideoJobs,
+        isStaleStartedRecord,
+        formatJobTiming,
+        serverMessageFromText,
+        getFailureReason,
+        localDateString,
+        queueItemCategory,
+        trimHistoryPayloads,
+        pollStatuses,
+        maybeAutoDownload,
+        logLine,
+        getState: () => state,
+        getConfig: () => config,
+      },
+    });
   }
 
   bootstrap().catch((error) => {
