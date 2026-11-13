@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         VideoExpress Library Manager
 // @namespace    https://app.videoexpress.ai/
-// @version      0.9.5
-// @description  Manage folders, upload images, and batch convert images to videos inside VideoExpress AI.
+// @version      0.9.6
+// @description  Manage folders, upload images, batch generate images from prompts, and batch convert images to videos inside VideoExpress AI.
 // @match        https://app.videoexpress.ai/*
 // @grant        none
 // @run-at       document-idle
@@ -55,11 +55,33 @@
     },
     autoExpireSessions: true,
     sessionExpiryDays: 30,
+    // Generate step mode: "image2video" (prompts -> image -> video), "image" (prompts -> images),
+    // "video" (the folder's existing images -> videos).
+    mode: "image2video",
+    imageType: "photorealistic",
+    enhanceImagePrompt: true,
+    enhanceVideoPrompt: true,
+    // Consistent character: "off", "first" (image 1 is the character), "reference" (picked images).
+    characterMode: "off",
+    referenceMediaId: "",
+    referenceMediaId2: "",
+    imageConcurrency: 3,
+    imageTimeoutMs: 6 * 60 * 1000,
+    renameOutputs: true,
+    moveVideosToFolder: true,
+    imagePrompts: "",
+    videoPrompts: "",
   };
+
+  const MAX_VIDEO_LENGTH = 10; // The server caps AI videos at 10 seconds.
+  const MIN_VIDEO_LENGTH = 3;
+  const GENERATOR_NAME = "create_from_prompt";
+  const PREVIEW_BASE_URL = "https://user-assets.renderplatform.com/preview/";
 
   const HISTORY_KEY = "videoexpress.manager.history.v1";
   const UI_STATE_KEY = "videoexpress.manager.ui-state.v1";
   const SESSION_META_KEY = "videoexpress.manager.sessions.v1";
+  const GEN_RUN_KEY = "videoexpress.manager.generator-run.v1";
   let _queryUuidSupported = null; // cache probe for server-side uuid query support (I3)
 
   const state = {
@@ -107,6 +129,12 @@
       pollTimer: null,
     },
     timelineVideos: [],
+    gen: {
+      run: loadGenRun(),
+      running: false,
+      stopRequested: false,
+    },
+    referenceImages: [],
   };
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -219,6 +247,24 @@
   function saveUiState(patch) {
     const next = { ...loadUiState(), ...patch };
     localStorage.setItem(UI_STATE_KEY, JSON.stringify(next, null, 2));
+  }
+
+  function loadGenRun() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(GEN_RUN_KEY) || "null");
+      return parsed && Array.isArray(parsed.items) ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function saveGenRun() {
+    if (!state.gen.run) {
+      localStorage.removeItem(GEN_RUN_KEY);
+      return;
+    }
+    state.gen.run.updatedAt = new Date().toISOString();
+    localStorage.setItem(GEN_RUN_KEY, JSON.stringify(state.gen.run));
   }
   // —— Sessions — unique naming + 30-day auto-expiry (only locally created) ——
   function loadSessions() {
@@ -768,7 +814,10 @@
         enhanceHumanFace: "0",
         isTalkingVideoFromText: "0",
         isNarrationVideo: "0",
-        enhanceVideoPrompt: "1",
+        enhanceVideoPrompt:
+          options.enhanceVideoPrompt === undefined || options.enhanceVideoPrompt
+            ? "1"
+            : "0",
         videoOnly: "0",
         speed: "",
         generatorName: "create_from_prompt",
@@ -788,6 +837,89 @@
       return getJson(
         `/ai/api/status/${uuid}?_=${cacheBust}`,
         `Load status ${uuid}`,
+      );
+    },
+
+    // Rewrites a prompt with the site's enhancer. kind: "image" or "consistent_character".
+    async extendPrompt(kind, prompt, options = {}) {
+      const params = new URLSearchParams({
+        prompt,
+        imageType: options.type || "photorealistic",
+      });
+      if (kind === "consistent_character") {
+        params.set("imageMediaId", String(options.mediaId || ""));
+        params.set("imageMediaId2", String(options.mediaId2 || ""));
+      }
+      const result = await postFormJson(
+        `/ai/api/extend_prompt/${kind}`,
+        params.toString(),
+        "Enhance prompt",
+      );
+      return result && result.prompt ? String(result.prompt) : prompt;
+    },
+
+    async generateImage(prompt, options = {}) {
+      const params = new URLSearchParams({
+        prompt,
+        enhancePrompt: "0",
+        type: options.type || "photorealistic",
+        uuid: "",
+        mediaId: "0",
+        seed: "",
+        aspect: options.aspect || config.aspect,
+        generatorName: GENERATOR_NAME,
+      });
+      return postFormJson("/ai/api/generate_image", params.toString(), "Generate image");
+    },
+
+    // Keeps the character from the reference image(s): the site's "Use Consistent Character".
+    async generateConsistentImage(prompt, options = {}) {
+      const params = new URLSearchParams({
+        prompt,
+        type: options.type || "photorealistic",
+        mediaId: String(options.mediaId || 0),
+        mediaId2: String(options.mediaId2 || 0),
+        aspect: options.aspect || config.aspect,
+        generatorName: GENERATOR_NAME,
+      });
+      return postFormJson(
+        "/ai/api/generate_image_consistent_character",
+        params.toString(),
+        "Generate consistent character image",
+      );
+    },
+
+    // Saves a finished generated image to "My AI Images". Returns HTTP 400 "Image is empty." until ready.
+    async saveGeneratedImage(uuid) {
+      const params = new URLSearchParams({ uuid, isShared: "0", generatorName: GENERATOR_NAME });
+      return postFormJson("/ai/api/save_generated_image", params.toString(), "Save image");
+    },
+
+    async renameItem(mediaId, name) {
+      const params = new URLSearchParams({ name });
+      return postFormJson(`/library/edit_item/${mediaId}`, params.toString(), "Rename item");
+    },
+
+    async moveItem(mediaId, categoryId) {
+      const params = new URLSearchParams({ categoryId: String(categoryId) });
+      return postFormJson(`/library/move_item/${mediaId}`, params.toString(), "Move item");
+    },
+
+    // Newest-first page of a folder (get_media sorted by id desc).
+    async getRecentMedia(folderId, page = 1) {
+      const params = new URLSearchParams({
+        categoryId: String(folderId),
+        page: String(page),
+        start: String((page - 1) * config.pageSize),
+        limit: String(config.pageSize),
+        query: "",
+        orderBy: "id",
+        orderDir: "desc",
+        filter: "",
+      });
+      return getJson(
+        `/api/library/get_media/${config.libraryId}?${params.toString()}`,
+        "Load recent media",
       );
     },
     async renderTimeline(bricks, options = {}) {
@@ -1463,6 +1595,43 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
   /* helper toolbar under context bar */
   .ve-toolbar { display:flex; gap:6px; margin-bottom:8px; }
   .ve-toolbar .ve-button{ flex:1; }
+  /* Generate modes */
+  .ve-mode-switch { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; margin:0 0 10px; }
+  .ve-mode-btn { display:flex; flex-direction:column; align-items:flex-start; gap:2px; background:#FFFFFF; color:#4B5162; border:1px solid #E6E8EF; border-radius:9px; padding:8px 10px; cursor:pointer; text-align:left; transition:all .14s ease; box-shadow:0 1px 2px rgba(17,24,39,0.04); }
+  .ve-mode-btn i { color:#6B6760; font-size:14px; }
+  .ve-mode-btn strong { font-family:'Barlow Condensed',sans-serif; font-size:11.5px; font-weight:700; letter-spacing:0.06em; text-transform:uppercase; color:#111827; }
+  .ve-mode-btn span { font-family:'Instrument Sans',sans-serif; font-size:10.5px; color:#6B7280; }
+  .ve-mode-btn:hover:not(:disabled) { border-color:#DADDE3; background:#F9FAFB; }
+  .ve-mode-btn.active { border-color:var(--cut-orange); box-shadow:0 0 0 3px rgba(111,92,207,0.12); }
+  .ve-mode-btn.active i { color:var(--cut-orange); }
+  .ve-mode-btn:disabled { opacity:.55; cursor:not-allowed; }
+  .ve-prompt-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .ve-prompt-grid.single { grid-template-columns:1fr; }
+  .ve-prompt-box { min-height:180px; white-space:pre; overflow-x:auto; }
+  .ve-count { display:inline-block; min-width:18px; margin-left:4px; padding:0 5px; border-radius:999px; background:#F3F0FF; color:var(--cut-orange); text-align:center; letter-spacing:0; }
+  #ve-prompt-check.is-warning { color:#B45309; font-weight:600; }
+  .ve-options { display:grid; grid-template-columns:1fr 1fr; gap:6px; }
+  .ve-check { display:flex; align-items:flex-start; gap:8px; cursor:pointer; background:#F9FAFB; border:1px solid #E6E8EF; border-radius:6px; padding:7px 9px; font-family:'Instrument Sans',sans-serif; font-size:11.5px; color:#374151; }
+  .ve-check b { color:#111827; font-weight:600; }
+  .ve-check .ve-checkbox { flex:0 0 15px; margin-top:1px; }
+  .ve-reference-preview { display:flex; gap:8px; }
+  .ve-reference-preview .ve-thumb { width:96px; height:54px; flex-basis:96px; }
+  .ve-cell-prompt { word-break:break-word; }
+  .ve-cell-prompt .ve-muted { display:block; margin-top:3px; font-size:11px; }
+  .ve-error-line { display:block; margin-top:4px; color:#B45309; font-size:10.5px; word-break:break-word; }
+  .ve-use-character { margin-top:4px; padding:3px 6px; font-size:9.5px; }
+  .ve-prompt-helper { display:flex; align-items:center; justify-content:space-between; gap:10px; margin:0 0 10px; padding:9px 11px; background:#F5F3FF; border:1px solid #DDD6FE; border-radius:8px; }
+  .ve-prompt-helper-text { display:flex; flex-direction:column; gap:2px; min-width:0; }
+  .ve-prompt-helper-text strong { font-family:'Barlow Condensed',sans-serif; font-size:11.5px; font-weight:700; letter-spacing:0.06em; text-transform:uppercase; color:#111827; }
+  .ve-prompt-helper-text strong i { color:var(--cut-orange); margin-right:4px; }
+  .ve-prompt-helper-text span { font-family:'Instrument Sans',sans-serif; font-size:11px; color:#4B5563; line-height:1.4; }
+  .ve-prompt-helper .ve-button { flex:0 0 auto; }
+  .ve-badge.pending, .ve-badge.stopped { background:#EDE8DF; color:#5A5752; }
+  .ve-badge.generating, .ve-badge.saving, .ve-badge.submitting { background:var(--cut-orange); color:#fff; }
+  .ve-badge.saved { background:#0EA768; color:#fff; }
+  @media (max-width: 640px) {
+    .ve-mode-switch, .ve-prompt-grid, .ve-options { grid-template-columns:1fr; }
+  }
   @media (max-width: 640px) {
     #ve-manager-root { top: 8px; right: 8px; left: 8px; }
     #ve-manager-panel { width: auto; max-height: calc(100vh - 16px); }
@@ -1616,13 +1785,27 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
 
         <!-- GENERATE -->
         <div class="ve-tab-panel" data-panel="queue">
+          <div class="ve-mode-switch" role="radiogroup" aria-label="Generate mode">
+            <button class="ve-mode-btn" data-mode="image2video" type="button" role="radio" title="Each line: generate an image from the image prompt, then animate it with the video prompt"><i class="bi bi-film"></i><strong>Image → Video</strong><span>prompts to finished videos</span></button>
+            <button class="ve-mode-btn" data-mode="image" type="button" role="radio" title="Each line becomes one image"><i class="bi bi-image"></i><strong>Image maker</strong><span>prompts to images</span></button>
+            <button class="ve-mode-btn" data-mode="video" type="button" role="radio" title="Turn the images already in the folder into videos"><i class="bi bi-camera-video"></i><strong>Video maker</strong><span>folder images to videos</span></button>
+          </div>
           <div class="ve-section">
-            <div class="ve-section-title"><span><i class="bi bi-camera-video"></i> Generate</span><span class="ve-muted" style="font-family:'JetBrains Mono',monospace; font-size:9px;">sequential · auto-retry at 5 max</span></div>
-            <p class="ve-section-help">Default 10s video. Queue runs 1 by 1; parallel limit retries automatically.</p>
+            <div class="ve-section-title"><span><i class="bi bi-camera-video"></i> Generate</span><span class="ve-muted" id="ve-generate-subtitle" style="font-family:'JetBrains Mono',monospace; font-size:9px;">sequential · auto-retry at 5 max</span></div>
+            <p class="ve-section-help" id="ve-generate-help">Default 10s video. Queue runs 1 by 1; parallel limit retries automatically.</p>
             <div class="ve-row">
-              <div>
-                <label class="ve-field-label">Video length (seconds)</label>
-                <input class="ve-input" id="ve-video-length" type="number" min="1" max="60" value="10" aria-label="Video length (seconds, 1–60)" title="Video length in seconds" />
+              <div data-show-modes="image2video video">
+                <label class="ve-field-label" for="ve-video-length">Video length</label>
+                <select class="ve-select" id="ve-video-length" aria-label="Video length in seconds" title="Lengths offered by VideoExpress (3–10 s)">
+                  <option value="3">3 seconds</option>
+                  <option value="4">4 seconds</option>
+                  <option value="5">5 seconds</option>
+                  <option value="6">6 seconds</option>
+                  <option value="7">7 seconds</option>
+                  <option value="8">8 seconds</option>
+                  <option value="9">9 seconds</option>
+                  <option value="10" selected>10 seconds</option>
+                </select>
               </div>
               <div>
                 <label class="ve-field-label">Aspect</label>
@@ -1630,6 +1813,17 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
                   <option value="16:9" selected>16:9 — landscape</option>
                   <option value="9:16">9:16 — portrait</option>
                   <option value="1:1">1:1 — square</option>
+                </select>
+              </div>
+              <div data-show-modes="image2video image">
+                <label class="ve-field-label">Image type</label>
+                <select class="ve-select" id="ve-image-type" aria-label="Image type">
+                  <option value="photorealistic">Photorealistic (cinematic)</option>
+                  <option value="human">Human</option>
+                  <option value="2d">2D</option>
+                  <option value="3d">3D</option>
+                  <option value="other">Other</option>
+                  <option value="creative">Creative mode</option>
                 </select>
               </div>
             </div>
@@ -1647,11 +1841,112 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
                   </div>
                 </div>
                 <p class="ve-field-hint">Defaults are safe for VideoExpress. Increase retry delay if you hit repeated parallel-limit loops.</p>
+                <div class="ve-row" data-show-modes="image2video image" style="margin-top:8px">
+                  <div>
+                    <label class="ve-field-label">Images at the same time (1–8)</label>
+                    <input class="ve-input" id="ve-image-concurrency" type="number" min="1" max="8" step="1" value="3" aria-label="Images generated at the same time" />
+                  </div>
+                  <div></div>
+                </div>
               </div>
             </div>
           </div>
 
-          <div class="ve-section">
+          <!-- Prompt helper: copies instructions for an AI agent, based on VideoExpress's own prompt guidance -->
+          <div class="ve-prompt-helper" id="ve-prompt-helper">
+            <div class="ve-prompt-helper-text">
+              <strong><i class="bi bi-robot"></i> Prompt helper</strong>
+              <span id="ve-prompt-helper-hint">Copies instructions you can paste into ChatGPT, Claude, etc. so it writes prompts the way VideoExpress wants them.</span>
+            </div>
+            <button class="ve-button primary small" id="ve-copy-prompt-guide-btn" type="button" title="Copy the prompt-writing instructions to the clipboard"><i class="bi bi-clipboard"></i> <span id="ve-copy-prompt-guide-label">Copy prompt guide</span></button>
+          </div>
+
+          <!-- PROMPTS → IMAGES / VIDEOS (Image → Video and Image maker modes) -->
+          <div class="ve-section" data-show-modes="image2video image">
+            <div class="ve-section-title"><span><i class="bi bi-card-text"></i> Prompts</span><span class="ve-muted" style="font-family:'JetBrains Mono',monospace; font-size:9px;">one per line · line N = output N</span></div>
+            <div class="ve-prompt-grid" id="ve-prompt-grid">
+              <div>
+                <label class="ve-field-label" for="ve-image-prompts">Image prompts <span class="ve-count" id="ve-image-prompt-count">0</span></label>
+                <textarea class="ve-textarea ve-prompt-box" id="ve-image-prompts" wrap="off" spellcheck="false" aria-label="Image prompts, one per line" placeholder="Line 1 → image 1&#10;Line 2 → image 2&#10;…"></textarea>
+              </div>
+              <div data-show-modes="image2video">
+                <label class="ve-field-label" for="ve-video-prompts">Video prompts <span class="ve-count" id="ve-video-prompt-count">0</span></label>
+                <textarea class="ve-textarea ve-prompt-box" id="ve-video-prompts" wrap="off" spellcheck="false" aria-label="Video prompts, one per line" placeholder="Line 1 animates image 1&#10;One line only → used for every image"></textarea>
+              </div>
+            </div>
+            <p class="ve-field-hint" id="ve-prompt-check">Images are saved into the active folder.</p>
+          </div>
+
+          <div class="ve-section" data-show-modes="image2video image">
+            <div class="ve-section-title"><span><i class="bi bi-person-bounding-box"></i> Consistent character</span><span class="ve-muted" style="font-family:'JetBrains Mono',monospace; font-size:9px;">same person across images</span></div>
+            <select class="ve-select" id="ve-character-mode" aria-label="Consistent character mode">
+              <option value="off">Off — every image is independent</option>
+              <option value="first">Use the first image as the character</option>
+              <option value="reference">Use reference image(s) from a folder</option>
+            </select>
+            <div class="ve-hidden" id="ve-reference-row" style="margin-top:8px">
+              <div class="ve-row" style="align-items:flex-end;">
+                <div style="flex:1; min-width:0;">
+                  <label class="ve-field-label" for="ve-reference-folder-select">Reference folder</label>
+                  <select class="ve-select" id="ve-reference-folder-select" aria-label="Reference folder"></select>
+                </div>
+                <div style="flex:0 0 auto;">
+                  <button class="ve-button ghost" id="ve-load-references-btn" type="button"><i class="bi bi-arrow-clockwise"></i> Load images</button>
+                </div>
+              </div>
+              <div class="ve-row">
+                <div>
+                  <label class="ve-field-label" for="ve-reference-1">Reference 1</label>
+                  <select class="ve-select" id="ve-reference-1" aria-label="Reference image 1"><option value="">Load a folder first</option></select>
+                </div>
+                <div>
+                  <label class="ve-field-label" for="ve-reference-2">Reference 2 (optional)</label>
+                  <select class="ve-select" id="ve-reference-2" aria-label="Reference image 2"><option value="">None</option></select>
+                </div>
+              </div>
+              <div class="ve-reference-preview" id="ve-reference-preview"></div>
+            </div>
+            <p class="ve-field-hint" id="ve-character-help"></p>
+          </div>
+
+          <div class="ve-section" data-show-modes="image2video image">
+            <div class="ve-section-title"><span><i class="bi bi-play-circle"></i> Run</span>
+              <button class="ve-button ghost ve-icon-button" id="ve-gen-clear-btn" type="button" title="Clear this run from the list"><i class="bi bi-eraser"></i></button>
+            </div>
+            <div class="ve-options">
+              <label class="ve-check"><input class="ve-checkbox" id="ve-enhance-image-prompt" type="checkbox" /> <span><b>Enhance image prompts</b> — the site's AI rewrites them</span></label>
+              <label class="ve-check" data-show-modes="image2video"><input class="ve-checkbox" id="ve-enhance-video-prompt" type="checkbox" /> <span><b>Enhance video prompts</b></span></label>
+              <label class="ve-check"><input class="ve-checkbox" id="ve-rename-outputs" type="checkbox" /> <span><b>Name in prompt order</b> — 001 - …</span></label>
+              <label class="ve-check" data-show-modes="image2video"><input class="ve-checkbox" id="ve-move-videos" type="checkbox" /> <span><b>Put videos in the folder</b> — not only My AI Videos</span></label>
+            </div>
+            <div class="ve-status-line" id="ve-gen-status-line" style="margin-top:10px"><span><strong id="ve-gen-stat-total">0</strong> lines</span><span class="dot done"></span><span><strong id="ve-gen-stat-images">0</strong> images</span><span class="dot running" data-show-modes="image2video"></span><span data-show-modes="image2video"><strong id="ve-gen-stat-videos">0</strong> videos</span><span class="dot fail"></span><span><strong id="ve-gen-stat-failed">0</strong> failed</span></div>
+            <div class="ve-row" style="margin-top:10px">
+              <button class="ve-button success" id="ve-gen-start-btn" type="button"><i class="bi bi-play-fill"></i> Start</button>
+              <button class="ve-button primary" id="ve-gen-resume-btn" type="button" title="Continue unfinished lines and retry failed ones"><i class="bi bi-arrow-repeat"></i> Resume</button>
+              <button class="ve-button warn" id="ve-gen-stop-btn" type="button"><i class="bi bi-stop-fill"></i> Stop</button>
+            </div>
+            <p class="ve-field-hint" id="ve-gen-summary" style="margin:6px 0 0;">No run yet.</p>
+          </div>
+
+          <div class="ve-section" data-show-modes="image2video image">
+            <div class="ve-section-title"><span><i class="bi bi-table"></i> Run progress</span></div>
+            <div style="max-height:360px; overflow:auto; border:1px solid #E0D8CC; border-radius:1px;">
+              <table class="ve-table">
+                <thead>
+                  <tr>
+                    <th style="width: 7%">#</th>
+                    <th style="width: 19%">Image</th>
+                    <th style="width: 44%">Prompts</th>
+                    <th style="width: 15%">Image</th>
+                    <th style="width: 15%" data-show-modes="image2video">Video</th>
+                  </tr>
+                </thead>
+                <tbody id="ve-gen-body"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="ve-section" data-show-modes="video">
             <div class="ve-section-title"><span><i class="bi bi-type"></i> Prompts</span><span class="ve-muted" style="font-size:10px; font-family:'JetBrains Mono',monospace;">Filenames → cleaned prompts</span></div>
             <label class="ve-muted" style="display:flex;align-items:center;gap:8px;cursor:pointer; background:#F9FAFB; border:1px solid #E6E8EF; border-radius:1px; padding:8px 9px;">
               <input class="ve-checkbox" id="ve-master-prompt-enabled" type="checkbox" />
@@ -1680,7 +1975,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
             <div class="ve-muted ve-hidden" id="ve-prompt-list-summary-legacy" style="display:none;"></div>
           </div>
 
-          <div class="ve-section">
+          <div class="ve-section" data-show-modes="video">
             <div class="ve-section-title"><span><i class="bi bi-play-circle"></i> Queue</span>
               <button class="ve-button ghost ve-icon-button" id="ve-reset-history-btn" type="button" title="Clear saved queue history"><i class="bi bi-eraser"></i></button>
             </div>
@@ -1693,7 +1988,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
             <p class="ve-field-hint" id="ve-folder-summary" style="margin:6px 0 0;">Choose a folder, then “Load images from folder” to build the queue.</p>
           </div>
 
-          <div class="ve-section" id="ve-queue-download-section">
+          <div class="ve-section" id="ve-queue-download-section" data-show-modes="image2video video">
             <div class="ve-section-title"><span><i class="bi bi-download"></i> Completed</span></div>
             <div class="ve-muted" id="ve-queue-download-summary" style="background:#F9FAFB; border:1px solid #E6E8EF; padding:7px 9px; border-radius:6px; margin-bottom:8px; font-size:11px;">No completed videos yet.</div>
             <div class="ve-progress" title="Download progress"><div class="ve-progress-bar" id="ve-queue-download-progress"></div></div>
@@ -1705,7 +2000,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
             <p class="ve-field-hint" id="ve-retry-all-summary"></p>
           </div>
 
-          <div class="ve-section">
+          <div class="ve-section" data-show-modes="video">
             <div class="ve-section-title">
               <span><i class="bi bi-table"></i> Queue preview</span>
               <span class="ve-muted" id="ve-queue-count" style="font-family:'JetBrains Mono',monospace; font-size:9px;">up to 150 shown</span>
@@ -1977,6 +2272,43 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     queuePagerInfo: root.querySelector("#ve-queue-pager-info"),
     queuePrev: root.querySelector("#ve-queue-prev"),
     queueNext: root.querySelector("#ve-queue-next"),
+    modeButtons: Array.from(root.querySelectorAll(".ve-mode-btn")),
+    modeScoped: Array.from(root.querySelectorAll("[data-show-modes]")),
+    generateSubtitle: root.querySelector("#ve-generate-subtitle"),
+    generateHelp: root.querySelector("#ve-generate-help"),
+    imageType: root.querySelector("#ve-image-type"),
+    imageConcurrency: root.querySelector("#ve-image-concurrency"),
+    promptGrid: root.querySelector("#ve-prompt-grid"),
+    imagePrompts: root.querySelector("#ve-image-prompts"),
+    videoPrompts: root.querySelector("#ve-video-prompts"),
+    imagePromptCount: root.querySelector("#ve-image-prompt-count"),
+    videoPromptCount: root.querySelector("#ve-video-prompt-count"),
+    promptCheck: root.querySelector("#ve-prompt-check"),
+    characterMode: root.querySelector("#ve-character-mode"),
+    characterHelp: root.querySelector("#ve-character-help"),
+    referenceRow: root.querySelector("#ve-reference-row"),
+    referenceFolderSelect: root.querySelector("#ve-reference-folder-select"),
+    loadReferencesBtn: root.querySelector("#ve-load-references-btn"),
+    reference1: root.querySelector("#ve-reference-1"),
+    reference2: root.querySelector("#ve-reference-2"),
+    referencePreview: root.querySelector("#ve-reference-preview"),
+    enhanceImagePrompt: root.querySelector("#ve-enhance-image-prompt"),
+    enhanceVideoPrompt: root.querySelector("#ve-enhance-video-prompt"),
+    renameOutputs: root.querySelector("#ve-rename-outputs"),
+    moveVideos: root.querySelector("#ve-move-videos"),
+    genStartBtn: root.querySelector("#ve-gen-start-btn"),
+    genResumeBtn: root.querySelector("#ve-gen-resume-btn"),
+    genStopBtn: root.querySelector("#ve-gen-stop-btn"),
+    genClearBtn: root.querySelector("#ve-gen-clear-btn"),
+    genSummary: root.querySelector("#ve-gen-summary"),
+    genBody: root.querySelector("#ve-gen-body"),
+    genStatTotal: root.querySelector("#ve-gen-stat-total"),
+    genStatImages: root.querySelector("#ve-gen-stat-images"),
+    genStatVideos: root.querySelector("#ve-gen-stat-videos"),
+    genStatFailed: root.querySelector("#ve-gen-stat-failed"),
+    copyPromptGuideBtn: root.querySelector("#ve-copy-prompt-guide-btn"),
+    copyPromptGuideLabel: root.querySelector("#ve-copy-prompt-guide-label"),
+    promptHelperHint: root.querySelector("#ve-prompt-helper-hint"),
   };
 
   function logLine(message) {
@@ -2126,6 +2458,11 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     if (els.contextSelect) {
       els.contextSelect.innerHTML = options || `<option value="">No folders found</option>`;
       els.contextSelect.value = state.selectedFolderId || "";
+    }
+    if (els.referenceFolderSelect) {
+      const referenceValue = els.referenceFolderSelect.value || state.selectedFolderId || "";
+      els.referenceFolderSelect.innerHTML = options || `<option value="">No folders found</option>`;
+      els.referenceFolderSelect.value = referenceValue;
     }
     const sel = getSelectedFolder();
     if (sel) {
@@ -2815,6 +3152,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     renderQueue();
     renderVideos();
     renderTimelineExport();
+    updatePromptCheck();
   }
 
   async function loadFolderImages() {
@@ -3245,8 +3583,13 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     await loadFolderImages();
   }
 
+  function clampVideoLength(value) {
+    const number = Math.round(Number(value) || Number(config.videoLength) || 10);
+    return Math.min(MAX_VIDEO_LENGTH, Math.max(MIN_VIDEO_LENGTH, number));
+  }
+
   function updateConfigFromInputs() {
-    config.videoLength = Number(els.videoLength.value || 10);
+    config.videoLength = clampVideoLength(els.videoLength.value);
     config.aspect = els.aspect.value || "16:9";
     config.delayBetweenRequestsMs = Number(els.delayInput.value || 0);
     config.parallelLimitRetryDelayMs = Number(
@@ -3263,6 +3606,17 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     config.masterPrompt = els.masterPrompt.value.trim();
     config.promptListEnabled = Boolean(els.promptListEnabled.checked);
     config.promptList = els.promptList.value;
+    config.imageType = els.imageType.value || "photorealistic";
+    config.imageConcurrency = Math.min(8, Math.max(1, Math.round(Number(els.imageConcurrency.value) || 3)));
+    config.enhanceImagePrompt = Boolean(els.enhanceImagePrompt.checked);
+    config.enhanceVideoPrompt = Boolean(els.enhanceVideoPrompt.checked);
+    config.renameOutputs = Boolean(els.renameOutputs.checked);
+    config.moveVideosToFolder = Boolean(els.moveVideos.checked);
+    config.characterMode = els.characterMode.value || "off";
+    config.referenceMediaId = els.reference1.value || "";
+    config.referenceMediaId2 = els.reference2.value || "";
+    config.imagePrompts = els.imagePrompts.value;
+    config.videoPrompts = els.videoPrompts.value;
     if (config.downloadMaxDelayMs < config.downloadMinDelayMs) {
       config.downloadMaxDelayMs = config.downloadMinDelayMs;
       els.downloadMaxDelay.value = String(config.downloadMaxDelayMs);
@@ -3899,9 +4253,896 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     }
   }
 
+  /* ------------------------------------------------------------------
+   * Generate modes: Image maker and Image → Video
+   * A run turns prompt lines into images (and videos). It is saved in
+   * localStorage (GEN_RUN_KEY) so Resume works after a page reload.
+   * Video status is polled by pollStatuses() through normal history
+   * records, so finished videos also appear in Completed / Collect / Stitch.
+   * ------------------------------------------------------------------ */
+
+  const GEN_VIDEO_FINAL = ["completed", "failed"];
+
+  function padIndex(index) {
+    return String(index + 1).padStart(3, "0");
+  }
+
+  function makeOutputName(index, prompt) {
+    const text = String(prompt || "").replace(/\s+/g, " ").trim().slice(0, 80).trim();
+    return text ? `${padIndex(index)} - ${text}` : padIndex(index);
+  }
+
+  // "creative" is a generation mode, not a type the enhancer or video step understands.
+  function apiImageType(type) {
+    return type === "creative" ? "other" : type || "photorealistic";
+  }
+
+  function getGenPromptLists() {
+    return {
+      imagePrompts: parsePromptList(els.imagePrompts.value),
+      videoPrompts: parsePromptList(els.videoPrompts.value),
+    };
+  }
+
+  function resolveVideoPrompt(videoPrompts, index) {
+    if (videoPrompts.length === 1) return videoPrompts[0];
+    return videoPrompts[index] || "";
+  }
+
+  // Problems that block starting a run (empty list = OK).
+  function validateGenInputs(mode) {
+    const problems = [];
+    const { imagePrompts, videoPrompts } = getGenPromptLists();
+    const folder = getSelectedFolder();
+    if (!folder) problems.push("Pick a folder in the bar at the top first.");
+    else if (getAiVideosFolder() && String(getAiVideosFolder().id) === String(folder.id)) {
+      problems.push('Pick one of your own folders, not "My AI Videos".');
+    }
+    if (!imagePrompts.length) problems.push("Add at least one image prompt.");
+    if (mode === "image2video") {
+      if (!videoPrompts.length) {
+        problems.push("Add video prompts (a single line is used for every image).");
+      } else if (videoPrompts.length !== 1 && videoPrompts.length !== imagePrompts.length) {
+        problems.push(
+          `There are ${imagePrompts.length} image prompts but ${videoPrompts.length} video prompts. Use the same number of lines, or one video prompt for all.`,
+        );
+      }
+    }
+    if (!["16:9", "9:16"].includes(config.aspect)) {
+      problems.push("Image generation supports 16:9 and 9:16 only.");
+    }
+    if (config.characterMode === "reference" && !config.referenceMediaId) {
+      problems.push("Pick a reference image for the consistent character.");
+    }
+    return problems;
+  }
+
+  function updatePromptCheck() {
+    if (!els.imagePrompts) return;
+    const { imagePrompts, videoPrompts } = getGenPromptLists();
+    els.imagePromptCount.textContent = String(imagePrompts.length);
+    els.videoPromptCount.textContent = String(videoPrompts.length);
+    const folder = getSelectedFolder();
+    const target = folder ? `“${folder.title || folder.name}”` : "the active folder";
+    let message = `Outputs are saved into ${target}.`;
+    let warn = false;
+    if (config.mode === "image2video" && imagePrompts.length) {
+      if (!videoPrompts.length) {
+        message = "Add video prompts. A single line is used for every image.";
+        warn = true;
+      } else if (videoPrompts.length === 1 && imagePrompts.length > 1) {
+        message = `The one video prompt is used for all ${imagePrompts.length} images. Saved into ${target}.`;
+      } else if (videoPrompts.length !== imagePrompts.length) {
+        message = `Line counts differ: ${imagePrompts.length} image vs ${videoPrompts.length} video prompts.`;
+        warn = true;
+      } else {
+        message = `${imagePrompts.length} image → video pairs. Saved into ${target}.`;
+      }
+    } else if (config.mode === "image" && imagePrompts.length) {
+      message = `${imagePrompts.length} image${imagePrompts.length === 1 ? "" : "s"} will be made in ${target}.`;
+    }
+    els.promptCheck.textContent = message;
+    els.promptCheck.classList.toggle("is-warning", warn);
+  }
+
+  function updateCharacterControls() {
+    const mode = els.characterMode.value;
+    els.referenceRow.classList.toggle("ve-hidden", mode !== "reference");
+    els.characterHelp.textContent = {
+      off: "Each image is generated on its own.",
+      first: "Image 1 is generated first. Every other image keeps the same character (the site's Consistent Character feature).",
+      reference: "Every image keeps the character from the reference image(s). Use two references for two characters.",
+    }[mode] || "";
+    renderReferencePreview();
+  }
+
+  function renderReferencePreview() {
+    const ids = [els.reference1.value, els.reference2.value].filter(Boolean);
+    els.referencePreview.innerHTML = ids
+      .map((id) => {
+        const image = state.referenceImages.find((item) => String(item.id) === String(id));
+        const url = image ? image.thumbUrl || image.mediaPath || "" : "";
+        return `<div class="ve-thumb" title="${escapeAttr(image ? image.name : `Image ${id}`)}" style="background-image:url('${escapeAttr(url)}')"></div>`;
+      })
+      .join("");
+  }
+
+  function fillReferenceSelects(selected1, selected2) {
+    const options = state.referenceImages
+      .map((image) => `<option value="${escapeAttr(String(image.id))}">${escapeHtml(image.name || image.fileName || String(image.id))} (${escapeHtml(String(image.id))})</option>`)
+      .join("");
+    const keepOption = (id) =>
+      id && !state.referenceImages.some((image) => String(image.id) === String(id))
+        ? `<option value="${escapeAttr(String(id))}">Image ${escapeHtml(String(id))}</option>`
+        : "";
+    els.reference1.innerHTML = `<option value="">Choose an image</option>${keepOption(selected1)}${options}`;
+    els.reference2.innerHTML = `<option value="">None</option>${keepOption(selected2)}${options}`;
+    els.reference1.value = selected1 || "";
+    els.reference2.value = selected2 || "";
+    renderReferencePreview();
+  }
+
+  async function loadReferenceImages() {
+    const folderId = els.referenceFolderSelect.value;
+    if (!folderId) throw new Error("Pick a reference folder first.");
+    const payload = await api.getAllImages(folderId);
+    state.referenceImages = payload.results.slice().sort(compareMediaName);
+    fillReferenceSelects(els.reference1.value, els.reference2.value);
+    logLine(`Loaded ${state.referenceImages.length} reference images from folder ${folderId}.`);
+  }
+
+  function useImageAsCharacter(mediaId, imageUrl) {
+    if (!state.referenceImages.some((image) => String(image.id) === String(mediaId))) {
+      state.referenceImages.unshift({ id: mediaId, name: `Image ${mediaId}`, thumbUrl: imageUrl });
+    }
+    els.characterMode.value = "reference";
+    fillReferenceSelects(String(mediaId), "");
+    updateConfigFromInputs();
+    updateCharacterControls();
+    persistGenSettings();
+    logLine(`Image ${mediaId} is now the consistent-character reference.`);
+  }
+
+  function persistGenSettings() {
+    saveUiState({
+      mode: config.mode,
+      imageType: config.imageType,
+      imageConcurrency: config.imageConcurrency,
+      enhanceImagePrompt: config.enhanceImagePrompt,
+      enhanceVideoPrompt: config.enhanceVideoPrompt,
+      renameOutputs: config.renameOutputs,
+      moveVideosToFolder: config.moveVideosToFolder,
+      characterMode: config.characterMode,
+      referenceMediaId: config.referenceMediaId,
+      referenceMediaId2: config.referenceMediaId2,
+      referenceFolderId: els.referenceFolderSelect.value || "",
+      imagePrompts: config.imagePrompts,
+      videoPrompts: config.videoPrompts,
+    });
+  }
+
+  function createGenRun(mode) {
+    const folder = getSelectedFolder();
+    const { imagePrompts, videoPrompts } = getGenPromptLists();
+    return {
+      id: `run-${Date.now()}`,
+      mode,
+      folderId: folder.id,
+      folderTitle: folder.title || folder.name,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      settings: {
+        aspect: config.aspect,
+        imageType: config.imageType,
+        videoLength: config.videoLength,
+        enhanceImagePrompt: config.enhanceImagePrompt,
+        enhanceVideoPrompt: config.enhanceVideoPrompt,
+        characterMode: config.characterMode,
+        referenceIds:
+          config.characterMode === "reference"
+            ? [config.referenceMediaId, config.referenceMediaId2].filter(Boolean)
+            : [],
+        renameOutputs: config.renameOutputs,
+        moveVideosToFolder: config.moveVideosToFolder,
+      },
+      characterMediaId: null,
+      items: imagePrompts.map((imagePrompt, index) => ({
+        index,
+        imagePrompt,
+        videoPrompt: mode === "image2video" ? resolveVideoPrompt(videoPrompts, index) : "",
+        image: { status: "pending" },
+        video: mode === "image2video" ? { status: "pending" } : null,
+      })),
+    };
+  }
+
+  function updateGenItem(item, part, patch) {
+    item[part] = { ...(item[part] || {}), ...patch, updatedAt: new Date().toISOString() };
+    saveGenRun();
+    renderGenRun();
+  }
+
+  function genCharacterRefs(run, item) {
+    const settings = run.settings;
+    if (settings.characterMode === "reference") return settings.referenceIds;
+    if (settings.characterMode === "first" && item.index > 0 && run.characterMediaId) {
+      return [run.characterMediaId];
+    }
+    return [];
+  }
+
+  async function sleepUnlessStopped(ms) {
+    const until = Date.now() + ms;
+    while (Date.now() < until && !state.gen.stopRequested) {
+      await sleep(Math.min(1000, Math.max(0, until - Date.now())));
+    }
+  }
+
+  // Resolves with the saved media id once the generated image exists.
+  // Saving is retried until the site stops answering "Image is empty."; the WebSocket push only wakes the loop early.
+  function waitForGeneratedImage(uuid, timeoutMs = config.imageTimeoutMs) {
+    return new Promise((resolve, reject) => {
+      let finished = false;
+      let wake = null;
+      let socket = null;
+      const startedAt = Date.now();
+      const done = (error, value) => {
+        if (finished) return;
+        finished = true;
+        try {
+          if (socket) socket.close();
+        } catch {
+          // ignore
+        }
+        if (error) reject(error);
+        else resolve(value);
+      };
+      try {
+        const wsUrl = (window.app && window.app.options && window.app.options.wsServerUrl) || "wss://ws.talkingphotos.ai/";
+        socket = new WebSocket(wsUrl);
+        socket.onopen = () => socket.send(JSON.stringify({ recipient_uuid: uuid, message: "connected" }));
+        socket.onmessage = (event) => {
+          const data = String(event.data || "");
+          if (/^error:/i.test(data)) done(new Error(data.replace(/^error:\s*/i, "") || "Image generation failed."));
+          else if (data === "abuse_block") done(new Error("The site blocked this request (abuse_block)."));
+          else if (/^https?:\/\//.test(data) && wake) wake();
+        };
+      } catch {
+        socket = null;
+      }
+      (async () => {
+        await sleep(3000);
+        while (!finished) {
+          try {
+            const result = await api.saveGeneratedImage(uuid);
+            if (result && result.mediaId) return done(null, result.mediaId);
+            if (result && result.error && !/image is empty/i.test(result.error)) return done(new Error(result.error));
+          } catch (error) {
+            if (!/image is empty/i.test(String(error.message))) return done(error);
+          }
+          if (Date.now() - startedAt > timeoutMs) return done(new Error("Timed out waiting for the image."));
+          await new Promise((resolveWait) => {
+            wake = resolveWait;
+            setTimeout(resolveWait, 5000);
+          });
+          wake = null;
+        }
+      })();
+    });
+  }
+
+  function shortError(error) {
+    const text = String((error && (error.bodyText || error.message)) || error || "");
+    try {
+      const json = JSON.parse(error && error.bodyText ? error.bodyText : "");
+      if (json && (json.error || json.message || json.msg)) return String(json.error || json.message || json.msg);
+    } catch {
+      // not JSON
+    }
+    return text.split("\n")[0].slice(0, 200);
+  }
+
+  async function processGenImage(run, item) {
+    const refs = genCharacterRefs(run, item);
+    const settings = run.settings;
+    const tag = `#${padIndex(item.index)}`;
+    try {
+      let mediaId = item.image.mediaId || null;
+      // A uuid without a media id means the page reloaded mid-generation: try to save it first.
+      if (!mediaId && item.image.uuid) {
+        updateGenItem(item, "image", { status: "saving", error: "" });
+        try {
+          mediaId = await waitForGeneratedImage(item.image.uuid, 20000);
+        } catch (error) {
+          logLine(`${tag} earlier image could not be saved (${shortError(error)}); generating again.`);
+        }
+      }
+      if (!mediaId) {
+        updateGenItem(item, "image", { status: "generating", error: "", uuid: null, character: refs.join(",") });
+        let prompt = item.imagePrompt;
+        if (settings.enhanceImagePrompt) {
+          try {
+            prompt = refs.length
+              ? await api.extendPrompt("consistent_character", prompt, { type: apiImageType(settings.imageType), mediaId: refs[0], mediaId2: refs[1] || "" })
+              : await api.extendPrompt("image", prompt, { type: apiImageType(settings.imageType) });
+          } catch (error) {
+            logLine(`${tag} prompt enhance failed, using the original: ${shortError(error)}`);
+          }
+        }
+        const options = { type: settings.imageType, aspect: settings.aspect };
+        const result = refs.length
+          ? await api.generateConsistentImage(prompt, { ...options, mediaId: refs[0], mediaId2: refs[1] || 0 })
+          : await api.generateImage(prompt, options);
+        if (!result || !result.success || !result.uuid) {
+          throw new Error((result && (result.message || result.msg || result.error)) || "The site did not accept the image request.");
+        }
+        updateGenItem(item, "image", { status: "generating", uuid: result.uuid, finalPrompt: prompt });
+        logLine(`${tag} image started.`);
+        mediaId = await waitForGeneratedImage(result.uuid);
+      }
+      updateGenItem(item, "image", { status: "saving", mediaId });
+      try {
+        await api.moveItem(mediaId, run.folderId);
+      } catch (error) {
+        logLine(`${tag} could not move the image into the folder: ${shortError(error)}`);
+      }
+      if (settings.renameOutputs) {
+        try {
+          await api.renameItem(mediaId, makeOutputName(item.index, item.imagePrompt));
+        } catch (error) {
+          logLine(`${tag} could not rename the image: ${shortError(error)}`);
+        }
+      }
+      updateGenItem(item, "image", {
+        status: "saved",
+        mediaId,
+        url: item.image.uuid ? `${PREVIEW_BASE_URL}${item.image.uuid}.jpg` : item.image.url || "",
+      });
+      logLine(`${tag} image saved (media ${mediaId}).`);
+      return true;
+    } catch (error) {
+      updateGenItem(item, "image", { status: "failed", error: shortError(error) });
+      logLine(`${tag} image failed: ${shortError(error)}`);
+      return false;
+    }
+  }
+
+  // Finds a just-submitted video in "My AI Videos" (newest first) by its job uuid.
+  async function findRecentAiVideo(uuid) {
+    const folder = getAiVideosFolder();
+    if (!folder) return null;
+    const needle = String(uuid).toLowerCase();
+    for (let page = 1; page <= 3; page += 1) {
+      const payload = await api.getRecentMedia(folder.id, page);
+      const results = Array.isArray(payload.results) ? payload.results : [];
+      const hit = results.find((media) => String(media.uuid || "").toLowerCase() === needle);
+      if (hit) return hit;
+      if (results.length < config.pageSize) break;
+    }
+    return null;
+  }
+
+  // Moves the video next to its image (right after submit) and renames it once finished
+  // (the site renames videos itself when they finish).
+  async function placeGenVideo(run, item, finished) {
+    const video = item.video;
+    const tag = `#${padIndex(item.index)}`;
+    try {
+      let videoId = video.mediaId;
+      if (!videoId) {
+        const record = getRecord(run.folderId, item.image.mediaId);
+        videoId = (record && record.videoId) || null;
+        if (!videoId) {
+          const found = await findRecentAiVideo(video.uuid);
+          if (!found) return;
+          videoId = String(found.id);
+        }
+        updateGenItem(item, "video", { mediaId: videoId });
+        const record2 = getRecord(run.folderId, item.image.mediaId);
+        if (record2 && !record2.videoId) setRecord(run.folderId, item.image.mediaId, { ...record2, videoId });
+      }
+      if (run.settings.moveVideosToFolder && !item.video.moved) {
+        await api.moveItem(videoId, run.folderId);
+        updateGenItem(item, "video", { moved: true });
+      }
+      if (finished && run.settings.renameOutputs && !item.video.renamed) {
+        await api.renameItem(videoId, makeOutputName(item.index, item.imagePrompt));
+        updateGenItem(item, "video", { renamed: true, renameChecks: 0 });
+      }
+    } catch (error) {
+      logLine(`${tag} could not place the video: ${shortError(error)}`);
+    }
+  }
+
+  // The site may rename a video again a few seconds after it reports "finished".
+  // Check once per poll and re-apply our name, up to 3 times.
+  async function verifyGenVideoName(run, item) {
+    const video = item.video;
+    const expected = makeOutputName(item.index, item.imagePrompt);
+    try {
+      const media = await getJson(`/library/get_media_item/${video.mediaId}`, "Load media item");
+      const current = String((media && media.name) || "");
+      // The site trims names to about 50 characters, so compare the start only.
+      if (current && expected.startsWith(current.replace(/\.\.\.$/, "").trim())) {
+        updateGenItem(item, "video", { nameVerified: true });
+        return;
+      }
+      const checks = Number(video.renameChecks || 0) + 1;
+      await api.renameItem(video.mediaId, expected);
+      updateGenItem(item, "video", { renameChecks: checks, nameVerified: checks >= 3 });
+    } catch (error) {
+      logLine(`#${padIndex(item.index)} could not check the video name: ${shortError(error)}`);
+    }
+  }
+
+  async function submitGenVideo(run, item) {
+    const settings = run.settings;
+    const tag = `#${padIndex(item.index)}`;
+    let attempts = 0;
+    while (!state.gen.stopRequested) {
+      attempts += 1;
+      updateGenItem(item, "video", { status: "submitting", error: "" });
+      try {
+        const result = await api.generateImageVideo(
+          { id: item.image.mediaId, uuid: "", type: apiImageType(settings.imageType), isShared: false },
+          item.videoPrompt,
+          { aspect: settings.aspect, videoLength: settings.videoLength, enhanceVideoPrompt: settings.enhanceVideoPrompt },
+        );
+        if (!result || !result.success || !result.uuid) {
+          const message = (result && (result.error || result.message || result.msg)) || "The site did not accept the video request.";
+          throw Object.assign(new Error(message), { final: !isParallelLimitMessage(message) });
+        }
+        const now = new Date().toISOString();
+        updateGenItem(item, "video", { status: "running", uuid: result.uuid, submittedAt: now });
+        setRecord(run.folderId, item.image.mediaId, {
+          libraryId: config.libraryId,
+          folderId: run.folderId,
+          folderTitle: run.folderTitle,
+          imageId: item.image.mediaId,
+          imageName: makeOutputName(item.index, item.imagePrompt),
+          prompt: item.videoPrompt,
+          aspect: settings.aspect,
+          videoLength: settings.videoLength,
+          generatorRunId: run.id,
+          uuid: result.uuid,
+          status: "submitted",
+          startedAt: now,
+          updatedAt: now,
+          videoId: null,
+          downloadedAt: null,
+          completedAt: null,
+        });
+        logLine(`${tag} video submitted.`);
+        await sleep(1500);
+        await placeGenVideo(run, item, false);
+        return;
+      } catch (error) {
+        const message = shortError(error);
+        if (!error.final && isParallelLimitMessage(message)) {
+          updateGenItem(item, "video", { status: "parallel_limit", error: "5 videos already running — waiting for a free slot" });
+          logLine(`${tag} waiting ${Math.round(config.parallelLimitRetryDelayMs / 1000)}s for a free video slot.`);
+          await sleepUnlessStopped(config.parallelLimitRetryDelayMs);
+          continue;
+        }
+        if (attempts < 2 && !error.final) {
+          await sleepUnlessStopped(5000);
+          continue;
+        }
+        updateGenItem(item, "video", { status: "failed", error: message });
+        logLine(`${tag} video failed: ${message}`);
+        return;
+      }
+    }
+    if (item.video.status !== "running") updateGenItem(item, "video", { status: "pending", error: "" });
+  }
+
+  // Syncs run items with history records (pollStatuses updates those every 15 s),
+  // and moves/renames videos that have finished.
+  async function pollGenRun() {
+    const run = state.gen.run;
+    if (!run || run.mode !== "image2video") return;
+    for (const item of run.items) {
+      const video = item.video;
+      if (!video || !video.uuid) continue;
+      if (video.status === "running") {
+        const record = getRecord(run.folderId, item.image.mediaId);
+        let mapped = null;
+        let detail = "";
+        if (record && record.uuid === video.uuid) {
+          const status = normalizeStatus(record.status);
+          if (status === "completed") mapped = "completed";
+          else if (status === "failed") {
+            mapped = "failed";
+            detail = getFailureReason(record);
+          }
+        } else {
+          // History was cleared: ask the site directly.
+          try {
+            const payload = await api.getStatus(video.uuid);
+            const status = normalizeStatus(payload && payload.status);
+            if (["succeeded", "success", "completed", "complete", "finished", "done"].includes(status)) mapped = "completed";
+            else if (["failed", "error", "canceled", "cancelled", "absent"].includes(status)) mapped = "failed";
+          } catch (error) {
+            logLine(`#${padIndex(item.index)} status check failed: ${shortError(error)}`);
+          }
+        }
+        if (!mapped) continue;
+        updateGenItem(item, "video", { status: mapped, error: detail, finishedAt: new Date().toISOString() });
+        logLine(`#${padIndex(item.index)} video ${mapped}.`);
+      }
+      if (
+        item.video.status === "completed" &&
+        Number(item.video.placeAttempts || 0) < 10 &&
+        ((run.settings.moveVideosToFolder && !item.video.moved) || (run.settings.renameOutputs && !item.video.renamed))
+      ) {
+        updateGenItem(item, "video", { placeAttempts: Number(item.video.placeAttempts || 0) + 1 });
+        await placeGenVideo(run, item, true);
+      } else if (
+        item.video.status === "completed" &&
+        run.settings.renameOutputs &&
+        item.video.renamed &&
+        !item.video.nameVerified &&
+        item.video.mediaId
+      ) {
+        await verifyGenVideoName(run, item);
+      }
+    }
+  }
+
+  function genNeedsFollowUp(run) {
+    return run.items.some(
+      (item) =>
+        item.video &&
+        (item.video.status === "running" ||
+          (item.video.status === "completed" && run.settings.renameOutputs && item.video.mediaId && !item.video.nameVerified)),
+    );
+  }
+
+  function getGenCounts(run) {
+    const items = run ? run.items : [];
+    return {
+      total: items.length,
+      images: items.filter((item) => item.image.status === "saved").length,
+      videos: items.filter((item) => item.video && item.video.status === "completed").length,
+      running: items.filter((item) => item.video && item.video.status === "running").length,
+      failed: items.filter((item) => item.image.status === "failed" || (item.video && item.video.status === "failed")).length,
+      unfinished: items.filter(
+        (item) =>
+          item.image.status !== "saved" ||
+          (item.video && (!GEN_VIDEO_FINAL.includes(item.video.status) || item.video.status === "failed")),
+      ).length,
+    };
+  }
+
+  async function runGenerator(run) {
+    state.gen.running = true;
+    state.gen.stopRequested = false;
+    updateButtonStates();
+    renderGenRun();
+    const label = run.mode === "image2video" ? "Image → Video" : "Image maker";
+    logLine(`${label}: ${run.items.length} line(s) into "${run.folderTitle}".`);
+    const imageQueue = run.items.filter((item) => item.image.status !== "saved");
+    let imagesActive = 0;
+    try {
+      // "Use the first image as the character": image 1 must exist before the others start.
+      if (run.settings.characterMode === "first") {
+        const first = run.items[0];
+        if (first.image.status !== "saved") {
+          imageQueue.splice(imageQueue.indexOf(first), 1);
+          const ok = await processGenImage(run, first);
+          if (!ok) throw new Error("Image 1 failed, so there is no character to keep. Fix line 1 and press Resume.");
+        }
+        run.characterMediaId = first.image.mediaId;
+        saveGenRun();
+      }
+      const imageWorker = async () => {
+        while (!state.gen.stopRequested && imageQueue.length) {
+          const item = imageQueue.shift();
+          imagesActive += 1;
+          try {
+            await processGenImage(run, item);
+          } finally {
+            imagesActive -= 1;
+          }
+        }
+      };
+      // Videos are submitted in line order as their images become ready.
+      const videoWorker = async () => {
+        if (run.mode !== "image2video") return;
+        while (!state.gen.stopRequested) {
+          const next = run.items.find((item) => item.image.status === "saved" && item.video.status === "pending");
+          if (next) {
+            await submitGenVideo(run, next);
+            if (config.delayBetweenRequestsMs > 0) await sleepUnlessStopped(config.delayBetweenRequestsMs);
+            continue;
+          }
+          if (!imageQueue.length && imagesActive === 0) return;
+          await sleep(1000);
+        }
+      };
+      const workers = [videoWorker()];
+      for (let index = 0; index < Math.max(1, config.imageConcurrency); index += 1) workers.push(imageWorker());
+      await Promise.all(workers);
+      // Keep going until the submitted videos finish and their names stick (pollStatuses runs every 15 s).
+      while (run.mode === "image2video" && !state.gen.stopRequested && genNeedsFollowUp(run)) {
+        await sleepUnlessStopped(config.pollIntervalMs);
+        await pollGenRun();
+      }
+    } catch (error) {
+      logLine(shortError(error));
+      alert(shortError(error));
+    } finally {
+      state.gen.running = false;
+      saveGenRun();
+      renderGenRun();
+      updateButtonStates();
+      const counts = getGenCounts(run);
+      logLine(
+        state.gen.stopRequested
+          ? `${label} stopped: ${counts.images}/${counts.total} images done. Press Resume to continue.`
+          : `${label} finished: ${counts.images}/${counts.total} images${run.mode === "image2video" ? `, ${counts.videos}/${counts.total} videos` : ""}, ${counts.failed} failed.`,
+      );
+    }
+  }
+
+  async function startGenerator() {
+    if (state.gen.running || state.running) return;
+    const problems = validateGenInputs(config.mode);
+    if (problems.length) throw new Error(problems.join("\n"));
+    const current = state.gen.run;
+    if (current && getGenCounts(current).unfinished > 0) {
+      const ok = window.confirm("The last run still has unfinished lines. Start a new run instead? (Everything already made stays in your library.)");
+      if (!ok) return;
+    }
+    state.gen.run = createGenRun(config.mode);
+    saveGenRun();
+    await runGenerator(state.gen.run);
+  }
+
+  async function resumeGenerator() {
+    if (state.gen.running || state.running) return;
+    const run = state.gen.run;
+    if (!run) throw new Error("There is no run to resume.");
+    if (!state.folders.some((folder) => String(folder.id) === String(run.folderId))) {
+      throw new Error(`The run's folder (${run.folderTitle}) no longer exists.`);
+    }
+    run.items.forEach((item) => {
+      if (["failed", "stopped"].includes(item.image.status)) item.image = { ...item.image, status: "pending", error: "" };
+      if (["generating", "saving"].includes(item.image.status) && !item.image.uuid && !item.image.mediaId) {
+        item.image = { status: "pending" };
+      }
+      if (item.video && ["failed", "stopped", "submitting", "parallel_limit"].includes(item.video.status)) {
+        item.video = { status: "pending" };
+      }
+    });
+    saveGenRun();
+    await runGenerator(run);
+  }
+
+  function clearGenRun() {
+    if (state.gen.running || !state.gen.run) return;
+    if (!window.confirm("Clear this run from the list? Everything already made stays in your library.")) return;
+    state.gen.run = null;
+    saveGenRun();
+    renderGenRun();
+    updateButtonStates();
+  }
+
+  function renderGenRun() {
+    if (!els.genBody) return;
+    const run = state.gen.run;
+    const counts = getGenCounts(run);
+    els.genStatTotal.textContent = String(counts.total);
+    els.genStatImages.textContent = String(counts.images);
+    els.genStatVideos.textContent = String(counts.videos);
+    els.genStatFailed.textContent = String(counts.failed);
+    if (!run) {
+      els.genSummary.textContent = "No run yet. Write prompts, then press Start.";
+      els.genBody.innerHTML = `<tr><td colspan="5" class="ve-muted">No run yet.</td></tr>`;
+      return;
+    }
+    const modeLabel = run.mode === "image2video" ? "Image → Video" : "Image maker";
+    const character = {
+      off: "no consistent character",
+      first: "character from image 1",
+      reference: `character from image ${run.settings.referenceIds.join(" + ")}`,
+    }[run.settings.characterMode] || "";
+    els.genSummary.textContent = `${modeLabel} → “${run.folderTitle}” · ${run.settings.aspect} · ${character} · started ${formatDateTime(run.createdAt)}${state.gen.running ? " · running" : counts.unfinished ? " · press Resume to continue" : " · done"}`;
+    const showVideo = run.mode === "image2video";
+    els.genBody.innerHTML = run.items
+      .slice(0, 300)
+      .map((item) => {
+        const image = item.image || {};
+        const video = item.video || {};
+        const thumb = image.url || (image.uuid ? `${PREVIEW_BASE_URL}${image.uuid}.jpg` : "");
+        const showThumb = image.status === "saved" || (image.uuid && image.status === "saving");
+        const useButton = image.status === "saved" && image.mediaId
+          ? `<button class="ve-button ghost small ve-use-character" type="button" data-use-character="${escapeAttr(String(image.mediaId))}" data-thumb="${escapeAttr(thumb)}" title="Keep this character in the next run">Use as character</button>`
+          : "";
+        const imageError = image.error ? `<span class="ve-error-line">${escapeHtml(image.error)}</span>` : "";
+        const videoError = video.error ? `<span class="ve-error-line">${escapeHtml(video.error)}</span>` : "";
+        return `
+          <tr>
+            <td>${padIndex(item.index)}</td>
+            <td><div class="ve-thumb" style="${showThumb ? `background-image:url('${escapeAttr(thumb)}')` : ""}"></div>${useButton}</td>
+            <td class="ve-cell-prompt">${escapeHtml(item.imagePrompt)}${item.videoPrompt ? `<span class="ve-muted">▶ ${escapeHtml(item.videoPrompt)}</span>` : ""}</td>
+            <td><span class="ve-badge ${getBadgeClass(image.status)}">${escapeHtml(image.status || "pending")}</span>${imageError}</td>
+            <td>${showVideo ? `<span class="ve-badge ${getBadgeClass(video.status)}">${escapeHtml(video.status || "pending")}</span>${videoError}` : ""}</td>
+          </tr>`;
+      })
+      .join("");
+  }
+
+  // —— Prompt helper ——
+  // Instructions for another AI agent. The video rules quote VideoExpress's own prompt guidance
+  // (the "Automatically enhance my video prompt" tooltip and the Text to Video tip).
+  const VE_VIDEO_PROMPT_RULES = [
+    "Write one flowing description in the present tense, like a director describing a shot.",
+    'Start with the shot and camera ("Medium shot, camera static" or "slow push-in ending on her face"), then what happens, in order.',
+    "Put dialogue in quotes and name who says it, one line per speaker. The video has sound, so you can also describe sounds. Example: The man says \"delicious\" and sets down the empty cup.",
+    "Say what stays still as well as what moves.",
+    "No timestamps or bullet lists.",
+    "If there is more than one character, define each by gender, age and clothing and give them an actor number (Actor 1, Actor 2).",
+  ];
+
+  function buildPromptGuide() {
+    updateConfigFromInputs();
+    const mode = config.mode;
+    const seconds = config.videoLength;
+    const aspect = config.aspect === "9:16" ? "9:16 (vertical)" : config.aspect === "1:1" ? "1:1 (square)" : "16:9 (landscape)";
+    const typeLabel = (els.imageType.selectedOptions[0] && els.imageType.selectedOptions[0].text) || config.imageType;
+    const existing = getGenPromptLists().imagePrompts.length;
+    const lines = [];
+    const add = (...rows) => lines.push(...rows);
+    const imageRules = [
+      "Describe one still moment, not a sequence of actions. It is the first frame the video starts from.",
+      "Include the subject and how they look (gender, age, hair, clothing), their pose, the setting, lighting, mood and framing (close-up, medium shot or wide shot).",
+      "Keep each prompt to 1–3 sentences on a single line.",
+    ];
+    const characterRules = {
+      off: [],
+      first: [
+        "The FIRST image defines the main character; every later image is generated to keep that same person. Describe the character fully in line 1 (gender, age, hair, face, clothing).",
+        'In later lines, refer to them as "the same woman" / "the same man" and keep the same clothing unless the story needs a change.',
+      ],
+      reference: [
+        "A reference photo of the main character is already provided to the tool, so every image keeps that same person.",
+        'Refer to them as "the same woman" / "the same man"; describe the new pose, setting and action, not their face.',
+      ],
+    }[config.characterMode] || [];
+
+    add("You are writing prompts for VideoExpress.ai, an AI tool that generates images and turns each image into a short video clip.");
+    if (mode === "image2video") {
+      add(
+        "Turn my idea (at the end) into a list of scenes. Each scene becomes one image, and that image is then animated into one video clip.",
+        "",
+        "OUTPUT FORMAT",
+        "Return exactly two plain-text code blocks and nothing else:",
+        "1. IMAGE PROMPTS: one line per scene.",
+        "2. VIDEO PROMPTS: one line per scene, same order, same number of lines.",
+        "Line N of the video block animates line N of the image block. No numbering, bullets, headings, blank lines, or line breaks inside a prompt.",
+      );
+    } else if (mode === "image") {
+      add(
+        "Turn my idea (at the end) into a list of images.",
+        "",
+        "OUTPUT FORMAT",
+        "Return one plain-text code block with one image prompt per line and nothing else. No numbering, bullets, headings or blank lines.",
+      );
+    } else {
+      const names = state.items.map((item) => cleanPrompt(item.name || item.fileName || ""));
+      add(
+        `I already have ${names.length || "N"} images. Write one video prompt per image that animates it into a short clip.`,
+        "",
+        "OUTPUT FORMAT",
+        "Return one plain-text code block with one video prompt per line, in the same order as the images below, and nothing else. No numbering, bullets, headings or blank lines.",
+      );
+      if (names.length) {
+        add("", "MY IMAGES (in order)", ...names.slice(0, 150).map((name, index) => `${index + 1}. ${name}`));
+      }
+    }
+
+    add("", "SETTINGS", `- Aspect ratio: ${aspect}.`);
+    if (mode !== "video") add(`- Image style: ${typeLabel}.`);
+    if (mode !== "image") {
+      add(
+        `- Each video clip is ${seconds} seconds long (VideoExpress makes clips of 3–10 seconds). Describe only what fits in ${seconds} seconds: one main action or movement per clip.`,
+      );
+    }
+    if (mode !== "video" && characterRules.length) add(...characterRules.map((rule) => `- ${rule}`));
+
+    if (mode !== "video") add("", "IMAGE PROMPT RULES", ...imageRules.map((rule) => `- ${rule}`));
+    if (mode !== "image") {
+      add(
+        "",
+        "VIDEO PROMPT RULES (VideoExpress's own guidance)",
+        ...VE_VIDEO_PROMPT_RULES.map((rule) => `- ${rule}`),
+        "- The clip starts from its image, so keep the same people, place and lighting. Don't introduce new characters or jump to a new location.",
+        "- Keep the motion realistic and gentle enough for the clip length; fast, chaotic action tends to blur.",
+      );
+    }
+    if (mode !== "video") {
+      add("", existing ? `How many scenes: about ${existing}, unless the idea needs a different number.` : "How many scenes: choose a sensible number for the idea, or use the number I give.");
+    }
+    add("", "MY IDEA:", "[describe your video or story here]");
+    return lines.join("\n");
+  }
+
+  async function copyTextToClipboard(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      const area = document.createElement("textarea");
+      area.value = text;
+      area.style.cssText = "position:fixed;left:-9999px;top:0";
+      document.body.appendChild(area);
+      area.select();
+      let ok = false;
+      try {
+        ok = document.execCommand("copy");
+      } catch {
+        ok = false;
+      }
+      area.remove();
+      return ok;
+    }
+  }
+
+  async function copyPromptGuide() {
+    const text = buildPromptGuide();
+    const ok = await copyTextToClipboard(text);
+    els.copyPromptGuideLabel.textContent = ok ? "Copied!" : "Copy failed";
+    setTimeout(() => {
+      els.copyPromptGuideLabel.textContent = "Copy prompt guide";
+    }, 2000);
+    logLine(ok ? `Prompt guide copied (${config.mode} mode, ${text.length} characters). Paste it into your AI assistant.` : "Could not copy the prompt guide; see the console.");
+    if (!ok) console.log(text);
+  }
+
+  function setMode(mode) {
+    if (state.gen.running || state.running) return;
+    config.mode = ["image2video", "image", "video"].includes(mode) ? mode : "image2video";
+    els.modeButtons.forEach((button) => {
+      const active = button.dataset.mode === config.mode;
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-checked", String(active));
+    });
+    els.modeScoped.forEach((element) => {
+      const modes = String(element.dataset.showModes || "").split(/\s+/);
+      element.classList.toggle("ve-hidden", !modes.includes(config.mode));
+    });
+    els.promptGrid.classList.toggle("single", config.mode === "image");
+    const copy = {
+      image2video: ["prompts → image → video", "Each line makes an image, then turns it into a video. Images run in parallel; videos run up to 5 at a time."],
+      image: ["prompts → images", "Each line makes one image, saved into the active folder."],
+      video: ["sequential · auto-retry at 5 max", "Default 10s video. Queue runs 1 by 1; parallel limit retries automatically."],
+    }[config.mode];
+    if (els.generateSubtitle) els.generateSubtitle.textContent = copy[0];
+    if (els.generateHelp) els.generateHelp.textContent = copy[1];
+    if (els.promptHelperHint) {
+      els.promptHelperHint.textContent = {
+        image2video: "Copies instructions for ChatGPT, Claude, etc. It replies with image and video prompts in the right format, using VideoExpress's own prompt rules.",
+        image: "Copies instructions for ChatGPT, Claude, etc. It replies with image prompts, one per line, ready to paste.",
+        video: "Copies instructions for ChatGPT, Claude, etc. It replies with one video prompt per loaded image, using VideoExpress's own prompt rules.",
+      }[config.mode];
+    }
+    // Image generation offers 16:9 and 9:16 only.
+    const square = els.aspect.querySelector('option[value="1:1"]');
+    if (square) square.disabled = config.mode !== "video";
+    if (config.mode !== "video" && els.aspect.value === "1:1") {
+      els.aspect.value = "16:9";
+      config.aspect = "16:9";
+      saveUiState({ aspect: "16:9" });
+    }
+    updatePromptCheck();
+    saveUiState({ mode: config.mode });
+  }
+
   function updateButtonStates() {
     const visibleVideoCount = getFilteredVideos().length;
-    els.runBtn.disabled = state.running || state.uploadInProgress;
+    const genBusy = state.gen.running;
+    els.runBtn.disabled = state.running || state.uploadInProgress || genBusy;
     els.stopBtn.disabled = !state.running;
     els.uploadBtn.disabled =
       state.uploadInProgress ||
@@ -3962,6 +5203,24 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     if (els.createSessionBtn) {
       const raw = els.sessionNameInput ? els.sessionNameInput.value.trim() : "";
       els.createSessionBtn.disabled = state.running || state.uploadInProgress || state.downloadInProgress || !raw || raw.length < 2;
+    }
+    if (els.genStartBtn) {
+      const genCounts = getGenCounts(state.gen.run);
+      els.genStartBtn.disabled = genBusy || state.running || state.uploadInProgress;
+      els.genResumeBtn.disabled = genBusy || state.running || !state.gen.run || genCounts.unfinished === 0;
+      els.genStopBtn.disabled = !genBusy;
+      els.genClearBtn.disabled = genBusy || !state.gen.run;
+      els.modeButtons.forEach((button) => {
+        button.disabled = genBusy || state.running;
+      });
+      [
+        els.aspect, els.imageType, els.videoLength, els.imageConcurrency, els.imagePrompts, els.videoPrompts,
+        els.characterMode, els.reference1, els.reference2, els.referenceFolderSelect, els.loadReferencesBtn,
+        els.enhanceImagePrompt, els.enhanceVideoPrompt, els.renameOutputs, els.moveVideos,
+      ].forEach((element) => {
+        element.disabled = genBusy;
+      });
+      if (genBusy) els.loadMediaBtn.disabled = true;
     }
     updateMasterPromptControls();
   }
@@ -4273,6 +5532,54 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     if (els.timelineDownloadBtn) els.timelineDownloadBtn.addEventListener("click", () => handleAction(downloadTimelineResult));
     if (els.timelineFolderSelect) els.timelineFolderSelect.addEventListener("change", () => { selectFolder(els.timelineFolderSelect.value); });
     [els.timelineName, els.timelineAspect, els.timelineQuality].forEach(el=>{ if(!el) return; el.addEventListener("change", updateTimelineExportConfigFromInputs); el.addEventListener("input", updateTimelineExportConfigFromInputs); });
+
+    // —— Generate modes ——
+    els.modeButtons.forEach((button) => {
+      button.addEventListener("click", () => {
+        setMode(button.dataset.mode);
+        updateButtonStates();
+      });
+    });
+    [els.imagePrompts, els.videoPrompts].forEach((element) => {
+      element.addEventListener("input", () => {
+        updateConfigFromInputs();
+        updatePromptCheck();
+      });
+      element.addEventListener("change", () => {
+        updateConfigFromInputs();
+        persistGenSettings();
+      });
+    });
+    [
+      els.imageType, els.imageConcurrency, els.characterMode, els.reference1, els.reference2,
+      els.enhanceImagePrompt, els.enhanceVideoPrompt, els.renameOutputs, els.moveVideos,
+    ].forEach((element) => {
+      element.addEventListener("change", () => {
+        updateConfigFromInputs();
+        updateCharacterControls();
+        persistGenSettings();
+      });
+    });
+    els.referenceFolderSelect.addEventListener("change", () => {
+      persistGenSettings();
+      handleAction(loadReferenceImages);
+    });
+    els.loadReferencesBtn.addEventListener("click", () => handleAction(loadReferenceImages));
+    els.videoLength.addEventListener("change", () => updatePromptCheck());
+    els.genStartBtn.addEventListener("click", () => handleAction(startGenerator));
+    els.genResumeBtn.addEventListener("click", () => handleAction(resumeGenerator));
+    els.genStopBtn.addEventListener("click", () => {
+      state.gen.stopRequested = true;
+      logLine("Stop requested. Images already generating will still be saved.");
+      els.genStopBtn.disabled = true;
+    });
+    els.genClearBtn.addEventListener("click", clearGenRun);
+    els.copyPromptGuideBtn.addEventListener("click", () => handleAction(copyPromptGuide));
+    els.genBody.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-use-character]");
+      if (!button || state.gen.running) return;
+      useImageAsCharacter(button.dataset.useCharacter, button.dataset.thumb);
+    });
   }
 
   async function bootstrap() {
@@ -4285,7 +5592,16 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     const savedUi = loadUiState();
     applyTheme(savedUi.theme || "videoexpress");
     if (savedUi.aspect) config.aspect = savedUi.aspect;
-    if (savedUi.videoLength) config.videoLength = savedUi.videoLength;
+    if (savedUi.videoLength) config.videoLength = clampVideoLength(savedUi.videoLength);
+    if (typeof savedUi.mode === "string") config.mode = savedUi.mode;
+    if (typeof savedUi.imageType === "string") config.imageType = savedUi.imageType;
+    if (savedUi.imageConcurrency) config.imageConcurrency = Math.min(8, Math.max(1, Number(savedUi.imageConcurrency) || 3));
+    ["enhanceImagePrompt", "enhanceVideoPrompt", "renameOutputs", "moveVideosToFolder"].forEach((key) => {
+      if (typeof savedUi[key] === "boolean") config[key] = savedUi[key];
+    });
+    ["characterMode", "referenceMediaId", "referenceMediaId2", "imagePrompts", "videoPrompts"].forEach((key) => {
+      if (typeof savedUi[key] === "string") config[key] = savedUi[key];
+    });
     if (savedUi.delayBetweenRequestsMs)
       config.delayBetweenRequestsMs = savedUi.delayBetweenRequestsMs;
     if (savedUi.parallelLimitRetryDelayMs) {
@@ -4347,6 +5663,16 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     els.masterPrompt.value = config.masterPrompt;
     els.promptListEnabled.checked = config.promptListEnabled;
     els.promptList.value = config.promptList;
+    els.imageType.value = config.imageType;
+    els.imageConcurrency.value = String(config.imageConcurrency);
+    els.enhanceImagePrompt.checked = config.enhanceImagePrompt;
+    els.enhanceVideoPrompt.checked = config.enhanceVideoPrompt;
+    els.renameOutputs.checked = config.renameOutputs;
+    els.moveVideos.checked = config.moveVideosToFolder;
+    els.characterMode.value = config.characterMode;
+    els.imagePrompts.value = config.imagePrompts;
+    els.videoPrompts.value = config.videoPrompts;
+    fillReferenceSelects(config.referenceMediaId, config.referenceMediaId2);
     updateMasterPromptControls();
     state.selectedFolderId = savedUi.selectedFolderId || null;
     applyVideoFiltersToInputs();
@@ -4397,13 +5723,24 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     setPanelVisible(!savedUi.collapsed);
     restorePanelPosition(savedUi.panelPosition);
     setActiveTab(savedUi.activeTab || "folders");
+    setMode(config.mode);
+    updateCharacterControls();
+    renderGenRun();
     renderSelectedFiles();
     renderVideos();
     updateButtonStates();
     await refreshFolders();
+    if (savedUi.referenceFolderId) els.referenceFolderSelect.value = String(savedUi.referenceFolderId);
+    if (config.characterMode === "reference" && els.referenceFolderSelect.value) {
+      loadReferenceImages().catch((error) => logLine(`Could not load reference images: ${error.message}`));
+    }
+    updatePromptCheck();
     renderQueue();
     updateSessionPreview();
     await pollStatuses();
+    if (state.gen.run && getGenCounts(state.gen.run).unfinished > 0) {
+      logLine("The last Generate run has unfinished lines. Press Resume in Generate to continue.");
+    }
     // auto-expiry: only locally created sessions, runs hourly + on visibility
     try { await checkExpiredSessions(); } catch (e) { console.warn("[VE] expiry check failed", e); }
     setInterval(() => {
@@ -4411,9 +5748,9 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     }, 6 * 60 * 60 * 1000);
     document.addEventListener("visibilitychange", () => { if (!document.hidden) checkExpiredSessions().catch(()=>{}); });
     setInterval(() => {
-      pollStatuses().catch((error) =>
-        console.warn("Status poll failed", error),
-      );
+      pollStatuses()
+        .then(() => (state.gen.running ? null : pollGenRun()))
+        .catch((error) => console.warn("Status poll failed", error));
     }, config.pollIntervalMs);
     logLine("Manager ready.");
   }
