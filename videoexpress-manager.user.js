@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoExpress Library Manager
 // @namespace    https://app.videoexpress.ai/
-// @version      0.9.7
+// @version      0.9.8
 // @description  Manage folders, upload images, batch generate images from prompts, and batch convert images to videos inside VideoExpress AI.
 // @match        https://app.videoexpress.ai/*
 // @grant        none
@@ -83,6 +83,7 @@
   const UI_STATE_KEY = "videoexpress.manager.ui-state.v1";
   const SESSION_META_KEY = "videoexpress.manager.sessions.v1";
   const GEN_RUN_KEY = "videoexpress.manager.generator-run.v1";
+  const IMAGE_DOWNLOAD_KEY = "videoexpress.manager.image-download.v1";
   let _queryUuidSupported = null; // cache probe for server-side uuid query support (I3)
 
   const state = {
@@ -1933,6 +1934,10 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
 
           <div class="ve-section" data-show-modes="image2video image">
             <div class="ve-section-title"><span><i class="bi bi-table"></i> Run progress</span></div>
+            <div class="ve-row" style="margin-bottom:8px">
+              <button class="ve-button primary small" id="ve-download-images-btn" type="button"><i class="bi bi-download"></i> Download all images</button>
+              <button class="ve-button ghost small" id="ve-resume-images-btn" type="button"><i class="bi bi-arrow-repeat"></i> Resume download</button>
+            </div>
             <div style="max-height:360px; overflow:auto; border:1px solid #E0D8CC; border-radius:1px;">
               <table class="ve-table">
                 <thead>
@@ -2301,6 +2306,8 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     genResumeBtn: root.querySelector("#ve-gen-resume-btn"),
     genStopBtn: root.querySelector("#ve-gen-stop-btn"),
     genClearBtn: root.querySelector("#ve-gen-clear-btn"),
+    downloadImagesBtn: root.querySelector("#ve-download-images-btn"),
+    resumeImagesBtn: root.querySelector("#ve-resume-images-btn"),
     genSummary: root.querySelector("#ve-gen-summary"),
     genBody: root.querySelector("#ve-gen-body"),
     genStatTotal: root.querySelector("#ve-gen-stat-total"),
@@ -3651,6 +3658,116 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     els.masterPrompt.disabled = state.running || !masterEnabled;
     els.appendFilenamePrompt.disabled = state.running || !masterEnabled;
     els.promptList.disabled = state.running || !promptListEnabled;
+  }
+
+
+  // Download every image in the selected folder; completed files are tracked so Resume
+  // continues only the ones that were not downloaded successfully.
+  function loadImageDownloadSession() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(IMAGE_DOWNLOAD_KEY) || "null");
+      return saved && Array.isArray(saved.images) && Array.isArray(saved.downloadedIds) ? saved : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function imageDownloadName(image) {
+    const source = String(image.fileName || image.name || image.mediaPath || "");
+    const matched = source.match(/\\.(png|jpe?g|webp|gif|avif)(?:[?#].*)?$/i);
+    const rawExtension = String(image.extension || "").toLowerCase().replace(/^\\./, "");
+    const extension = matched ? matched[1].toLowerCase()
+      : /^(png|jpe?g|webp|gif|avif)$/.test(rawExtension) ? rawExtension : "jpg";
+    const baseName = String(image.name || image.title || image.fileName || image.id)
+      .replace(/\\.(png|jpe?g|webp|gif|avif)$/i, "");
+    return sanitizeFileName(baseName) + "." + extension;
+  }
+
+  async function fetchImageDownload(image) {
+    const filename = image.fileName;
+    const retryCount = Math.max(0, Number(config.downloadRetryCount) || 0);
+    let lastError;
+    for (let attempt = 0; attempt <= retryCount; attempt++) {
+      try {
+        const response = await sessionFetch(
+          `/library/download/${encodeURIComponent(image.id)}`,
+          { method: "GET" },
+          `Download image ${filename}`,
+        );
+        const type = String(response.headers.get("content-type") || "").toLowerCase();
+        if (type.includes("json") || type.includes("html") || type.startsWith("text/")) {
+          throw new Error("The server returned a page instead of an image.");
+        }
+        const blob = await response.blob();
+        if (blob.size < 100) throw new Error("The downloaded image is empty.");
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = filename;
+        anchor.style.display = "none";
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
+        return;
+      } catch (error) {
+        lastError = error;
+        if (attempt < retryCount) {
+          await sleep(Math.max(500, Number(config.downloadRetryBaseDelayMs) || 5000));
+        }
+      }
+    }
+    throw lastError;
+  }
+
+  async function downloadFolderImages(resume = false) {
+    if (state.downloadInProgress) return;
+    const folder = getSelectedFolder();
+    if (!folder) throw new Error("Select a folder first.");
+    const saved = loadImageDownloadSession();
+    if (resume && (!saved || String(saved.folderId) !== String(folder.id))) {
+      throw new Error("There is no image download to resume for this folder.");
+    }
+
+    state.downloadInProgress = true;
+    state.stopRequested = false;
+    updateButtonStates();
+    try {
+      let batch = saved;
+      if (!resume) {
+        const payload = await api.getAllImages(folder.id);
+        const images = (payload.results || [])
+          .filter((image) => image && image.id != null)
+          .map((image) => ({ id: String(image.id), fileName: imageDownloadName(image) }));
+        if (!images.length) throw new Error("No images found in the selected folder.");
+        batch = { folderId: String(folder.id), images, downloadedIds: [] };
+        localStorage.setItem(IMAGE_DOWNLOAD_KEY, JSON.stringify(batch));
+      }
+      const completed = new Set(batch.downloadedIds.map(String));
+      const remaining = batch.images.filter((image) => !completed.has(String(image.id)));
+      let failures = 0;
+      logLine(`${resume ? "Resuming" : "Starting"} image downloads: ${remaining.length} remaining of ${batch.images.length}.`);
+      for (let index = 0; index < remaining.length && !state.stopRequested; index++) {
+        const image = remaining[index];
+        try {
+          await fetchImageDownload(image);
+          completed.add(String(image.id));
+          batch.downloadedIds = [...completed];
+          localStorage.setItem(IMAGE_DOWNLOAD_KEY, JSON.stringify(batch));
+          logLine(`Image downloaded ${completed.size}/${batch.images.length}: ${image.fileName}`);
+        } catch (error) {
+          failures++;
+          logLine(`Image download failed (${image.fileName}): ${shortError(error)}`);
+        }
+        if (index < remaining.length - 1 && !state.stopRequested) {
+          await sleep(randomDelay(config.downloadMinDelayMs, config.downloadMaxDelayMs));
+        }
+      }
+      logLine(`Image downloads: ${completed.size}/${batch.images.length} completed${failures ? `; ${failures} failed — click Resume download to retry` : ""}.`);
+    } finally {
+      state.downloadInProgress = false;
+      updateButtonStates();
+    }
   }
 
   async function downloadVideos(videos, label) {
@@ -5404,6 +5521,13 @@ async function downloadQueueCompleted({ onlyRemaining }) {
   function updateButtonStates() {
     const visibleVideoCount = getFilteredVideos().length;
     const genBusy = state.gen.running;
+    const imageDownload = loadImageDownloadSession();
+    const imageDownloadsRemaining = imageDownload &&
+      imageDownload.images.some((image) => !imageDownload.downloadedIds.includes(String(image.id)));
+    const imageDownloadBusy = state.running || state.uploadInProgress || state.downloadInProgress || genBusy;
+    els.downloadImagesBtn.disabled = imageDownloadBusy || !getSelectedFolder();
+    els.resumeImagesBtn.disabled = imageDownloadBusy || !imageDownloadsRemaining ||
+      !getSelectedFolder() || String(imageDownload.folderId) !== String(state.selectedFolderId);
     els.runBtn.disabled = state.running || state.uploadInProgress || genBusy;
     els.stopBtn.disabled = !state.running;
     els.uploadBtn.disabled =
@@ -5866,6 +5990,8 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       els.genStopBtn.disabled = true;
     });
     els.genClearBtn.addEventListener("click", clearGenRun);
+    els.downloadImagesBtn.addEventListener("click", () => handleAction(() => downloadFolderImages(false)));
+    els.resumeImagesBtn.addEventListener("click", () => handleAction(() => downloadFolderImages(true)));
     els.copyPromptGuideBtn.addEventListener("click", () => handleAction(copyPromptGuide));
     els.genBody.addEventListener("click", (event) => {
       const button = event.target.closest("[data-use-character]");
