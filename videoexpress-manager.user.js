@@ -70,6 +70,8 @@
     imageTimeoutMs: 6 * 60 * 1000,
     renameOutputs: true,
     moveVideosToFolder: true,
+    // Generate: put each new run in its own dated folder (2026-11-20-01, -02, ...) created when Start is pressed.
+    autoSession: true,
     imagePrompts: "",
     videoPrompts: "",
   };
@@ -408,6 +410,78 @@
     } catch (e) {
       console.warn("[VE] session meta save failed", e);
     }
+    return { folderName, folder: created };
+  }
+  // Generate, "New dated folder per run": a run gets its own folder named YYYY-MM-DD-NN (local date,
+  // NN = next free number that day). It is made only when Start is pressed, never on page load or
+  // reload, so several batches on one day never share a folder and reloading creates nothing.
+  let runSessionPromise = null;
+  function nextRunSessionName(day) {
+    const taken = new Set();
+    let max = 0;
+    for (const f of state.folders || []) {
+      const name = String(f.title || f.name || "").trim();
+      taken.add(name.toLowerCase());
+      const m = name.match(/^(\d{4}-\d{2}-\d{2})-(\d+)$/);
+      if (m && m[1] === day) max = Math.max(max, Number(m[2]));
+    }
+    let n = max + 1;
+    let name = `${day}-${String(n).padStart(2, "0")}`;
+    while (taken.has(name.toLowerCase())) {
+      n += 1;
+      name = `${day}-${String(n).padStart(2, "0")}`;
+    }
+    return name;
+  }
+  function ensureRunSession() {
+    if (!runSessionPromise) {
+      runSessionPromise = createRunSession().finally(() => { runSessionPromise = null; });
+    }
+    return runSessionPromise;
+  }
+  async function createRunSession() {
+    const d = new Date();
+    const pad2 = (n) => String(n).padStart(2, "0");
+    const day = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; // local date
+    await refreshFolders(); // other tabs or an earlier batch may have taken numbers
+    let folderName = nextRunSessionName(day);
+    let lastErr = null;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        await api.createFolder(folderName);
+        lastErr = null;
+        break;
+      } catch (e) {
+        if (!isDuplicateFolderError(e)) throw e;
+        lastErr = e;
+        await refreshFolders();
+        folderName = nextRunSessionName(day);
+      }
+    }
+    if (lastErr) throw lastErr;
+    await refreshFolders();
+    const created = state.folders.find((f) => String(f.title || f.name) === folderName);
+    if (!created) throw new Error(`Created folder "${folderName}" but could not find it in the folder list.`);
+    state.selectedFolderId = created.id;
+    saveUiState({ selectedFolderId: created.id });
+    renderFolders();
+    try {
+      const meta = loadSessions();
+      const now = Date.now();
+      meta.sessions[String(created.id)] = {
+        folderId: String(created.id),
+        folderName,
+        baseName: day,
+        kind: "run",
+        createdAt: new Date(now).toISOString(),
+        expiresAt: new Date(now + Number(config.sessionExpiryDays || 30) * 24 * 60 * 60 * 1000).toISOString(),
+        autoExpire: Boolean(config.autoExpireSessions),
+      };
+      saveSessions(meta);
+    } catch (e) {
+      console.warn("[VE] session meta save failed", e);
+    }
+    logLine(`New folder for this run: "${folderName}"${config.autoExpireSessions ? ` (auto-deletes after ${config.sessionExpiryDays} days)` : ""}`);
     return { folderName, folder: created };
   }
   async function checkExpiredSessions() {
@@ -1920,6 +1994,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
             <div class="ve-options">
               <label class="ve-check"><input class="ve-checkbox" id="ve-enhance-image-prompt" type="checkbox" /> <span><b>Enhance image prompts</b> — the site's AI rewrites them</span></label>
               <label class="ve-check" data-show-modes="image2video"><input class="ve-checkbox" id="ve-enhance-video-prompt" type="checkbox" /> <span><b>Enhance video prompts</b></span></label>
+              <label class="ve-check"><input class="ve-checkbox" id="ve-auto-session" type="checkbox" /> <span><b>New dated folder per run</b> - 2026-11-20-01, -02, ... made when you press Start</span></label>
               <label class="ve-check"><input class="ve-checkbox" id="ve-rename-outputs" type="checkbox" /> <span><b>Name in prompt order</b> — 001 - …</span></label>
               <label class="ve-check" data-show-modes="image2video"><input class="ve-checkbox" id="ve-move-videos" type="checkbox" /> <span><b>Put videos in the folder</b> — not only My AI Videos</span></label>
             </div>
@@ -2300,6 +2375,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     loadReferencesBtn: root.querySelector("#ve-load-references-btn"),
     enhanceImagePrompt: root.querySelector("#ve-enhance-image-prompt"),
     enhanceVideoPrompt: root.querySelector("#ve-enhance-video-prompt"),
+    autoSession: root.querySelector("#ve-auto-session"),
     renameOutputs: root.querySelector("#ve-rename-outputs"),
     moveVideos: root.querySelector("#ve-move-videos"),
     genStartBtn: root.querySelector("#ve-gen-start-btn"),
@@ -2986,7 +3062,65 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     return [400, 404, 429, 500, 502, 503].includes(Number(status));
   }
 
-  async function fetchAndDownload(video, fileName) {
+  // Saves files in a fixed order even when downloads run in parallel: each task fetches its
+  // blob freely, then waits for its turn before the browser save starts. Tasks must call
+  // finish(i) when done (success, failure or skip) so later ones are never blocked.
+  function createSaveGate() {
+    let next = 0;
+    const finished = new Set();
+    const waiting = new Map();
+    const wake = () => {
+      const w = waiting.get(next);
+      if (w) { waiting.delete(next); w(); }
+    };
+    return {
+      async wait(i) {
+        while (next < i) await new Promise((resolve) => waiting.set(i, resolve));
+      },
+      finish(i) {
+        finished.add(i);
+        while (finished.has(next)) { finished.delete(next); next += 1; }
+        wake();
+      },
+    };
+  }
+
+  // Orders completed records and gives each a serial number so the saved files sort in order.
+  // Source of the number, first one that covers every record: Generate line number, queue
+  // position, else plain rank by start time and name.
+  function planQueueDownloads(records) {
+    const run = state.gen && state.gen.run;
+    const genPos = (rec) => {
+      if (!run || String(run.folderId) !== String(rec.folderId)) return null;
+      const item = (run.items || []).find((it) => it.image && String(it.image.mediaId) === String(rec.imageId));
+      return item ? item.index + 1 : null;
+    };
+    const queuePos = (rec) => getQueuePositionForMedia(rec.imageId);
+    const natural = (a, b) => String(a || "").localeCompare(String(b || ""), undefined, { numeric: true, sensitivity: "base" });
+    let pos = null;
+    for (const source of [genPos, queuePos]) {
+      const all = records.map(source);
+      if (all.every((p) => p != null)) { pos = all; break; }
+    }
+    const rows = records.map((rec, i) => ({ rec, pos: pos ? pos[i] : null }));
+    rows.sort((a, b) =>
+      (a.pos != null && b.pos != null && a.pos !== b.pos) ? a.pos - b.pos
+        : (Date.parse(a.rec.startedAt || "") || 0) - (Date.parse(b.rec.startedAt || "") || 0)
+          || natural(a.rec.imageName, b.rec.imageName));
+    const maxNum = Math.max(1, ...rows.map((r, i) => (r.pos != null ? r.pos : i + 1)));
+    const width = Math.max(3, String(maxNum).length);
+    return rows.map((r, i) => ({ rec: r.rec, num: r.pos != null ? r.pos : i + 1, width }));
+  }
+
+  function serialFileName(num, width, baseName) {
+    const label = String(num).padStart(width, "0");
+    // Generate names already start with their line number ("001 - prompt.mp4").
+    const lead = baseName.match(/^0*(\d+)\b/);
+    if (lead && Number(lead[1]) === num) return baseName;
+    return `${label}_${baseName}`;
+  }
+
+  async function fetchAndDownload(video, fileName, turn = null) {
     const id = String(video && (video.id || video.mediaId || video.videoId) || "").trim();
     const rawMedia = String(video && (video.mediaPath || video.videoUrl || video.path || video.fileName) || "").trim();
     // Normalize potential CDN / path candidates
@@ -3036,6 +3170,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
           // if still tiny but not JSON, still allow — some videos could be tiny?
           if (blob.size < 100) throw new Error(`Download ${fileName} via ${cand.label} returned empty blob (${blob.size} bytes)`);
         }
+        if (turn) await turn.gate.wait(turn.i);
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url; a.download = fileName; a.rel = "noopener"; a.style.display = "none";
@@ -3060,7 +3195,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     let lastError = null;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
-        await fetchAndDownload(video, fileName);
+        await fetchAndDownload(video, fileName, opts.turn || null);
         if (attempt > 0) logLine(`Retry succeeded for ${fileName} on attempt ${attempt + 1}`);
         return;
       } catch (e) {
@@ -3620,6 +3755,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     config.imageConcurrency = Math.min(8, Math.max(1, Math.round(Number(els.imageConcurrency.value) || 3)));
     config.enhanceImagePrompt = Boolean(els.enhanceImagePrompt.checked);
     config.enhanceVideoPrompt = Boolean(els.enhanceVideoPrompt.checked);
+    if (els.autoSession) config.autoSession = Boolean(els.autoSession.checked);
     config.renameOutputs = Boolean(els.renameOutputs.checked);
     config.moveVideosToFolder = Boolean(els.moveVideos.checked);
     config.defaultCharacterTag = els.defaultCharacter.value || "";
@@ -3791,13 +3927,29 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     els.downloadSummary.textContent = `${label}: starting ${total} files (x${concurrency})`;
 
     try {
-      await asyncPool(concurrency, videos, async (video) => {
+      // Serial order: by generation order when every video is in the saved history, else list order.
+      const recOf = (video) => {
+        const u = String(video.uuid || "").toLowerCase().trim();
+        return u ? Object.values(state.history.records).find((r) => r && r.uuid && String(r.uuid).toLowerCase().trim() === u) : null;
+      };
+      const recs = videos.map(recOf);
+      let ordered;
+      if (recs.every(Boolean)) {
+        const byRec = new Map(recs.map((r, i) => [r, videos[i]]));
+        ordered = planQueueDownloads(recs).map((p) => ({ video: byRec.get(p.rec), num: p.num, width: p.width }));
+      } else {
+        const width = Math.max(3, String(videos.length).length);
+        ordered = videos.map((video, i) => ({ video, num: i + 1, width }));
+      }
+      const gate = createSaveGate();
+      await asyncPool(concurrency, ordered, async ({ video, num, width }, planIdx) => {
+        try {
         if (state.stopRequested) return;
         const myIdx = ++nextIdx;
-        const downloadName = resolveVideoDownloadName(video);
+        const downloadName = serialFileName(num, width, resolveVideoDownloadName(video));
         els.downloadSummary.textContent = `${label}: downloading ${myIdx}/${total} | ${downloadName}`;
         try {
-          await fetchAndDownloadWithRetry(video, downloadName);
+          await fetchAndDownloadWithRetry(video, downloadName, { turn: { gate, i: planIdx } });
           logLine(`Download completed ${myIdx}/${total}: ${downloadName}`);
         } catch (error) {
           failCount += 1;
@@ -3816,6 +3968,9 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
           } else {
             els.downloadSummary.textContent = `${label}: ${processed}/${total} | success ${processed - failCount} failed ${failCount}`;
           }
+        }
+        } finally {
+          gate.finish(planIdx);
         }
       });
     } finally {
@@ -3980,22 +4135,21 @@ async function downloadQueueCompleted({ onlyRemaining }) {
   els.queueDownloadSummary.textContent = `${onlyRemaining ? "Remaining" : "Completed"}: starting ${total} files (x${concurrency})`;
   let processed = 0;
   let nextQIdx = 0;
+  const plan = planQueueDownloads(entries.map((e) => e.rec));
+  const gate = createSaveGate();
   try {
-    await asyncPool(concurrency, entries, async ({ rec }) => {
+    await asyncPool(concurrency, plan, async ({ rec, num, width }, planIdx) => {
+      try {
       if (state.stopRequested) return;
       const vid = rec.videoId;
       if (!vid) { failed++; processed++; logLine(`Skip ${rec.imageName}: no videoId resolvable`); return; }
       const myQIdx = ++nextQIdx;
       const fakeVideo = { id: vid, uuid: rec.uuid, name: rec.imageName, fileName: rec.imageFileName };
       const baseName = resolveVideoDownloadName(fakeVideo);
-      const queuePos = getQueuePositionForMedia(rec.imageId);
-      const fallbackPos = myQIdx; // 1-based within entries
-      const finalPos = queuePos != null ? queuePos : fallbackPos;
-      if (queuePos == null) logLine(`queuePos fallback for ${rec.imageName || rec.imageId}: using ${fallbackPos} (queue not loaded)`);
-      const fileName = `${finalPos}_${baseName}`;
+      const fileName = serialFileName(num, width, baseName);
       els.queueDownloadSummary.textContent = `${onlyRemaining ? "Remaining" : "Completed"}: downloading ${myQIdx}/${total} | ${fileName}`;
       try {
-        await fetchAndDownloadWithRetry(fakeVideo, fileName);
+        await fetchAndDownloadWithRetry(fakeVideo, fileName, { turn: { gate, i: planIdx } });
         const next = { ...rec, downloadedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
         setRecord(folder.id, rec.imageId, next);
         completed++;
@@ -4016,6 +4170,9 @@ async function downloadQueueCompleted({ onlyRemaining }) {
         } else {
           els.queueDownloadSummary.textContent = `${onlyRemaining ? "Remaining" : "Completed"}: ${processed}/${total} | ${completed} ok ${failed} failed`;
         }
+      }
+      } finally {
+        gate.finish(planIdx);
       }
     });
   } finally {
@@ -4412,8 +4569,10 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     const problems = [];
     const { imagePrompts, videoPrompts } = getGenPromptLists();
     const folder = getSelectedFolder();
-    if (!folder) problems.push("Pick a folder in the bar at the top first.");
-    else if (getAiVideosFolder() && String(getAiVideosFolder().id) === String(folder.id)) {
+    if (!folder && config.autoSession) {
+      // A dated folder is created when Start is pressed.
+    } else if (!folder) problems.push("Pick a folder in the bar at the top first.");
+    else if (!config.autoSession && getAiVideosFolder() && String(getAiVideosFolder().id) === String(folder.id)) {
       problems.push('Pick one of your own folders, not "My AI Videos".');
     }
     if (!imagePrompts.length) problems.push("Add at least one image prompt.");
@@ -4692,6 +4851,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       imageConcurrency: config.imageConcurrency,
       enhanceImagePrompt: config.enhanceImagePrompt,
       enhanceVideoPrompt: config.enhanceVideoPrompt,
+      autoSession: config.autoSession,
       renameOutputs: config.renameOutputs,
       moveVideosToFolder: config.moveVideosToFolder,
       characters: (config.characters || []).map(({ id, tag, description, mediaId, thumbUrl }) => ({ id, tag, description, mediaId, thumbUrl })),
@@ -5250,6 +5410,11 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       const ok = window.confirm("The last run still has unfinished lines. Start a new run instead? (Everything already made stays in your library.)");
       if (!ok) return;
     }
+    if (config.autoSession) await ensureRunSession();
+    if (!getSelectedFolder()) throw new Error("Pick a folder in the bar at the top first.");
+    if (getAiVideosFolder() && String(getAiVideosFolder().id) === String(getSelectedFolder().id)) {
+      throw new Error('Pick one of your own folders, not "My AI Videos".');
+    }
     state.gen.run = createGenRun(config.mode);
     saveGenRun();
     await runGenerator(state.gen.run);
@@ -5604,9 +5769,9 @@ async function downloadQueueCompleted({ onlyRemaining }) {
       [
         els.aspect, els.imageType, els.videoLength, els.imageConcurrency, els.imagePrompts, els.videoPrompts,
         els.addCharacterBtn, els.defaultCharacter, els.referenceFolderSelect, els.loadReferencesBtn,
-        els.enhanceImagePrompt, els.enhanceVideoPrompt, els.renameOutputs, els.moveVideos,
+        els.enhanceImagePrompt, els.enhanceVideoPrompt, els.renameOutputs, els.moveVideos, els.autoSession,
       ].forEach((element) => {
-        element.disabled = genBusy;
+        if (element) element.disabled = genBusy;
       });
       els.characterList.querySelectorAll("input, select, button").forEach((element) => {
         element.disabled = genBusy;
@@ -5944,8 +6109,9 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     });
     [
       els.imageType, els.imageConcurrency, els.defaultCharacter,
-      els.enhanceImagePrompt, els.enhanceVideoPrompt, els.renameOutputs, els.moveVideos,
+      els.enhanceImagePrompt, els.enhanceVideoPrompt, els.renameOutputs, els.moveVideos, els.autoSession,
     ].forEach((element) => {
+      if (!element) return;
       element.addEventListener("change", () => {
         updateConfigFromInputs();
         persistGenSettings();
@@ -6016,7 +6182,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     if (typeof savedUi.mode === "string") config.mode = savedUi.mode;
     if (typeof savedUi.imageType === "string") config.imageType = savedUi.imageType;
     if (savedUi.imageConcurrency) config.imageConcurrency = Math.min(8, Math.max(1, Number(savedUi.imageConcurrency) || 3));
-    ["enhanceImagePrompt", "enhanceVideoPrompt", "renameOutputs", "moveVideosToFolder"].forEach((key) => {
+    ["enhanceImagePrompt", "enhanceVideoPrompt", "renameOutputs", "moveVideosToFolder", "autoSession"].forEach((key) => {
       if (typeof savedUi[key] === "boolean") config[key] = savedUi[key];
     });
     ["imagePrompts", "videoPrompts", "defaultCharacterTag"].forEach((key) => {
@@ -6096,6 +6262,7 @@ async function downloadQueueCompleted({ onlyRemaining }) {
     els.imageConcurrency.value = String(config.imageConcurrency);
     els.enhanceImagePrompt.checked = config.enhanceImagePrompt;
     els.enhanceVideoPrompt.checked = config.enhanceVideoPrompt;
+    if (els.autoSession) els.autoSession.checked = Boolean(config.autoSession);
     els.renameOutputs.checked = config.renameOutputs;
     els.moveVideos.checked = config.moveVideosToFolder;
     els.imagePrompts.value = config.imagePrompts;

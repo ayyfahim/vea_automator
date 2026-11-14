@@ -125,7 +125,7 @@ describe("queue + timeline pure", ()=>{
 describe("DOM contract (source-string, pre-wire)", ()=>{
   it("userscript header version exists", ()=>{
     const src=fs.readFileSync("videoexpress-manager.user.js","utf8");
-    assert.match(src, /@version\s+0\.9\.(4|5|6|7)|0\.8\.(3|4)/);
+    assert.match(src, /@version\s+0\.9\.(4|5|6|7|8)|0\.8\.(3|4)/);
   });
   it("template contains required IDs (folders/upload/queue/downloads/timeline/activity)", ()=>{
     const src=fs.readFileSync("videoexpress-manager.user.js","utf8");
