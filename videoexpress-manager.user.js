@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VideoExpress Library Manager
 // @namespace    https://app.videoexpress.ai/
-// @version      0.9.8
+// @version      0.9.9
 // @description  Manage folders, upload images, batch generate images from prompts, and batch convert images to videos inside VideoExpress AI.
 // @match        https://app.videoexpress.ai/*
 // @grant        none
@@ -3874,9 +3874,15 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       let batch = saved;
       if (!resume) {
         const payload = await api.getAllImages(folder.id);
-        const images = (payload.results || [])
+        // Same order as the queue (natural name order), saved as 001_name.jpg, 002_name.jpg, ...
+        const sorted = (payload.results || [])
           .filter((image) => image && image.id != null)
-          .map((image) => ({ id: String(image.id), fileName: imageDownloadName(image) }));
+          .sort(compareMediaName);
+        const width = Math.max(3, String(sorted.length).length);
+        const images = sorted.map((image, index) => ({
+          id: String(image.id),
+          fileName: serialFileName(index + 1, width, imageDownloadName(image)),
+        }));
         if (!images.length) throw new Error("No images found in the selected folder.");
         batch = { folderId: String(folder.id), images, downloadedIds: [] };
         localStorage.setItem(IMAGE_DOWNLOAD_KEY, JSON.stringify(batch));
